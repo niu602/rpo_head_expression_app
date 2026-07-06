@@ -27,6 +27,17 @@ render.experimental.xml
 *.jks
 *.keystore
 
+# 敏感密钥与配置
+*.pem
+*.key
+*.env
+*.token
+apikey.properties
+local.properties
+
+# 内部临时文件
+*.internal
+debug_credentials/
 # Google Services (e.g. APIs or Firebase)
 google-services.json
 
