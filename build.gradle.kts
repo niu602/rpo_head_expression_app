@@ -1,0 +1,9 @@
+/*
+ * SPDX-FileCopyrightText: 2026 Roboparty Camp
+ * SPDX-License-Identifier: GPL-3.0-only
+ */
+
+plugins {
+    id("com.android.application") version "8.2.0" apply false
+    id("org.jetbrains.kotlin.android") version "1.9.20" apply false
+}

@@ -1,0 +1,32 @@
+<?xml version="1.0" encoding="utf-8"?>
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    <!-- 机器人头部外框 -->
+    <path
+        android:fillColor="#FFFFFF"
+        android:pathData="M54,24C38.536,24 26,36.536 26,52v12c0,15.464 12.536,28 28,28s28,-12.536 28,-28V52C82,36.536 69.464,24 54,24z" />
+    <!-- 左眼 -->
+    <path
+        android:fillColor="#212121"
+        android:pathData="M42,48m-6,0a6,6 0,1 1,12 0a6,6 0,1 1,-12 0" />
+    <!-- 右眼 -->
+    <path
+        android:fillColor="#212121"
+        android:pathData="M66,48m-6,0a6,6 0,1 1,12 0a6,6 0,1 1,-12 0" />
+    <!-- 微笑嘴巴 -->
+    <path
+        android:fillColor="#212121"
+        android:pathData="M42,66c0,6.627 5.373,12 12,12s12,-5.373 12,-12H42z" />
+    <!-- 天线 -->
+    <path
+        android:fillColor="#FFFFFF"
+        android:strokeColor="#FFFFFF"
+        android:strokeWidth="4"
+        android:pathData="M54,24L54,16" />
+    <path
+        android:fillColor="#F44336"
+        android:pathData="M54,14m-3,0a3,3 0,1 1,6 0a3,3 0,1 1,-6 0" />
+</vector>
