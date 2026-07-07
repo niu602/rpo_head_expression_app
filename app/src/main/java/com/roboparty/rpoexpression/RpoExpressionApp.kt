@@ -10,6 +10,7 @@ import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.os.Build
 import com.roboparty.rpoexpression.communication.CommunicationManager
+import com.roboparty.rpoexpression.expression.DemoSequenceManager
 import com.roboparty.rpoexpression.expression.ExpressionManager
 import com.roboparty.rpoexpression.sensor.BrightnessManager
 import com.roboparty.rpoexpression.util.Constants
@@ -26,6 +27,8 @@ class RpoExpressionApp : Application() {
         private set
     lateinit var brightnessManager: BrightnessManager
         private set
+    lateinit var demoSequenceManager: DemoSequenceManager
+        private set
 
     override fun onCreate() {
         super.onCreate()
@@ -34,6 +37,7 @@ class RpoExpressionApp : Application() {
         expressionManager = ExpressionManager.getInstance()
         communicationManager = CommunicationManager.getInstance()
         brightnessManager = BrightnessManager.getInstance(this)
+        demoSequenceManager = DemoSequenceManager(expressionManager)
 
         // 配置通信地址
         communicationManager.setMasterAddress(

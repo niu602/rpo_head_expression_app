@@ -49,7 +49,20 @@ class ExpressionRenderer {
         // 计算中心位置和缩放比例
         val centerX = size.width / 2f
         val centerY = size.height / 2f
-        val scale = size.width / 1080f  // 基于1080p设计稿缩放
+        val scale = size.width / 1220f  // 适配红米Note 12 Turbo 1220px宽度，自适应缩放
+
+        // 应用100ms平滑过渡动画：新表情从透明到不透明，避免生硬切换
+        val transitionAlpha = state.transitionProgress.coerceIn(0f, 1f)
+        drawContext.canvas.save()
+        drawContext.canvas.translate(0f, (1f - transitionAlpha) * 20f * scale) // 轻微上移进入
+        drawContext.canvas.rotate((1f - transitionAlpha) * 2f, centerX, centerY) // 轻微旋转进入
+        drawContext.canvas.scale(
+            0.95f + 0.05f * transitionAlpha,
+            0.95f + 0.05f * transitionAlpha,
+            centerX,
+            centerY
+        ) // 轻微缩放进入
+        drawContext.canvas.rotate(if (state.type == ExpressionType.RESPONSE) 0f else 0f, centerX, centerY)
 
         // 根据表情类型绘制对应内容
         when (state.type) {
@@ -61,8 +74,13 @@ class ExpressionRenderer {
             ExpressionType.RESPONSE -> renderResponse(centerX, centerY, scale, state.progress)
         }
 
-        // 应用过渡效果
-        applyTransition(state.transitionProgress)
+        // 应用透明度过渡
+        drawRect(
+            color = backgroundColor.copy(alpha = 1f - transitionAlpha),
+            size = size,
+            blendMode = BlendMode.SrcOver
+        )
+        drawContext.canvas.restore()
     }
 
     /**
