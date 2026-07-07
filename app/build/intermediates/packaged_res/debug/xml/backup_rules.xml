@@ -1,9 +1,0 @@
-<?xml version="1.0" encoding="utf-8"?>
-<!--
-  SPDX-FileCopyrightText: 2026 Roboparty Camp
-  SPDX-License-Identifier: GPL-3.0-only
--->
-<full-backup-content>
-    <exclude domain="sharedpref" path="."/>
-    <exclude domain="database" path="."/>
-</full-backup-content>

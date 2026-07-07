@@ -36,10 +36,10 @@ class CommunicationManager private constructor() {
 
     companion object {
         private const val TAG = "CommManager"
-        private const val DEFAULT_PORT = 8899
+        private const val DEFAULT_PORT = 8899 // 与接口规范一致
         private const val CONNECT_TIMEOUT = 5000
         private const val RECONNECT_DELAY = 3000L
-        private const val HEARTBEAT_INTERVAL = 2000L
+        private const val HEARTBEAT_INTERVAL = 3000L // 3秒心跳，与接口规范一致
         private const val READ_BUFFER_SIZE = 1024
 
         @Volatile

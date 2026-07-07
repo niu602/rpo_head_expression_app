@@ -29,7 +29,8 @@ class ExpressionManager private constructor() {
         private const val TAG = "ExpressionManager"
         private const val BLINK_MIN_INTERVAL = 3000L  // 眨眼最小间隔3秒
         private const val BLINK_MAX_INTERVAL = 8000L  // 眨眼最大间隔8秒
-        private const val TRANSITION_DURATION = 150L  // 表情切换过渡时长150ms，保障<100ms响应
+        private const val TRANSITION_DURATION = 100L  // 表情切换过渡时长100ms，满足≤100ms要求
+        private const val DEBOUNCE_INTERVAL = 100L  // 防抖间隔100ms，短时间重复指令忽略
 
         @Volatile
         private var instance: ExpressionManager? = null
@@ -40,6 +41,9 @@ class ExpressionManager private constructor() {
             }
         }
     }
+
+    // 上次表情切换时间，用于防抖
+    private var lastSwitchTime = 0L
 
     // 表情状态流 - UI层订阅此流进行渲染
     private val _expressionState = MutableStateFlow(ExpressionState(type = ExpressionType.IDLE))
@@ -94,18 +98,27 @@ class ExpressionManager private constructor() {
         duration: Long? = null,
         force: Boolean = false
     ): Boolean {
+        val currentTime = System.currentTimeMillis()
         val currentState = _expressionState.value
 
-        // 优先级检查：非强制模式下，低优先级不能抢占高优先级
-        if (!force && type.priority < currentState.type.priority) {
-            Log.d(TAG, "Expression $type rejected, current priority higher: ${currentState.type}")
+        // 防抖检查：非强制切换，100ms内重复请求直接忽略
+        if (!force && currentTime - lastSwitchTime < DEBOUNCE_INTERVAL) {
+            Log.d(TAG, "Expression $type debounced")
             return false
         }
 
+        // 优先级检查：非强制模式下，低优先级不能抢占高优先级
+        if (!force && type.priority < currentState.type.priority) {
+            Log.d(TAG, "Expression $type rejected, target priority: \${type.priority},current priority higher: ${currentState.type}")
+            return false
+        }
         // 相同表情不重复触发（眨眼除外）
         if (type == currentState.type && type != ExpressionType.BLINK) {
             return true
         }
+
+        // 更新切换时间
+        lastSwitchTime = currentTime
 
         Log.d(TAG, "Switching expression: ${currentState.type} -> $type")
 
