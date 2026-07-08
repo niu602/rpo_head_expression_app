@@ -1,3 +1,9 @@
+<div align="center">
+  <a href="./README.md">English</a> | 
+  <a href="./README.zh-CN.md">中文</a>
+</div>
+
+-----
 # RPO Robot Expression Display Module
 > Facial expression display APP for Roboparty Camp roboto_origin robot, optimized for Redmi Note 12 Turbo
 
