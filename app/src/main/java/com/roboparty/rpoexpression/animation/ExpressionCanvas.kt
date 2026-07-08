@@ -10,11 +10,14 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.remember
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalLifecycleOwner
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.lifecycleScope
 import androidx.lifecycle.repeatOnLifecycle
+import com.roboparty.rpoexpression.RpoExpressionApp
 import com.roboparty.rpoexpression.expression.ExpressionManager
 import kotlinx.coroutines.launch
 
@@ -29,8 +32,11 @@ fun ExpressionCanvas(
     modifier: Modifier = Modifier,
     expressionManager: ExpressionManager = ExpressionManager.getInstance()
 ) {
+    val context = LocalContext.current
+    val app = remember { context.applicationContext as RpoExpressionApp }
+    val assetLoader = remember { app.assetLoader }
     val expressionState by expressionManager.expressionState.collectAsState()
-    val renderer = ExpressionRenderer()
+    val renderer = remember { ExpressionRenderer(assetLoader) }
 
     Canvas(
         modifier = modifier.fillMaxSize()
