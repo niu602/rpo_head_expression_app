@@ -1,3 +1,9 @@
+<div align="center">
+  <a href="./README.md">English</a> | 
+  <a href="./README.zh-CN.md">中文</a>
+</div>
+
+-----
 # RPO 机器人表情显示模块
 > Roboparty Camp 机器人表情显示APP，适配红米Note 12 Turbo，为roboto_origin机器人提供面部表情显示能力
 
