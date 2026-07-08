@@ -9,10 +9,12 @@ import android.app.Application
 import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.os.Build
+import com.roboparty.rpoexpression.animation.ExpressionAssetLoader
 import com.roboparty.rpoexpression.communication.CommunicationManager
 import com.roboparty.rpoexpression.expression.DemoSequenceManager
 import com.roboparty.rpoexpression.expression.ExpressionManager
 import com.roboparty.rpoexpression.sensor.BrightnessManager
+import com.roboparty.rpoexpression.sensor.ImuManager
 import com.roboparty.rpoexpression.util.Constants
 
 /**
@@ -29,6 +31,10 @@ class RpoExpressionApp : Application() {
         private set
     lateinit var demoSequenceManager: DemoSequenceManager
         private set
+    lateinit var assetLoader: ExpressionAssetLoader
+        private set
+    lateinit var imuManager: ImuManager
+        private set
 
     override fun onCreate() {
         super.onCreate()
@@ -38,6 +44,9 @@ class RpoExpressionApp : Application() {
         communicationManager = CommunicationManager.getInstance()
         brightnessManager = BrightnessManager.getInstance(this)
         demoSequenceManager = DemoSequenceManager(expressionManager)
+        assetLoader = ExpressionAssetLoader.getInstance(this)
+        assetLoader.init() // 初始化素材检查
+        imuManager = ImuManager.getInstance(this)
 
         // 配置通信地址
         communicationManager.setMasterAddress(

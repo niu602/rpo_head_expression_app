@@ -56,6 +56,7 @@ class ExpressionManager private constructor() {
     private val isRunning = AtomicBoolean(false)
     private var managerJob: Job? = null
     private var blinkJob: Job? = null
+    private var autoFallbackJob: Job? = null
     private val scope = CoroutineScope(Dispatchers.Default + SupervisorJob())
 
     // 待执行的表情序列（Demo演示用）
@@ -139,10 +140,18 @@ class ExpressionManager private constructor() {
 
         // 如果是应答反馈等临时状态，启动回落计时
         if (type.isAutoFallback && type != ExpressionType.BLINK) {
-            scope.launch {
+            // 取消之前的回落协程，避免多个回落任务冲突
+            autoFallbackJob?.cancel()
+            autoFallbackJob = scope.launch {
                 delay(actualDuration)
-                fallbackToIdle()
+                // 只有当前表情还是这个临时表情，才回落到IDLE，避免覆盖新切换的表情
+                if (_expressionState.value.type == type) {
+                    fallbackToIdle()
+                }
             }
+        } else {
+            // 切换到常驻表情时，取消自动回落
+            autoFallbackJob?.cancel()
         }
 
         return true

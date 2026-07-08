@@ -15,17 +15,20 @@ import com.roboparty.rpoexpression.expression.ExpressionState
 import com.roboparty.rpoexpression.expression.ExpressionType
 import kotlin.math.cos
 import kotlin.math.sin
-
+import androidx.compose.ui.unit.IntSize
 /**
  * 表情渲染器
  * 使用Jetpack Compose Canvas进行自定义绘制，保证60fps流畅动画
  *
  * 设计原则：
- * 1. 纯函数式绘制，无状态依赖
- * 2. 基于进度参数驱动所有动画
- * 3. 使用硬件加速绘制路径
+ * 1. 优先加载正式图片素材，无素材时自动回退到矢量绘制
+ * 2. 纯函数式绘制，无状态依赖
+ * 3. 基于进度参数驱动所有动画
+ * 4. 使用硬件加速绘制路径
  */
-class ExpressionRenderer {
+class ExpressionRenderer(
+    private val assetLoader: ExpressionAssetLoader
+) {
 
     // 主题颜色 - 机器人蓝色眼睛
     private val eyeColor = Color(0xFF00D4FF)
@@ -62,16 +65,26 @@ class ExpressionRenderer {
             centerX,
             centerY
         ) // 轻微缩放进入
-        drawContext.canvas.rotate(if (state.type == ExpressionType.RESPONSE) 0f else 0f, centerX, centerY)
 
-        // 根据表情类型绘制对应内容
-        when (state.type) {
-            ExpressionType.IDLE -> renderIdle(centerX, centerY, scale, state.progress)
-            ExpressionType.BLINK -> renderBlink(centerX, centerY, scale, state.progress)
-            ExpressionType.SPEAKING -> renderSpeaking(centerX, centerY, scale, state.progress)
-            ExpressionType.THINKING -> renderThinking(centerX, centerY, scale, state.progress)
-            ExpressionType.RECOGNIZING -> renderRecognizing(centerX, centerY, scale, state.progress)
-            ExpressionType.RESPONSE -> renderResponse(centerX, centerY, scale, state.progress)
+        // 优先尝试加载正式图片素材，有素材直接绘制图片
+        val expressionBitmap = assetLoader.loadExpressionBitmap(state.type, size.width.toInt(), size.height.toInt())
+        if (expressionBitmap != null) {
+            // 绘制图片，等比拉伸填满屏幕
+            drawImage(
+                image = expressionBitmap,
+                dstSize =IntSize(size.width.toInt(), size.height.toInt()),
+                alpha = transitionAlpha
+            )
+        } else {
+            // 无素材时回退到矢量绘制
+            when (state.type) {
+                ExpressionType.IDLE -> renderIdle(centerX, centerY, scale, state.progress)
+                ExpressionType.BLINK -> renderBlink(centerX, centerY, scale, state.progress)
+                ExpressionType.SPEAKING -> renderSpeaking(centerX, centerY, scale, state.progress)
+                ExpressionType.THINKING -> renderThinking(centerX, centerY, scale, state.progress)
+                ExpressionType.RECOGNIZING -> renderRecognizing(centerX, centerY, scale, state.progress)
+                ExpressionType.RESPONSE -> renderResponse(centerX, centerY, scale, state.progress)
+            }
         }
 
         // 应用透明度过渡
