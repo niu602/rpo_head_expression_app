@@ -84,6 +84,17 @@ dependencies {
     // JSON解析
     implementation("com.google.code.gson:gson:2.10.1")
     
+    // ML Kit 人脸检测
+    implementation("com.google.mlkit:face-detection:16.1.6")
+    
+    // OkHttp 大模型网络请求
+    implementation("com.squareup.okhttp3:okhttp:4.12.0")
+
+    // CameraX 相机预览与帧获取
+    implementation("androidx.camera:camera-core:1.3.1")
+    implementation("androidx.camera:camera-camera2:1.3.1")
+    implementation("androidx.camera:camera-lifecycle:1.3.1")
+    
     // 测试依赖
     testImplementation("junit:junit:4.13.2")
     androidTestImplementation("androidx.test.ext:junit:1.1.5")

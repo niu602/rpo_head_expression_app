@@ -6,12 +6,18 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
     xmlns:tools="http://schemas.android.com/tools">
 
-    <!-- 网络权限：TCP Socket与主控通信 -->
+    <!-- 网络权限：TCP Socket与主控通信、大模型请求 -->
     <uses-permission android:name="android.permission.INTERNET" />
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
     <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
     
-    <!-- 传感器权限：光照传感器 -->
+    <!-- 音频权限：ASR语音识别录音 -->
+    <uses-permission android:name="android.permission.RECORD_AUDIO" />
+    
+    <!-- 相机权限：人脸识别 -->
+    <uses-permission android:name="android.permission.CAMERA" />
+    
+    <!-- 传感器权限：光照传感器、IMU -->
     <uses-permission android:name="android.permission.BODY_SENSORS" />
     
     <!-- 唤醒锁：保持屏幕常亮 -->

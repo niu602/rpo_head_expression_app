@@ -66,6 +66,40 @@ object ModuleStateManager {
         expressionManager.requestExpression(ExpressionType.RESPONSE, duration = 1000)
     }
 
+    // ==================== LLM大模型模块对接 ====================
+    /**
+     * LLM开始思考生成回复
+     * 自动切换到思考表情
+     */
+    fun onLlmStartThinking() {
+        Log.d(TAG, "LLM start thinking, switch to THINKING")
+        expressionManager.requestExpression(ExpressionType.THINKING)
+    }
+
+    /**
+     * LLM生成结束
+     * 500ms后自动回落到待机，等待TTS播报
+     */
+    fun onLlmFinish() {
+        Log.d(TAG, "LLM finish")
+        // 500ms后自动回IDLE，如果期间TTS开始会自动抢占
+        kotlinx.coroutines.GlobalScope.launch {
+            kotlinx.coroutines.delay(500)
+            if (expressionManager.expressionState.value.type == ExpressionType.THINKING) {
+                expressionManager.requestExpression(ExpressionType.IDLE)
+            }
+        }
+    }
+
+    /**
+     * LLM请求错误
+     * 显示错误应答表情
+     */
+    fun onLlmError() {
+        Log.d(TAG, "LLM error")
+        expressionManager.requestExpression(ExpressionType.RESPONSE, duration = 1000)
+    }
+
     // ==================== TTS语音播报模块对接 ====================
     /**
      * TTS开始播报
@@ -101,7 +135,7 @@ object ModuleStateManager {
      */
     fun onFaceDetectStart() {
         Log.d(TAG, "Face detect start, switch to RECOGNIZING")
-        expressionManager.requestExpression(ExpressionType.RECOGNIZING)
+        expressionManager.requestExpression(ExpressionType.RECOGNIZING, duration = 4000)
     }
 
     /**
@@ -118,7 +152,7 @@ object ModuleStateManager {
      */
     fun onFaceDetectFailed() {
         Log.d(TAG, "Face detect failed")
-        expressionManager.requestExpression(ExpressionType.IDLE)
+        expressionManager.requestExpression(ExpressionType.IDLE,force = true)
     }
 
     // ==================== 头部电机模块对接（预留） ====================
