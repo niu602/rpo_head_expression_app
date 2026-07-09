@@ -63,6 +63,9 @@ class ExpressionManager private constructor() {
     private val expressionSequence = mutableListOf<ExpressionType>()
     private var isPlayingSequence = false
 
+    // 临时表情自动回落目标
+    private var temporaryFallbackTarget: ExpressionType = ExpressionType.IDLE
+
     /**
      * 启动表情管理器
      */
@@ -142,11 +145,14 @@ class ExpressionManager private constructor() {
         if (type.isAutoFallback && type != ExpressionType.BLINK) {
             // 取消之前的回落协程，避免多个回落任务冲突
             autoFallbackJob?.cancel()
+            // 保存回落目标为设置临时表情前的表情
+            temporaryFallbackTarget = currentState.type
             autoFallbackJob = scope.launch {
                 delay(actualDuration)
-                // 只有当前表情还是这个临时表情，才回落到IDLE，避免覆盖新切换的表情
+                // 只有当前表情还是这个临时表情，才回落，避免覆盖新切换的表情
                 if (_expressionState.value.type == type) {
-                    fallbackToIdle()
+                    Log.d(TAG, "Auto fallback from $type to $temporaryFallbackTarget")
+                    requestExpression(temporaryFallbackTarget, force = true)
                 }
             }
         } else {

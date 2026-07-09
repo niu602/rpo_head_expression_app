@@ -8,7 +8,8 @@ package com.roboparty.rpoexpression.expression
 /**
  * 机器人表情类型枚举
  * 定义6类基础表情状态及优先级
- * 优先级规则：说话 > 识别中 > 思考 > 应答反馈 > 待机（眨眼为待机附属状态）
+ * 优先级规则：说话 > 应答反馈 > 识别中 > 思考 > 待机（眨眼为待机附属状态）
+ * 高优先级可以抢占低优先级，低优先级无法抢占高优先级
  */
 enum class ExpressionType(
     val priority: Int,
@@ -50,21 +51,22 @@ enum class ExpressionType(
     ),
 
     /**
-     * 思考状态：ASR识别中/任务处理时触发
-     * 优先级高于识别中
+     * 思考状态：ASR准备/任务处理时触发
+     * 优先级高于待机
      */
     THINKING(
-        priority = 2,
+        priority = 1,
         defaultDuration = Long.MAX_VALUE,
         isAutoFallback = false,
         description = "思考"
     ),
 
     /**
-     * 识别中状态：人脸识别模块工作时触发
+     * 识别中状态：语音识别/人脸识别工作时触发
+     * 优先级高于思考
      */
     RECOGNIZING(
-        priority = 3,
+        priority = 2,
         defaultDuration = Long.MAX_VALUE,
         isAutoFallback = false,
         description = "识别中"
@@ -72,9 +74,10 @@ enum class ExpressionType(
 
     /**
      * 应答反馈状态：识别成功/指令执行完成时触发，持续1s后回落
+     * 优先级高于识别/思考，低于说话，不会打断播报
      */
     RESPONSE(
-        priority = 1,
+        priority = 3,
         defaultDuration = 1000L,
         isAutoFallback = true,
         description = "应答反馈"

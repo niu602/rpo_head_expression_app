@@ -10,12 +10,15 @@ import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.os.Build
 import com.roboparty.rpoexpression.animation.ExpressionAssetLoader
+import com.roboparty.rpoexpression.audio.AudioManager
 import com.roboparty.rpoexpression.communication.CommunicationManager
 import com.roboparty.rpoexpression.expression.DemoSequenceManager
 import com.roboparty.rpoexpression.expression.ExpressionManager
+import com.roboparty.rpoexpression.llm.LlmManager
 import com.roboparty.rpoexpression.sensor.BrightnessManager
 import com.roboparty.rpoexpression.sensor.ImuManager
 import com.roboparty.rpoexpression.util.Constants
+import com.roboparty.rpoexpression.vision.VisionManager
 
 /**
  * Application入口
@@ -35,11 +38,17 @@ class RpoExpressionApp : Application() {
         private set
     lateinit var imuManager: ImuManager
         private set
+    lateinit var audioManager: AudioManager
+        private set
+    lateinit var visionManager: VisionManager
+        private set
+    lateinit var llmManager: LlmManager
+        private set
 
     override fun onCreate() {
         super.onCreate()
 
-        // 初始化管理器
+        // 初始化核心管理器
         expressionManager = ExpressionManager.getInstance()
         communicationManager = CommunicationManager.getInstance()
         brightnessManager = BrightnessManager.getInstance(this)
@@ -47,6 +56,14 @@ class RpoExpressionApp : Application() {
         assetLoader = ExpressionAssetLoader.getInstance(this)
         assetLoader.init() // 初始化素材检查
         imuManager = ImuManager.getInstance(this)
+
+        // 初始化第二阶段新增模块
+        audioManager = AudioManager.getInstance(this)
+        audioManager.init()
+        visionManager = VisionManager.getInstance(this)
+        visionManager.init()
+        llmManager = LlmManager.getInstance(this)
+        llmManager.init()
 
         // 配置通信地址
         communicationManager.setMasterAddress(
@@ -72,6 +89,17 @@ class RpoExpressionApp : Application() {
             val notificationManager = getSystemService(NotificationManager::class.java)
             notificationManager.createNotificationChannel(channel)
         }
+    }
+
+    override fun onTerminate() {
+        super.onTerminate()
+        // 释放所有模块资源
+        audioManager.release()
+        visionManager.release()
+        llmManager.release()
+        brightnessManager.stop()
+        imuManager.stop()
+        communicationManager.stop()
     }
 
     companion object {
