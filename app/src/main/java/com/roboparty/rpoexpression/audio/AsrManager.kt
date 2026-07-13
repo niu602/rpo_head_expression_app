@@ -191,8 +191,8 @@ class AsrManager private constructor(private val context: Context) {
                 })
                 add("turn_detection", JsonObject().apply {
                     addProperty("type", "server_vad")
-                    addProperty("threshold", 0.2) // 默认灵敏度
-                    addProperty("silence_duration_ms", 800) // 800ms静音判定为说话结束，给用户足够反应时间
+                    addProperty("threshold", 0.15) // 提高灵敏度，更容易检测到语音结束
+                    addProperty("silence_duration_ms", 500) // 500ms静音判定为说话结束，响应更快
                 })
             })
         }

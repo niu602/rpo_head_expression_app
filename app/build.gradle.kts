@@ -6,16 +6,17 @@
 plugins {
     id("com.android.application")
     id("org.jetbrains.kotlin.android")
+    id("org.jetbrains.kotlin.plugin.compose")
 }
 
 android {
     namespace = "com.roboparty.rpoexpression"
-    compileSdk = 34
+    compileSdk = 35
 
     defaultConfig {
         applicationId = "com.roboparty.rpoexpression"
         minSdk = 33  // Android 13，匹配红米Note 12 Turbo
-        targetSdk = 34
+        targetSdk = 35
         versionCode = 1
         versionName = "1.0.0"
 
@@ -49,9 +50,6 @@ android {
     buildFeatures {
         compose = true
     }
-    composeOptions {
-        kotlinCompilerExtensionVersion = "1.5.4"
-    }
     packaging {
         resources {
             excludes += "/META-INF/{AL2.0,LGPL2.1}"
@@ -65,6 +63,8 @@ android {
 }
 
 dependencies {
+    implementation("androidx.compose.ui:ui-graphics:1.11.4")
+    implementation("androidx.compose.ui:ui-unit:1.11.4")
     // AndroidX Core
     implementation("androidx.core:core-ktx:1.12.0")
     implementation("androidx.lifecycle:lifecycle-runtime-ktx:2.7.0")

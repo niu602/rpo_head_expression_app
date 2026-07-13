@@ -6,6 +6,7 @@
 package com.roboparty.rpoexpression.communication
 
 import com.google.gson.annotations.SerializedName
+import com.roboparty.rpoexpression.expression.ExpressionStyle
 import com.roboparty.rpoexpression.expression.ExpressionType
 
 /**
@@ -41,6 +42,8 @@ data class ControlCommand(
         const val CMD_PING = "ping"
         const val CMD_STATUS = "status"
         const val CMD_BRIGHTNESS = "brightness"
+        const val CMD_SET_STYLE = "set_style"  // 设置渲染风格
+        const val CMD_SET_INTENSITY = "set_intensity"  // 设置表情强度
 
         // 指令来源
         const val SOURCE_MASTER = "roboto_origin"
@@ -55,6 +58,28 @@ data class ControlCommand(
      */
     fun toExpressionType(): ExpressionType? {
         return type?.let { ExpressionType.fromCommand(it) }
+    }
+
+    /**
+     * 解析表情强度 0-100，默认100
+     */
+    fun toIntensity(): Int {
+        val intensity = data?.get("intensity") as? Number
+        return intensity?.toInt()?.coerceIn(0, 100) ?: 100
+    }
+
+    /**
+     * 解析渲染风格
+     */
+    fun toStyle(): ExpressionStyle? {
+        val styleName = data?.get("style")?.toString()?.lowercase()
+        return when (styleName) {
+            "cartoon", "0" -> ExpressionStyle.CARTOON
+            "cyberpunk", "cyber", "1" -> ExpressionStyle.CYBERPUNK
+            "minimal", "line", "2" -> ExpressionStyle.MINIMAL
+            "pixel", "8bit", "3" -> ExpressionStyle.PIXEL
+            else -> null
+        }
     }
 
     /**

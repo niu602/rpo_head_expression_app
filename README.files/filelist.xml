@@ -1,6 +1,8 @@
-<xml xmlns:o="urn:schemas-microsoft-com:office:office">
- <o:MainFile HRef="../README.md"/>
- <o:File HRef="themedata.thmx"/>
- <o:File HRef="colorschememapping.xml"/>
- <o:File HRef="filelist.xml"/>
+<xml xmlns:o="urn:schemas-microsoft-com:office:office"
+        xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+        xsi:schemaLocation="urn:schemas-microsoft-com:office:office ">
+ <o:MainFile HRef="../README.md" />
+ <o:File HRef="themedata.thmx" />
+ <o:File HRef="colorschememapping.xml" />
+ <o:File HRef="filelist.xml" />
 </xml>

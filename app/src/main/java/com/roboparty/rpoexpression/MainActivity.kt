@@ -21,6 +21,7 @@ import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
@@ -33,7 +34,6 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Surface
 import androidx.compose.runtime.*
-import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
@@ -56,6 +56,16 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import androidx.compose.ui.platform.LocalContext
 import android.annotation.SuppressLint
+import androidx.compose.ui.Modifier
+import com.roboparty.rpoexpression.expression.ExpressionState
+import com.roboparty.rpoexpression.expression.ExpressionStyle
+import androidx.compose.material3.Slider
+import androidx.compose.material3.ButtonDefaults
+import androidx.compose.foundation.background
+import androidx.compose.ui.Alignment
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.ui.graphics.Color as ComposeColor
+import androidx.compose.ui.text.font.FontWeight
 
 /**
  * 主Activity
@@ -73,6 +83,7 @@ class MainActivity : ComponentActivity() {
     private lateinit var visionManager: VisionManager
     private val REQUEST_RECORD_AUDIO_PERMISSION = 1001
     private val REQUEST_CAMERA_PERMISSION = 1002
+
     // 权限申请后待执行的操作：是否为ASR单独测试模式
     private var pendingAsrOnlyTest = false
 
@@ -89,7 +100,6 @@ class MainActivity : ComponentActivity() {
         audioManager = app.audioManager
         llmManager = app.llmManager
         visionManager = app.visionManager
-
 
         // 保持屏幕常亮
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
@@ -116,23 +126,25 @@ class MainActivity : ComponentActivity() {
             }
         }
 
-        // 全屏沉浸式设置（放在setContent之后，确保decorView已创建，避免空指针）
+        // 全屏沉浸式设置
         enableFullscreenMode()
 
         // 启动各个管理器
         startManagers()
+
+        // 注册TTS播放结束回调，播报完自动切回待机
+        initTtsFinishCallback()
     }
 
     /**
      * 启用全屏沉浸式模式
-     * 隐藏状态栏和导航栏
      */
     private fun enableFullscreenMode() {
-        // 使用AndroidX兼容API设置沉浸式，避免空指针
         WindowCompat.setDecorFitsSystemWindows(window, false)
         val controller = WindowInsetsControllerCompat(window, window.decorView)
         controller.hide(WindowInsetsCompat.Type.statusBars() or WindowInsetsCompat.Type.navigationBars())
-        controller.systemBarsBehavior = WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
+        controller.systemBarsBehavior =
+            WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
     }
 
     /**
@@ -151,9 +163,24 @@ class MainActivity : ComponentActivity() {
         }
     }
 
+    /**
+     * TTS播报结束自动切回待机
+     */
+    private fun initTtsFinishCallback() {
+                ModuleStateManager.onTtsFinishSpeaking()
+    }
+
     override fun onResume() {
         super.onResume()
         enableFullscreenMode()
+    }
+
+    override fun onPause() {
+        super.onPause()
+        // 退后台停止所有前台任务
+        audioManager.stopListening()
+        audioManager.stopSpeaking()
+        visionManager.stopFaceDetect()
     }
 
     override fun onWindowFocusChanged(hasFocus: Boolean) {
@@ -163,98 +190,150 @@ class MainActivity : ComponentActivity() {
         }
     }
 
+    // 手柄切换表情用的索引
+    private var currentExpressionIndex = 0
+    private val expressionList = ExpressionType.values().filter { it != ExpressionType.BLINK }.toList()
+
     /**
      * 处理手柄按键事件
-     * 手柄X键：触发Demo
-     * 手柄B键：停止Demo
      */
     @SuppressLint("RestrictedApi")
     override fun dispatchKeyEvent(event: KeyEvent): Boolean {
         if (event.action == KeyEvent.ACTION_DOWN) {
             when (event.keyCode) {
+                // X/A键：开始语音对话
                 KeyEvent.KEYCODE_BUTTON_X, KeyEvent.KEYCODE_BUTTON_A -> {
-                    // 手柄X/A键：触发一键对话
                     checkRecordPermissionAndStartAsr()
                     return true
                 }
-                KeyEvent.KEYCODE_BUTTON_B, KeyEvent.KEYCODE_BACK -> {
-                    // 手柄B键：停止所有任务回到待机，返回键不处理
-                    if (event.keyCode == KeyEvent.KEYCODE_BUTTON_B) {
-                        demoSequenceManager.stopDemo() // 停止Demo
-                        audioManager.stopSpeaking() // 停止TTS播放
-                        audioManager.stopListening() // 停止ASR
-                        llmManager.cancelRequest() // 取消LLM请求
-                        expressionManager.requestExpression(ExpressionType.IDLE, force = true) // 切回待机
-                        return true
+                // B键：停止所有操作，回到待机
+                KeyEvent.KEYCODE_BUTTON_B -> {
+                    demoSequenceManager.stopDemo()
+                    audioManager.stopSpeaking()
+                    audioManager.stopListening()
+                    llmManager.cancelRequest()
+                    visionManager.stopFaceDetect()
+                    expressionManager.requestExpression(ExpressionType.IDLE, force = true)
+                    return true
+                }
+                // Y键：循环切换渲染风格
+                KeyEvent.KEYCODE_BUTTON_Y -> {
+                    val styles = ExpressionStyle.values()
+                    val currentStyle = expressionManager.getCurrentStyle()
+                    val nextIndex = (currentStyle.ordinal + 1) % styles.size
+                    expressionManager.setStyle(styles[nextIndex])
+                    return true
+                }
+                // L1键：上一个表情
+                KeyEvent.KEYCODE_BUTTON_L1, KeyEvent.KEYCODE_BUTTON_R2 -> {
+                    currentExpressionIndex = (currentExpressionIndex - 1 + expressionList.size) % expressionList.size
+                    expressionManager.requestExpression(expressionList[currentExpressionIndex], force = true)
+                    return true
+                }
+                // R1键：下一个表情
+                KeyEvent.KEYCODE_BUTTON_R1, KeyEvent.KEYCODE_BUTTON_L2 -> {
+                    currentExpressionIndex = (currentExpressionIndex + 1) % expressionList.size
+                    expressionManager.requestExpression(expressionList[currentExpressionIndex], force = true)
+                    return true
+                }
+                // 十字键上：增加表情强度
+                KeyEvent.KEYCODE_DPAD_UP -> {
+                    val currentIntensity = (expressionManager.expressionState.value.intensity + 10).coerceIn(0, 100)
+                    expressionManager.requestExpression(
+                        type = expressionManager.expressionState.value.type,
+                        intensity = currentIntensity,
+                        force = true
+                    )
+                    return true
+                }
+                // 十字键下：减小表情强度
+                KeyEvent.KEYCODE_DPAD_DOWN -> {
+                    val currentIntensity = (expressionManager.expressionState.value.intensity - 10).coerceIn(0, 100)
+                    expressionManager.requestExpression(
+                        type = expressionManager.expressionState.value.type,
+                        intensity = currentIntensity,
+                        force = true
+                    )
+                    return true
+                }
+                // Start键：开始/停止人脸识别
+                KeyEvent.KEYCODE_BUTTON_START, KeyEvent.KEYCODE_MENU -> {
+                    if (visionManager.isDetecting()) {
+                        visionManager.stopFaceDetect()
+                    } else {
+                        checkCameraPermissionAndStartFaceDetect()
                     }
+                    return true
+                }
+                // Select键：播放演示Demo
+                KeyEvent.KEYCODE_BUTTON_SELECT, KeyEvent.KEYCODE_SEARCH -> {
+                    demoSequenceManager.triggerStandardDemo()
+                    return true
+                }
+                KeyEvent.KEYCODE_BACK -> {
+                    // 返回键不拦截，交给系统处理
+                    return super.dispatchKeyEvent(event)
                 }
             }
         }
         return super.dispatchKeyEvent(event)
     }
 
-    override fun onDestroy() {
-        super.onDestroy()
-        expressionManager.stop()
-        communicationManager.stop()
-        brightnessManager.stop()
-        audioManager.release()
-        llmManager.release()
-        visionManager.release()
-    }
-
     /**
-     * 检查录音权限，开始完整对话流程（ASR→LLM→TTS）
+     * 检查录音权限，开始完整对话流程
      */
     internal fun checkRecordPermissionAndStartAsr() {
         pendingAsrOnlyTest = false
         if (ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
             ActivityCompat.requestPermissions(this, arrayOf(Manifest.permission.RECORD_AUDIO), REQUEST_RECORD_AUDIO_PERMISSION)
         } else {
-            // 有权限，开始识别
             startAsrRecognition(pendingAsrOnlyTest)
         }
     }
 
     /**
-     * 检查录音权限，开始ASR单独测试（识别结果直接播报，不调用LLM）
+     * 检查录音权限，开始ASR单独测试
      */
     internal fun checkRecordPermissionAndStartAsrOnly() {
         pendingAsrOnlyTest = true
         if (ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
             ActivityCompat.requestPermissions(this, arrayOf(Manifest.permission.RECORD_AUDIO), REQUEST_RECORD_AUDIO_PERMISSION)
         } else {
-            // 有权限，开始ASR单独测试
             startAsrRecognition(asrOnly = true)
         }
     }
 
     /**
      * 开始ASR识别
-     * @param asrOnly 是否仅测试ASR：true则识别结果直接播报，不调用LLM；false则走完整链路ASR→LLM→TTS
      */
     private fun startAsrRecognition(asrOnly: Boolean = false) {
         if (audioManager.isListening() || audioManager.isSpeaking()) {
             return
         }
+        // 切换到识别中表情
+        //expressionManager.requestExpression(ExpressionType.RECOGNIZING)
+        ModuleStateManager.onAsrStartListening()
+
         audioManager.startListening(object : AsrManager.AsrResultCallback {
             override fun onResult(text: String) {
-                // 识别完成
-                if (text.isNotEmpty()) {
-                    runOnUiThread {
+                runOnUiThread {
+                    ModuleStateManager.onAsrFinish()
+                    if (text.isNotEmpty()) {
                         if (asrOnly) {
-                            // ASR单独测试模式：直接播报识别结果
                             audioManager.startSpeaking("识别结果：$text")
                         } else {
-                            // 完整链路：发送给LLM
                             sendTextToLlm(text)
                         }
+                    } else {
+                        expressionManager.requestExpression(ExpressionType.IDLE, force = true)
                     }
                 }
             }
 
             override fun onError(errorMsg: String) {
                 runOnUiThread {
+                    ModuleStateManager.onAsrFinish()
+                    expressionManager.requestExpression(ExpressionType.CONFUSED)
                     audioManager.startSpeaking("抱歉，我没有听清，请再说一遍")
                 }
             }
@@ -262,20 +341,32 @@ class MainActivity : ComponentActivity() {
     }
 
     /**
-     * 发送文本给LLM，获取回复后TTS播报
+     * 发送文本给LLM
      */
     private fun sendTextToLlm(text: String) {
         if (text.isBlank()) {
             return
         }
+        // 切换到思考表情
+        //expressionManager.requestExpression(ExpressionType.THINKING)
+        ModuleStateManager.onLlmStartThinking()
+
         llmManager.sendQuery(text, object : LlmManager.LlmCallback {
             override fun onSuccess(response: String) {
-                // LLM返回成功，播报回复
-                audioManager.startSpeaking(response)
+                runOnUiThread {
+                    ModuleStateManager.onLlmFinish()
+                    // 切换到说话表情，开始播报
+                    expressionManager.requestExpression(ExpressionType.SPEAKING)
+                    audioManager.startSpeaking(response)
+                }
             }
 
             override fun onError(errorMsg: String) {
-                audioManager.startSpeaking("抱歉，我现在无法回答你的问题，请稍后再试")
+                runOnUiThread {
+                    ModuleStateManager.onLlmFinish()
+                    expressionManager.requestExpression(ExpressionType.SAD)
+                    audioManager.startSpeaking("抱歉，我现在无法回答你的问题，请稍后再试")
+                }
             }
         })
     }
@@ -285,7 +376,6 @@ class MainActivity : ComponentActivity() {
         when (requestCode) {
             REQUEST_RECORD_AUDIO_PERMISSION -> {
                 if (grantResults.isNotEmpty() && grantResults[0] == PackageManager.PERMISSION_GRANTED) {
-                    // 权限通过，根据待执行模式启动
                     startAsrRecognition(pendingAsrOnlyTest)
                 } else {
                     audioManager.startSpeaking("请授予录音权限，否则无法进行语音识别")
@@ -293,7 +383,6 @@ class MainActivity : ComponentActivity() {
             }
             REQUEST_CAMERA_PERMISSION -> {
                 if (grantResults.isNotEmpty() && grantResults[0] == PackageManager.PERMISSION_GRANTED) {
-                    // 权限通过，开始人脸检测
                     startFaceDetect()
                 } else {
                     audioManager.startSpeaking("请授予相机权限，否则无法进行人脸识别")
@@ -303,13 +392,12 @@ class MainActivity : ComponentActivity() {
     }
 
     /**
-     * 检查相机权限，没有则申请
+     * 检查相机权限
      */
     internal fun checkCameraPermissionAndStartFaceDetect() {
         if (ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA) != PackageManager.PERMISSION_GRANTED) {
             ActivityCompat.requestPermissions(this, arrayOf(Manifest.permission.CAMERA), REQUEST_CAMERA_PERMISSION)
         } else {
-            // 有权限，开始检测
             startFaceDetect()
         }
     }
@@ -319,227 +407,310 @@ class MainActivity : ComponentActivity() {
      */
     private fun startFaceDetect() {
         visionManager.startFaceDetect(this, object : VisionManager.VisionStateCallback {
+            override fun onFaceDetected(faceOffsetX: Float, faceOffsetY: Float, faceSize: Float) {
+                super.onFaceDetected(faceOffsetX, faceOffsetY, faceSize)
+                // 实时更新瞳孔偏移，实现视线跟踪
+                expressionManager.setPupilOffset(faceOffsetX, faceOffsetY)
+            }
+
+            override fun onFaceLost() {
+                super.onFaceLost()
+                // 人脸离开，重置瞳孔到中心
+                expressionManager.setPupilOffset(0f, 0f)
+            }
+
             override fun onTimeout() {
                 super.onTimeout()
-                // 7秒未检测到人脸：先停止检测切IDLE，再TTS语音提醒，播报完自动回IDLE
+                // 超时，重置瞳孔到中心
+                expressionManager.setPupilOffset(0f, 0f)
                 visionManager.stopFaceDetect()
+                expressionManager.requestExpression(ExpressionType.IDLE, force = true)
                 audioManager.startSpeaking("我看不到你哦，请面向镜头")
+            }
+
+            override fun onStop() {
+                super.onStop()
+                // 停止检测，重置瞳孔到中心
+                expressionManager.setPupilOffset(0f, 0f)
             }
         })
     }
-}
 
-/**
- * 调试面板 - 开发测试用
- * 提供按钮手动测试所有功能，无需写代码
- * @param onStartConversation 一键开始语音对话的回调
- * @param onStartFaceDetect 开始人脸检测的回调
- * @param onSendText 发送文本给LLM的回调
- */
-@Composable
-private fun DebugPanel(
-    onStartConversation: () -> Unit = {},
-    onStartAsrOnlyTest: () -> Unit = {},
-    onStartFaceDetect: () -> Unit = {},
-    onSendText: (String) -> Unit = {}
-) {
-    // 测试时设置为true显示调试面板，发布时设置为false
-    val showDebug = true
+    override fun onDestroy() {
+        super.onDestroy()
+        // 释放所有资源
+        demoSequenceManager.stopDemo()
+        audioManager.stopSpeaking()
+        audioManager.stopListening()
+        llmManager.cancelRequest()
+        visionManager.stopFaceDetect()
+        expressionManager.stop()
+        communicationManager.stop()
+        brightnessManager.stop()
+    }
 
-    if (showDebug) {
-        val context = LocalContext.current
-        val expressionManager = remember { ExpressionManager.getInstance() }
-        val demoSequenceManager = remember { (context.applicationContext as RpoExpressionApp).demoSequenceManager }
-        val audioManager = remember { AudioManager.getInstance(context) }
-        val visionManager = remember { VisionManager.getInstance(context) }
-        // ASR运行状态，用于更新按钮文字
-        var isAsrListening by remember { mutableStateOf(audioManager.isListening()) }
-        // 人脸检测运行状态
-        var isFaceDetecting by remember { mutableStateOf(visionManager.isDetecting()) }
-        // 对话测试输入文本
-        var inputText by remember { mutableStateOf("") }
-        val scrollState = rememberScrollState()
+    /**
+     * 调试面板 - 开发测试用
+     * 包含完整的表情、风格、强度测试功能
+     */
+    @Composable
+    private fun DebugPanel(
+        onStartConversation: () -> Unit = {},
+        onStartAsrOnlyTest: () -> Unit = {},
+        onStartFaceDetect: () -> Unit = {},
+        onSendText: (String) -> Unit = {}
+    ) {
+        // 测试时设置为true显示调试面板，发布时设置为false
+        val showDebug = true
 
-        // 定时同步状态，保证按钮文字正确
-        LaunchedEffect(Unit) {
-            while (true) {
-                isAsrListening = audioManager.isListening()
-                isFaceDetecting = visionManager.isDetecting()
-                delay(500)
-            }
-        }
+        if (showDebug) {
+            var isAsrListening by remember { mutableStateOf(audioManager.isListening()) }
+            var isFaceDetecting by remember { mutableStateOf(visionManager.isDetecting()) }
+            var inputText by remember { mutableStateOf("") }
+            var currentIntensity by remember { mutableStateOf(100) }
+            val expressionState by expressionManager.expressionState.collectAsState()
+            val scrollState = rememberScrollState()
 
-        Column(
-            modifier = Modifier
-                .fillMaxSize()
-                .padding(8.dp)
-                .verticalScroll(scrollState),
-            verticalArrangement = Arrangement.Bottom
-        ) {
-            // ==================== 配置状态显示 ====================
-            val asrKeyConfigured = Constants.QWEN_ASR_API_KEY.isNotBlank()
-            val llmKeyConfigured = Constants.QWEN_LLM_API_KEY.isNotBlank()
-            Text(
-                text = buildString {
-                    append("🔧 配置状态：")
-                    append("ASR Key: ${if (asrKeyConfigured) "✅已配置" else "❌未配置"} | ")
-                    append("LLM Key: ${if (llmKeyConfigured) "✅已配置" else "⚠️未配置(模拟模式)"}")
-                },
-                color = Color.White,
-                fontSize = 11.sp
-            )
-            Divider(color = Color.Gray, modifier = Modifier.padding(vertical = 4.dp))
-
-            // ==================== 对话测试区域 ====================
-            Text("=== 对话测试 ===", color = Color.White)
-            // 语音测试按钮：完整对话 + ASR单独测试
-            Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                Button(
-                    modifier = Modifier.weight(1f),
-                    onClick = {
-                        if (isAsrListening) {
-                            audioManager.stopListening()
-                        } else {
-                            onStartConversation()
-                        }
-                    }
-                ) {
-                    Text(if (isAsrListening) "停止" else "🎤 完整对话", fontSize = 12.sp)
-                }
-                Button(
-                    modifier = Modifier.weight(1f),
-                    onClick = {
-                        if (isAsrListening) {
-                            audioManager.stopListening()
-                        } else {
-                            onStartAsrOnlyTest()
-                        }
-                    }
-                ) {
-                    Text(if (isAsrListening) "停止" else "🔍 单独测ASR", fontSize = 12.sp)
+            LaunchedEffect(Unit) {
+                while (true) {
+                    isAsrListening = audioManager.isListening()
+                    isFaceDetecting = visionManager.isDetecting()
+                    currentIntensity = expressionState.intensity
+                    delay(200)
                 }
             }
-            // 文本输入测试（测试LLM）
-            OutlinedTextField(
-                value = inputText,
-                onValueChange = { inputText = it },
+
+            // 半透明背景面板，不遮挡眼睛显示
+            Column(
                 modifier = Modifier
-                    .fillMaxWidth()
-                    .padding(vertical = 4.dp),
-                label = { Text("输入文本测试LLM", color = Color.White, fontSize = 12.sp) },
-                singleLine = true
-            )
-            Button(
-                modifier = Modifier.fillMaxWidth(),
-                onClick = {
-                    if (inputText.isNotBlank()) {
-                        onSendText(inputText.trim())
-                        inputText = ""
+                    .fillMaxSize()
+                    .padding(8.dp)
+                    .verticalScroll(scrollState),
+                verticalArrangement = Arrangement.Bottom
+            ) {
+                // ========== 状态显示栏 ==========
+                Box(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .background(
+                            color = ComposeColor(0x80000000),
+                            shape = RoundedCornerShape(8.dp)
+                        )
+                        .padding(8.dp)
+                ) {
+                    Column {
+                        Text(
+                            text = "🤖 RPO纯眼表情系统 v1.0",
+                            color = ComposeColor.White,
+                            fontSize = 12.sp,
+                            fontWeight = androidx.compose.ui.text.font.FontWeight.Bold
+                        )
+                        Text(
+                            text = "当前表情: ${expressionState.type.name} | 风格: ${expressionState.style.name} | 强度: ${expressionState.intensity}%",
+                            color = ComposeColor(0xFFE0E0E0),
+                            fontSize = 11.sp
+                        )
                     }
                 }
-            ) {
-                Text("发送文本测试LLM并播报", fontSize = 12.sp)
-            }
-            Divider(color = Color.Gray, modifier = Modifier.padding(vertical = 4.dp))
 
-            // Demo控制
-            Text("=== Demo控制 ===", color = Color.White)
-            Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                Button(
-                    modifier = Modifier.weight(1f),
-                    onClick = { demoSequenceManager.triggerStandardDemo() }
-                ) {
-                    Text("播放Demo", fontSize = 12.sp)
-                }
-                Button(
-                    modifier = Modifier.weight(1f),
-                    onClick = { demoSequenceManager.stopDemo() }
-                ) {
-                    Text("停止Demo", fontSize = 12.sp)
-                }
-            }
-            Divider(color = Color.Gray, modifier = Modifier.padding(vertical = 4.dp))
+                Spacer(modifier = Modifier.padding(4.dp))
 
-            // 基础表情
-            Text("=== 基础表情 ===", color = Color.White)
-            Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(4.dp)) {
-                Button(
-                    modifier = Modifier.weight(1f),
-                    onClick = {
-                        // 停止所有正在进行的任务，回到干净的待机状态
-                        demoSequenceManager.stopDemo() // 停止演示序列
-                        audioManager.stopSpeaking() // 停止TTS播放
-                        audioManager.stopListening() // 停止ASR
-                        expressionManager.requestExpression(ExpressionType.IDLE, force = true) // 强制切回待机表情
-                    }
-                ) {
-                    Text("待机", fontSize = 12.sp)
-                }
-                Button(
-                    modifier = Modifier.weight(1f),
-                    onClick = { expressionManager.requestExpression(ExpressionType.BLINK) }
-                ) {
-                    Text("眨眼", fontSize = 12.sp)
-                }
-                Button(
-                    modifier = Modifier.weight(1f),
-                    onClick = { expressionManager.requestExpression(ExpressionType.THINKING) }
-                ) {
-                    Text("思考", fontSize = 12.sp)
-                }
-            }
-            Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(4.dp)) {
-                Button(
-                    modifier = Modifier.weight(1f),
-                    onClick = { expressionManager.requestExpression(ExpressionType.RECOGNIZING) }
-                ) {
-                    Text("识别中", fontSize = 12.sp)
-                }
-                Button(
-                    modifier = Modifier.weight(1f),
-                    onClick = { expressionManager.requestExpression(ExpressionType.RESPONSE) }
-                ) {
-                    Text("应答", fontSize = 12.sp)
-                }
-                Button(
-                    modifier = Modifier.weight(1f),
-                    onClick = { expressionManager.requestExpression(ExpressionType.SPEAKING) }
-                ) {
-                    Text("说话", fontSize = 12.sp)
-                }
-            }
-            Divider(color = Color.Gray, modifier = Modifier.padding(vertical = 4.dp))
-
-            // TTS测试
-            Text("=== TTS语音播报测试 ===", color = Color.White)
-            // 真实TTS测试播报按钮
-            Button(
-                modifier = Modifier.fillMaxWidth(),
-                onClick = {
-                    audioManager.startSpeaking("你好，我是RPO智能对话机器人，有什么可以帮你的吗？")
-                }
-            ) {
-                Text("测试播报（系统TTS）", fontSize = 12.sp)
-            }
-            Divider(color = Color.Gray, modifier = Modifier.padding(vertical = 4.dp))
-
-            // 人脸识别测试
-            Text("=== 人脸识别测试 ===", color = Color.White)
-            // 真实ML Kit人脸检测按钮
-            Button(
-                modifier = Modifier.fillMaxWidth(),
-                onClick = {
-                    if (isFaceDetecting) {
-                        visionManager.stopFaceDetect()
-                    } else {
-                        isFaceDetecting = true
-                        onStartFaceDetect()
+                // ========== 风格切换 ==========
+                Text("🎨 渲染风格", color = ComposeColor.White, fontSize = 12.sp, fontWeight = androidx.compose.ui.text.font.FontWeight.Bold)
+                Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+                    val styles = listOf(
+                        ExpressionStyle.CARTOON to "卡通圆眼",
+                        ExpressionStyle.CYBERPUNK to "机械赛博",
+                        ExpressionStyle.MINIMAL to "极简线条",
+                        ExpressionStyle.PIXEL to "像素8bit"
+                    )
+                    styles.forEach { (style, name) ->
+                        Button(
+                            modifier = Modifier.weight(1f),
+                            colors = ButtonDefaults.buttonColors(
+                                containerColor = if (expressionState.style == style)
+                                    ComposeColor(0xFF2196F3) else ComposeColor(0x60606060),
+                                contentColor = ComposeColor.White
+                            ),
+                            onClick = { expressionManager.setStyle(style) }
+                        ) {
+                            Text(name, fontSize = 10.sp)
+                        }
                     }
                 }
-            ) {
-                Text(if (isFaceDetecting) "停止检测" else "开始人脸检测（ML Kit）", fontSize = 12.sp)
+
+                Spacer(modifier = Modifier.padding(4.dp))
+
+                // ========== 强度调节 ==========
+                Text("📊 表情强度: $currentIntensity%", color = ComposeColor.White, fontSize = 12.sp, fontWeight = androidx.compose.ui.text.font.FontWeight.Bold)
+                Slider(
+                    value = currentIntensity.toFloat(),
+                    onValueChange = { value ->
+                        currentIntensity = value.toInt()
+                        expressionManager.requestExpression(
+                            type = expressionState.type,
+                            intensity = currentIntensity,
+                            force = true
+                        )
+                    },
+                    valueRange = 0f..100f,
+                    steps = 100,
+                    modifier = Modifier.fillMaxWidth()
+                )
+
+                Spacer(modifier = Modifier.padding(4.dp))
+
+                // ========== 功能类表情 ==========
+                Text("⚙️ 功能类表情", color = ComposeColor.White, fontSize = 12.sp, fontWeight = androidx.compose.ui.text.font.FontWeight.Bold)
+                Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+                    Button(
+                        modifier = Modifier.weight(1f),
+                        onClick = { expressionManager.requestExpression(ExpressionType.IDLE, currentIntensity, force = true) }
+                    ) { Text("待机", fontSize = 10.sp) }
+                    Button(
+                        modifier = Modifier.weight(1f),
+                        onClick = { expressionManager.requestExpression(ExpressionType.SPEAKING, currentIntensity) }
+                    ) { Text("说话", fontSize = 10.sp) }
+                    Button(
+                        modifier = Modifier.weight(1f),
+                        onClick = { expressionManager.requestExpression(ExpressionType.THINKING, currentIntensity) }
+                    ) { Text("思考", fontSize = 10.sp) }
+                }
+                Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+                    Button(
+                        modifier = Modifier.weight(1f),
+                        onClick = { expressionManager.requestExpression(ExpressionType.RECOGNIZING, currentIntensity) }
+                    ) { Text("识别中", fontSize = 10.sp) }
+                    Button(
+                        modifier = Modifier.weight(1f),
+                        onClick = { expressionManager.requestExpression(ExpressionType.RESPONSE, currentIntensity) }
+                    ) { Text("应答", fontSize = 10.sp) }
+                }
+
+                Spacer(modifier = Modifier.padding(4.dp))
+
+                // ========== 情绪类表情 ==========
+                Text("😊 情绪类表情", color = ComposeColor.White, fontSize = 12.sp, fontWeight = androidx.compose.ui.text.font.FontWeight.Bold)
+                Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+                    Button(
+                        modifier = Modifier.weight(1f),
+                        colors = ButtonDefaults.buttonColors(containerColor = ComposeColor(0xFFFFC107)),
+                        onClick = { expressionManager.requestExpression(ExpressionType.HAPPY, currentIntensity) }
+                    ) { Text("开心", fontSize = 10.sp, color = ComposeColor.Black) }
+                    Button(
+                        modifier = Modifier.weight(1f),
+                        colors = ButtonDefaults.buttonColors(containerColor = ComposeColor(0xFFFF9800)),
+                        onClick = { expressionManager.requestExpression(ExpressionType.CONFUSED, currentIntensity) }
+                    ) { Text("疑惑", fontSize = 10.sp, color = ComposeColor.Black) }
+                    Button(
+                        modifier = Modifier.weight(1f),
+                        colors = ButtonDefaults.buttonColors(containerColor = ComposeColor(0xFF9C27B0)),
+                        onClick = { expressionManager.requestExpression(ExpressionType.SURPRISED, currentIntensity) }
+                    ) { Text("惊讶", fontSize = 10.sp) }
+                    Button(
+                        modifier = Modifier.weight(1f),
+                        colors = ButtonDefaults.buttonColors(containerColor = ComposeColor(0xFF2196F3)),
+                        onClick = { expressionManager.requestExpression(ExpressionType.SAD, currentIntensity) }
+                    ) { Text("难过", fontSize = 10.sp) }
+                }
+                Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+                    Button(
+                        modifier = Modifier.weight(1f),
+                        colors = ButtonDefaults.buttonColors(containerColor = ComposeColor(0xFFF44336)),
+                        onClick = { expressionManager.requestExpression(ExpressionType.ANGRY, currentIntensity) }
+                    ) { Text("生气", fontSize = 10.sp) }
+                    Button(
+                        modifier = Modifier.weight(1f),
+                        colors = ButtonDefaults.buttonColors(containerColor = ComposeColor(0xFF9E9E9E)),
+                        onClick = { expressionManager.requestExpression(ExpressionType.SLEEPY, currentIntensity) }
+                    ) { Text("困倦", fontSize = 10.sp) }
+                    Button(
+                        modifier = Modifier.weight(1f),
+                        colors = ButtonDefaults.buttonColors(containerColor = ComposeColor(0xFFE91E63)),
+                        onClick = { expressionManager.requestExpression(ExpressionType.SHY, currentIntensity) }
+                    ) { Text("害羞", fontSize = 10.sp) }
+                }
+
+                Spacer(modifier = Modifier.padding(4.dp))
+
+                // ========== 系统状态表情 ==========
+                Text("🔔 系统状态", color = ComposeColor.White, fontSize = 12.sp, fontWeight = androidx.compose.ui.text.font.FontWeight.Bold)
+                Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+                    Button(
+                        modifier = Modifier.weight(1f),
+                        colors = ButtonDefaults.buttonColors(containerColor = ComposeColor(0xFFFFEB3B)),
+                        onClick = { expressionManager.requestExpression(ExpressionType.LOW_BATTERY, currentIntensity) }
+                    ) { Text("低电量", fontSize = 10.sp, color = ComposeColor.Black) }
+                    Button(
+                        modifier = Modifier.weight(1f),
+                        colors = ButtonDefaults.buttonColors(containerColor = ComposeColor(0xFF4CAF50)),
+                        onClick = { expressionManager.requestExpression(ExpressionType.CHARGING, currentIntensity) }
+                    ) { Text("充电中", fontSize = 10.sp) }
+                    Button(
+                        modifier = Modifier.weight(1f),
+                        colors = ButtonDefaults.buttonColors(containerColor = ComposeColor(0xFFD32F2F)),
+                        onClick = { expressionManager.requestExpression(ExpressionType.ALERT, currentIntensity) }
+                    ) { Text("告警", fontSize = 10.sp) }
+                }
+                Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+                    Button(
+                        modifier = Modifier.weight(1f),
+                        colors = ButtonDefaults.buttonColors(containerColor = ComposeColor(0xFF424242)),
+                        onClick = { expressionManager.requestExpression(ExpressionType.SLEEPING, currentIntensity) }
+                    ) { Text("休眠", fontSize = 10.sp) }
+                    Button(
+                        modifier = Modifier.weight(1f),
+                        colors = ButtonDefaults.buttonColors(containerColor = ComposeColor(0xFF03A9F4)),
+                        onClick = { expressionManager.requestExpression(ExpressionType.UPDATING, currentIntensity) }
+                    ) { Text("升级中", fontSize = 10.sp) }
+                    Button(
+                        modifier = Modifier.weight(1f),
+                        onClick = {
+                            demoSequenceManager.stopDemo()
+                            audioManager.stopSpeaking()
+                            audioManager.stopListening()
+                            expressionManager.clearExpression()
+                        }
+                    ) { Text("清空", fontSize = 10.sp) }
+                }
+
+                Spacer(modifier = Modifier.padding(4.dp))
+
+                // ========== 功能测试 ==========
+                Text("🧪 功能测试", color = ComposeColor.White, fontSize = 12.sp, fontWeight = androidx.compose.ui.text.font.FontWeight.Bold)
+                Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+                    Button(
+                        modifier = Modifier.weight(1f),
+                        onClick = { demoSequenceManager.triggerStandardDemo() }
+                    ) { Text("播放Demo", fontSize = 10.sp) }
+                    Button(
+                        modifier = Modifier.weight(1f),
+                        onClick = {
+                            audioManager.startSpeaking("你好，我是RPO智能对话机器人，现在正在测试纯眼部表情系统。")
+                        }
+                    ) { Text("TTS测试", fontSize = 10.sp) }
+                    Button(
+                        modifier = Modifier.weight(1f),
+                        onClick = { onStartConversation() }
+                    ) { Text("语音对话", fontSize = 10.sp) }
+                    Button(
+                        modifier = Modifier.weight(1f),
+                        colors = ButtonDefaults.buttonColors(
+                            containerColor = if (isFaceDetecting) ComposeColor(0xFFF44336) else ComposeColor(0xFF4CAF50),
+                            contentColor = ComposeColor.White
+                        ),
+                        onClick = {
+                            if (isFaceDetecting) {
+                                visionManager.stopFaceDetect()
+                            } else {
+                                onStartFaceDetect()
+                            }
+                        }
+                    ) { Text(if (isFaceDetecting) "停止人脸" else "人脸识别", fontSize = 10.sp) }
+                }
+
+                Spacer(modifier = Modifier.padding(8.dp))
             }
-            Divider(color = Color.Gray, modifier = Modifier.padding(vertical = 4.dp))
         }
     }
 }

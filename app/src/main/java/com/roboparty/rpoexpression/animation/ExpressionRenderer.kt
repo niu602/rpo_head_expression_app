@@ -5,361 +5,375 @@
 
 package com.roboparty.rpoexpression.animation
 
-import androidx.compose.ui.geometry.CornerRadius
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Size
-import androidx.compose.ui.graphics.*
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.ColorFilter
+import androidx.compose.ui.graphics.ColorMatrix
+import androidx.compose.ui.graphics.Path
 import androidx.compose.ui.graphics.drawscope.DrawScope
 import androidx.compose.ui.graphics.drawscope.Stroke
+import androidx.compose.ui.graphics.drawscope.drawIntoCanvas
+import androidx.compose.ui.graphics.drawscope.scale
+import androidx.compose.ui.graphics.drawscope.translate
+import androidx.compose.ui.graphics.drawscope.withTransform
+import com.roboparty.rpoexpression.animation.style.EyeMetrics
+import com.roboparty.rpoexpression.animation.style.EyeStyleFactory
+import com.roboparty.rpoexpression.expression.EyeEffectType
+import com.roboparty.rpoexpression.expression.ExpressionManager
 import com.roboparty.rpoexpression.expression.ExpressionState
 import com.roboparty.rpoexpression.expression.ExpressionType
-import kotlin.math.cos
+import com.roboparty.rpoexpression.sensor.AmbientLightManager
+import kotlin.math.min
 import kotlin.math.sin
-import androidx.compose.ui.unit.IntSize
+import kotlin.math.cos
+import kotlin.random.Random
+import androidx.compose.ui.geometry.toRect
 /**
- * 表情渲染器
- * 使用Jetpack Compose Canvas进行自定义绘制，保证60fps流畅动画
- *
- * 设计原则：
- * 1. 优先加载正式图片素材，无素材时自动回退到矢量绘制
- * 2. 纯函数式绘制，无状态依赖
- * 3. 基于进度参数驱动所有动画
- * 4. 使用硬件加速绘制路径
+ * 纯眼部表情渲染器
+ * 严格限定在眼部区域绘制，通过参数化控制所有视觉效果
+ * 支持多风格动态切换，支持强度无级调节
  */
 class ExpressionRenderer(
     private val assetLoader: ExpressionAssetLoader
 ) {
 
-    // 主题颜色 - 机器人蓝色眼睛
-    private val eyeColor = Color(0xFF00D4FF)
-    private val eyeGlowColor = Color(0x8000D4FF)
-    private val backgroundColor = Color.Black
-    private val mouthColor = Color(0xFF00D4FF)
-
-    // 缓存绘制路径，减少GC
-    private val eyePath = Path()
-    private val mouthPath = Path()
-
     /**
-     * 主绘制入口
-     * @param state 当前表情状态
-     * @param size 画布尺寸
+     * 主渲染方法：参数化绘制纯眼部表情
      */
-    fun DrawScope.render(state: ExpressionState, size: Size) {
-        // 绘制黑色背景
-        drawRect(color = backgroundColor, size = size)
+    fun DrawScope.render(state: ExpressionState, size: Size, lightConfig: AmbientLightManager.LightConfig) {
+        // 绘制纯黑背景
+        drawRect(color = Color.Black, size = size)
 
-        // 计算中心位置和缩放比例
         val centerX = size.width / 2f
         val centerY = size.height / 2f
-        val scale = size.width / 1220f  // 适配红米Note 12 Turbo 1220px宽度，自适应缩放
+        val time = System.currentTimeMillis() / 1000f
 
-        // 应用100ms平滑过渡动画：新表情从透明到不透明，避免生硬切换
-        val transitionAlpha = state.transitionProgress.coerceIn(0f, 1f)
-        drawContext.canvas.save()
-        drawContext.canvas.translate(0f, (1f - transitionAlpha) * 20f * scale) // 轻微上移进入
-        drawContext.canvas.rotate((1f - transitionAlpha) * 2f, centerX, centerY) // 轻微旋转进入
-        drawContext.canvas.scale(
-            0.95f + 0.05f * transitionAlpha,
-            0.95f + 0.05f * transitionAlpha,
-            centerX,
-            centerY
-        ) // 轻微缩放进入
-
-        // 优先尝试加载正式图片素材，有素材直接绘制图片
-        val expressionBitmap = assetLoader.loadExpressionBitmap(state.type, size.width.toInt(), size.height.toInt())
-        if (expressionBitmap != null) {
-            // 绘制图片，等比拉伸填满屏幕
-            drawImage(
-                image = expressionBitmap,
-                dstSize =IntSize(size.width.toInt(), size.height.toInt()),
-                alpha = transitionAlpha
+        // 计算色温调整系数
+        val (rCoeff, gCoeff, bCoeff) = when {
+            lightConfig.isNightMode -> Triple(1.1f, 1.0f, 0.7f) // 夜光模式：暖黄，减少蓝光
+            lightConfig.colorTemp < 4000 -> Triple(1.08f, 1.02f, 0.85f) // 暖光
+            lightConfig.colorTemp > 6000 -> Triple(0.9f, 0.98f, 1.1f) // 冷光
+            else -> Triple(1.0f, 1.0f, 1.0f) // 中性光
+        }
+        val brightness = lightConfig.brightness
+        val colorMatrix = ColorMatrix(
+            floatArrayOf(
+                rCoeff * brightness, 0f, 0f, 0f, 0f,
+                0f, gCoeff * brightness, 0f, 0f, 0f,
+                0f, 0f, bCoeff * brightness, 0f, 0f,
+                0f, 0f, 0f, 1f, 0f
             )
-        } else {
-            // 无素材时回退到矢量绘制
-            when (state.type) {
-                ExpressionType.IDLE -> renderIdle(centerX, centerY, scale, state.progress)
-                ExpressionType.BLINK -> renderBlink(centerX, centerY, scale, state.progress)
-                ExpressionType.SPEAKING -> renderSpeaking(centerX, centerY, scale, state.progress)
-                ExpressionType.THINKING -> renderThinking(centerX, centerY, scale, state.progress)
-                ExpressionType.RECOGNIZING -> renderRecognizing(centerX, centerY, scale, state.progress)
-                ExpressionType.RESPONSE -> renderResponse(centerX, centerY, scale, state.progress)
+        )
+
+        // 应用微动画：呼吸缩放
+        val microAnim = MicroAnimationLayer.getInstance().apply(state.type)
+
+        drawIntoCanvas { canvas ->
+            canvas.save()
+
+            // 应用环境光颜色滤镜（亮度+色温）
+            drawContext.canvas.saveLayer(bounds = size.toRect(), paint = androidx.compose.ui.graphics.Paint().apply {
+                colorFilter = ColorFilter.colorMatrix(colorMatrix)
+            })
+
+            // 应用呼吸缩放
+            scale(microAnim.scale, microAnim.scale, pivot = Offset(centerX, centerY)) {
+                // 应用头部Y轴微动
+                translate(top = microAnim.offsetY * size.height * 0.05f) {
+                    // 获取当前风格渲染器
+                    val styleRenderer = EyeStyleFactory.getRenderer(state.style)
+
+                    // 获取应用了强度和过渡的眼部参数
+                    val eyeParams = state.getEyeParameters()
+                    // 计算眼睛位置度量
+                    val eyeMetrics = with(styleRenderer) {
+                        calculateEyeMetrics(eyeParams, centerX, centerY, size)
+                    }
+                    // 计算左右瞳孔位置
+                    val leftPupil = with(styleRenderer) {
+                        calculatePupilPosition(eyeMetrics.leftEyeCenter, eyeMetrics.eyeWidth, eyeMetrics.eyeHeight, eyeParams)
+                    }
+                    val rightPupil = with(styleRenderer) {
+                        calculatePupilPosition(eyeMetrics.rightEyeCenter, eyeMetrics.eyeWidth, eyeMetrics.eyeHeight, eyeParams)
+                    }
+                    val pupilRadius = eyeMetrics.eyeWidth * 0.18f // 瞳孔半径
+
+                    // 绘制眼睛
+                    with(styleRenderer) {
+                        drawEyes(eyeParams, centerX, centerY, size, time)
+                    }
+
+                    // 绘制眼内特效（严格限制在瞳孔/眼周区域）
+                    drawEyeEffects(leftPupil, rightPupil, pupilRadius, eyeMetrics.scale, time, lightConfig.highlight)
+
+                    // 绘制系统状态特殊叠加效果
+                    drawSystemStateOverlays(state, centerX, centerY, size, time)
+                }
+            }
+
+            // 恢复环境光颜色滤镜
+            drawContext.canvas.restore()
+            canvas.restore()
+        }
+    }
+
+    /**
+     * 绘制眼内特效（严格限制在瞳孔和眼周区域，不超出眼睛范围）
+     */
+    private fun DrawScope.drawEyeEffects(
+        leftPupil: Offset,
+        rightPupil: Offset,
+        pupilRadius: Float,
+        scale: Float,
+        time: Float,
+        highlight: Float
+    ) {
+        val effect = ExpressionManager.getInstance().currentEffect.value
+        if (effect == EyeEffectType.NONE) return
+
+        // 对左右眼分别绘制特效
+        listOf(leftPupil, rightPupil).forEach { pupilCenter ->
+            when (effect) {
+                EyeEffectType.THINKING_LOADING -> {
+                    // 思考：旋转加载线，2条旋转圆弧
+                    val rotateAngle = time * 2f // 旋转速度
+                    val arcRadius = pupilRadius * 1.3f
+                    val strokeWidth = 2f * scale
+
+                    // 两条旋转的半圆弧
+                    for (i in 0..1) {
+                        val startAngle = Math.toRadians(((rotateAngle + i * 180f) % 360f).toDouble())
+                        val sweepAngle = Math.toRadians(60.0)
+                        drawArc(
+                            color = Color.White.copy(alpha = 0.6f * highlight),
+                            startAngle = Math.toDegrees(startAngle).toFloat(),
+                            sweepAngle = Math.toDegrees(sweepAngle).toFloat(),
+                            useCenter = false,
+                            topLeft = Offset(pupilCenter.x - arcRadius, pupilCenter.y - arcRadius),
+                            size = Size(arcRadius * 2, arcRadius * 2),
+                            style = Stroke(width = strokeWidth)
+                        )
+                    }
+                }
+
+                EyeEffectType.RECOGNIZE_SUCCESS -> {
+                    // 识别成功：星芒高光，4条放射状光线，闪烁1秒
+                    val progress = (time % 1.5f) / 1.5f
+                    if (progress > 0.8f) return@forEach // 只显示前0.8秒
+                    val alpha = (1f - progress / 0.8f) * 0.8f * highlight
+                    val rayLength = pupilRadius * (1f + progress * 0.5f)
+                    val strokeWidth = 1.5f * scale
+
+                    // 4条星芒射线
+                    for (i in 0..3) {
+                        val angle = i * Math.PI / 2f
+                        val endX = pupilCenter.x + cos(angle).toFloat() * rayLength
+                        val endY = pupilCenter.y + sin(angle).toFloat() * rayLength
+                        drawLine(
+                            color = Color.White.copy(alpha = alpha),
+                            start = pupilCenter,
+                            end = Offset(endX, endY),
+                            strokeWidth = strokeWidth
+                        )
+                    }
+                    // 中心亮点
+                    drawCircle(
+                        color = Color.White.copy(alpha = alpha * 0.7f),
+                        radius = pupilRadius * 0.3f * (1f - progress),
+                        center = pupilCenter
+                    )
+                }
+
+                EyeEffectType.HAPPY_STARLIGHT -> {
+                    // 开心：细碎星光，随机小光点闪烁
+                    val starCount = 6
+                    val starSeed = (time * 2f).toInt()
+                    val random = Random(starSeed) // 固定种子，避免每帧乱跳
+                    repeat(starCount) {
+                        val angle = random.nextFloat() * 2f * Math.PI.toFloat()
+                        val distance = random.nextFloat() * pupilRadius * 1.2f
+                        val starX = pupilCenter.x + cos(angle) * distance
+                        val starY = pupilCenter.y + sin(angle) * distance
+                        val blink = (sin(time * 3f + it) * 0.5f + 0.5f)
+                        val starRadius = (1f + random.nextFloat() * 1.5f) * scale
+                        drawCircle(
+                            color = Color.White.copy(alpha = blink * 0.7f * highlight),
+                            radius = starRadius,
+                            center = Offset(starX, starY)
+                        )
+                    }
+                }
+
+                EyeEffectType.ERROR_PULSE -> {
+                    // 报错：红色脉冲光，向外扩散圆环
+                    val pulseProgress = (time % 1f)
+                    val pulseRadius = pupilRadius * (1f + pulseProgress * 1f)
+                    val alpha = (1f - pulseProgress) * 0.5f * highlight
+                    val strokeWidth = 2f * scale * (1f - pulseProgress)
+
+                    drawCircle(
+                        color = Color(0xFFFF5252).copy(alpha = alpha),
+                        radius = pulseRadius,
+                        center = pupilCenter,
+                        style = Stroke(width = strokeWidth)
+                    )
+                    // 中心红色微光
+                    drawCircle(
+                        color = Color(0xFFFF5252).copy(alpha = 0.3f * highlight),
+                        radius = pupilRadius * 0.8f,
+                        center = pupilCenter
+                    )
+                }
+
+                else -> {}
             }
         }
-
-        // 应用透明度过渡
-        drawRect(
-            color = backgroundColor.copy(alpha = 1f - transitionAlpha),
-            size = size,
-            blendMode = BlendMode.SrcOver
-        )
-        drawContext.canvas.restore()
     }
 
     /**
-     * 绘制待机表情 - 轻微呼吸微动
+     * 绘制系统状态特殊叠加效果
+     * 严格不涉及下半脸元素
      */
-    private fun DrawScope.renderIdle(cx: Float, cy: Float, scale: Float, progress: Float) {
-        // 呼吸效果：眼睛大小轻微变化
-        val breathScale = 1f + 0.02f * sin(progress * 2 * Math.PI).toFloat()
-        val eyeOffsetY = 5f * sin(progress * 2 * Math.PI).toFloat() * scale
+    private fun DrawScope.drawSystemStateOverlays(
+        state: ExpressionState,
+        centerX: Float,
+        centerY: Float,
+        size: Size,
+        time: Float
+    ) {
+        val scale = min(size.width, size.height) / 1080f
 
-        // 绘制双眼
-        drawEye(cx - 180f * scale, cy + eyeOffsetY, 80f * scale * breathScale)
-        drawEye(cx + 180f * scale, cy + eyeOffsetY, 80f * scale * breathScale)
+        when (state.type) {
+            ExpressionType.THINKING -> {
+                // 思考状态：三个跳动省略号（眼部下方）
+                val dotRadius = 8f * scale
+                val dotSpacing = 30f * scale
+                val dotY = centerY + size.height * 0.25f
+                for (i in 0..2) {
+                    val offset = sin(time * 3f + i * 0.8f) * 6f * scale
+                    drawCircle(
+                        color = Color(0xFFFFD700).copy(alpha = 0.7f + 0.3f * sin(time * 3f + i * 0.8f)),
+                        radius = dotRadius,
+                        center = Offset(centerX + (i - 1) * dotSpacing, dotY + offset)
+                    )
+                }
+            }
 
-        // 绘制微笑嘴巴
-        drawSmileMouth(cx, cy + 150f * scale, 100f * scale, 0.3f)
-    }
+            ExpressionType.RECOGNIZING -> {
+                // 识别中状态：眼部区域扫描框
+                val boxWidth = size.width * 0.5f
+                val boxHeight = size.height * 0.4f
+                val boxLeft = centerX - boxWidth/2
+                val boxTop = centerY - boxHeight/2
+                val scanOffset = (time % 1.5f) / 1.5f * boxHeight
+                val cornerLength = 25f * scale
+                val strokeWidth = 2f * scale
+                val boxColor = Color(0xFF7C4DFF).copy(alpha = 0.8f)
 
-    /**
-     * 绘制眨眼表情 - 眼睛快速闭合再睁开
-     */
-    private fun DrawScope.renderBlink(cx: Float, cy: Float, scale: Float, progress: Float) {
-        // 眨眼进度：0~0.5闭合，0.5~1睁开
-        val eyeHeight = if (progress < 0.5f) {
-            80f * scale * (1f - progress * 2)
-        } else {
-            80f * scale * ((progress - 0.5f) * 2)
-        }
+                // 四角
+                drawLine(boxColor, Offset(boxLeft, boxTop), Offset(boxLeft + cornerLength, boxTop), strokeWidth = strokeWidth)
+                drawLine(boxColor, Offset(boxLeft, boxTop), Offset(boxLeft, boxTop + cornerLength), strokeWidth = strokeWidth)
+                drawLine(boxColor, Offset(boxLeft + boxWidth, boxTop), Offset(boxLeft + boxWidth - cornerLength, boxTop), strokeWidth = strokeWidth)
+                drawLine(boxColor, Offset(boxLeft + boxWidth, boxTop), Offset(boxLeft + boxWidth, boxTop + cornerLength), strokeWidth = strokeWidth)
+                drawLine(boxColor, Offset(boxLeft, boxTop + boxHeight), Offset(boxLeft + cornerLength, boxTop + boxHeight), strokeWidth = strokeWidth)
+                drawLine(boxColor, Offset(boxLeft, boxTop + boxHeight), Offset(boxLeft, boxTop + boxHeight - cornerLength), strokeWidth = strokeWidth)
+                drawLine(boxColor, Offset(boxLeft + boxWidth, boxTop + boxHeight), Offset(boxLeft + boxWidth - cornerLength, boxTop + boxHeight), strokeWidth = strokeWidth)
+                drawLine(boxColor, Offset(boxLeft + boxWidth, boxTop + boxHeight), Offset(boxLeft + boxWidth, boxTop + boxHeight - cornerLength), strokeWidth = strokeWidth)
 
-        // 绘制闭合/半睁的眼睛
-        drawEyeSquint(cx - 180f * scale, cy, 80f * scale, eyeHeight)
-        drawEyeSquint(cx + 180f * scale, cy, 80f * scale, eyeHeight)
+                // 扫描线
+                drawLine(
+                    Color(0xFF7C4DFF).copy(alpha = 0.6f),
+                    Offset(boxLeft, boxTop + scanOffset),
+                    Offset(boxLeft + boxWidth, boxTop + scanOffset),
+                    strokeWidth = 1.5f * scale
+                )
+            }
 
-        // 保持微笑
-        drawSmileMouth(cx, cy + 150f * scale, 100f * scale, 0.3f)
-    }
+            ExpressionType.RESPONSE -> {
+                // 应答状态：对勾动画（眼部下方）
+                val progress = state.transitionProgress.coerceIn(0f, 1f)
+                val checkSize = 50f * scale
+                val checkY = centerY + size.height * 0.22f
+                val path = Path().apply {
+                    moveTo(centerX - checkSize/2, checkY)
+                    lineTo(centerX - checkSize/6, checkY + checkSize/2)
+                    lineTo(centerX + checkSize/2, checkY - checkSize/3)
+                }
+                drawPath(
+                    path = path,
+                    color = Color(0xFFFFD700).copy(alpha = progress),
+                    style = Stroke(width = 5f * scale)
+                )
+            }
 
-    /**
-     * 绘制说话表情 - 嘴巴张合动画
-     */
-    private fun DrawScope.renderSpeaking(cx: Float, cy: Float, scale: Float, progress: Float) {
-        // 眼睛保持睁开
-        drawEye(cx - 180f * scale, cy, 80f * scale)
-        drawEye(cx + 180f * scale, cy, 80f * scale)
+            ExpressionType.CHARGING -> {
+                // 充电状态：闪电图标
+                val boltSize = 30f * scale
+                val boltY = centerY - size.height * 0.25f
+                val boltPath = Path().apply {
+                    moveTo(centerX, boltY - boltSize)
+                    lineTo(centerX - boltSize/2, boltY)
+                    lineTo(centerX, boltY - boltSize/4)
+                    lineTo(centerX, boltY + boltSize)
+                    lineTo(centerX + boltSize/2, boltY - boltSize/4)
+                    lineTo(centerX, boltY)
+                    close()
+                }
+                drawPath(
+                    path = boltPath,
+                    color = Color(0xFF66BB6A).copy(alpha = 0.5f + 0.5f * sin(time * 2f)),
+                    style = Stroke(width = 3f * scale)
+                )
+            }
 
-        // 嘴巴张合：模拟说话口型
-        val mouthOpen = (0.5f + 0.5f * sin(progress * 8 * Math.PI)).toFloat()
-        drawTalkingMouth(cx, cy + 150f * scale, 80f * scale, mouthOpen)
-    }
+            ExpressionType.UPDATING -> {
+                // 升级状态：进度条
+                val barWidth = size.width * 0.4f
+                val barHeight = 8f * scale
+                val barY = centerY + size.height * 0.25f
+                val progress = ((time * 0.2f) % 1f)
 
-    /**
-     * 绘制思考表情 - 眼睛向上看，旋转光圈
-     */
-    private fun DrawScope.renderThinking(cx: Float, cy: Float, scale: Float, progress: Float) {
-        // 眼睛向上偏移
-        val lookUp = -30f * scale
-        drawEye(cx - 180f * scale, cy + lookUp, 60f * scale)
-        drawEye(cx + 180f * scale, cy + lookUp, 60f * scale)
+                // 背景条
+                drawRect(
+                    color = Color(0xFF2196F3).copy(alpha = 0.3f),
+                    topLeft = Offset(centerX - barWidth/2, barY),
+                    size = Size(barWidth, barHeight)
+                )
+                // 进度条
+                drawRect(
+                    color = Color(0xFF2196F3),
+                    topLeft = Offset(centerX - barWidth/2, barY),
+                    size = Size(barWidth * progress, barHeight)
+                )
+            }
 
-        // 思考中的省略号动画
-        val dotOffset = (progress * 3).toInt()
-        for (i in 0..2) {
-            val alpha = if (i <= dotOffset % 3) 1f else 0.3f
-            drawCircle(
-                color = eyeColor.copy(alpha = alpha),
-                radius = 15f * scale,
-                center = Offset(cx + (i - 1) * 50f * scale, cy + 250f * scale)
-            )
-        }
+            ExpressionType.ALERT -> {
+                // 告警状态：感叹号
+                val alertSize = 25f * scale
+                val alertY = centerY - size.height * 0.25f
+                val flashAlpha = if ((time * 5f).toInt() % 2 == 0) 0.9f else 0.3f
 
-        // 思考时嘴巴微抿
-        drawLine(
-            color = mouthColor,
-            start = Offset(cx - 50f * scale, cy + 150f * scale),
-            end = Offset(cx + 50f * scale, cy + 150f * scale),
-            strokeWidth = 8f * scale
-        )
-    }
+                drawCircle(
+                    color = Color(0xFFE53935).copy(alpha = flashAlpha),
+                    radius = alertSize,
+                    center = Offset(centerX, alertY),
+                    style = Stroke(width = 3f * scale)
+                )
+                drawLine(
+                    color = Color(0xFFE53935).copy(alpha = flashAlpha),
+                    start = Offset(centerX, alertY - alertSize/2),
+                    end = Offset(centerX, alertY + alertSize/3),
+                    strokeWidth = 4f * scale
+                )
+                drawCircle(
+                    color = Color(0xFFE53935).copy(alpha = flashAlpha),
+                    radius = 4f * scale,
+                    center = Offset(centerX, alertY + alertSize * 0.6f)
+                )
+            }
 
-    /**
-     * 绘制识别中表情 - 扫描动画
-     */
-    private fun DrawScope.renderRecognizing(cx: Float, cy: Float, scale: Float, progress: Float) {
-        // 绘制矩形扫描框
-        val boxSize = 300f * scale
-        val scanY = cy - boxSize/2 + progress * boxSize
-
-        drawRoundRect(
-            color = eyeColor,
-            topLeft = Offset(cx - boxSize/2, cy - boxSize/2),
-            size = Size(boxSize, boxSize),
-            cornerRadius = CornerRadius(20f * scale),
-            style = Stroke(width = 6f * scale)
-        )
-
-        // 扫描线
-        drawLine(
-            color = eyeColor,
-            start = Offset(cx - boxSize/2, scanY),
-            end = Offset(cx + boxSize/2, scanY),
-            strokeWidth = 4f * scale,
-            blendMode = BlendMode.Plus
-        )
-
-        // 扫描线发光效果
-        drawRect(
-            brush = Brush.verticalGradient(
-                colors = listOf(Color.Transparent, eyeGlowColor, Color.Transparent),
-                startY = scanY - 30f * scale,
-                endY = scanY + 30f * scale
-            ),
-            topLeft = Offset(cx - boxSize/2, scanY - 30f * scale),
-            size = Size(boxSize, 60f * scale)
-        )
-
-        // 眼睛在扫描框两侧
-        drawEye(cx - 250f * scale, cy, 50f * scale)
-        drawEye(cx + 250f * scale, cy, 50f * scale)
-    }
-
-    /**
-     * 绘制应答反馈表情 - 开心眨眼+对勾
-     */
-    private fun DrawScope.renderResponse(cx: Float, cy: Float, scale: Float, progress: Float) {
-        // 开心弯眼
-        drawHappyEye(cx - 180f * scale, cy, 80f * scale)
-        drawHappyEye(cx + 180f * scale, cy, 80f * scale)
-
-        // 大笑嘴巴
-        drawSmileMouth(cx, cy + 150f * scale, 120f * scale, 0.6f)
-
-        // 成功对勾动画（进度完成后显示）
-        if (progress > 0.3f) {
-            val checkProgress = ((progress - 0.3f) / 0.7f).coerceIn(0f, 1f)
-            drawCheckMark(cx, cy - 200f * scale, 60f * scale, checkProgress)
-        }
-    }
-
-    // region 绘制辅助方法
-    /**
-     * 绘制圆形眼睛
-     */
-    private fun DrawScope.drawEye(x: Float, y: Float, radius: Float) {
-        // 外发光
-        drawCircle(
-            color = eyeGlowColor,
-            radius = radius * 1.5f,
-            center = Offset(x, y),
-            blendMode = BlendMode.Plus
-        )
-        // 主体
-        drawCircle(
-            color = eyeColor,
-            radius = radius,
-            center = Offset(x, y)
-        )
-        // 高光
-        drawCircle(
-            color = Color.White.copy(alpha = 0.8f),
-            radius = radius * 0.2f,
-            center = Offset(x - radius * 0.3f, y - radius * 0.3f)
-        )
-    }
-
-    /**
-     * 绘制眯眼（眨眼用）
-     */
-    private fun DrawScope.drawEyeSquint(x: Float, y: Float, width: Float, height: Float) {
-        if (height < 2f) {
-            // 完全闭合，画一条线
-            drawLine(
-                color = eyeColor,
-                start = Offset(x - width, y),
-                end = Offset(x + width, y),
-                strokeWidth = 8f
-            )
-        } else {
-            drawOval(
-                color = eyeColor,
-                topLeft = Offset(x - width, y - height),
-                size = Size(width * 2, height * 2)
-            )
+            else -> {}
         }
     }
-
-    /**
-     * 绘制开心弯眼（^_^）
-     */
-    private fun DrawScope.drawHappyEye(x: Float, y: Float, radius: Float) {
-        eyePath.reset()
-        eyePath.moveTo(x - radius, y)
-        eyePath.quadraticBezierTo(x, y - radius, x + radius, y)
-        drawPath(
-            path = eyePath,
-            color = eyeColor,
-            style = Stroke(width = 10f, cap = StrokeCap.Round)
-        )
-    }
-
-    /**
-     * 绘制微笑嘴巴
-     */
-    private fun DrawScope.drawSmileMouth(x: Float, y: Float, width: Float, curve: Float) {
-        mouthPath.reset()
-        mouthPath.moveTo(x - width, y)
-        mouthPath.quadraticBezierTo(x, y + width * curve * 2, x + width, y)
-        drawPath(
-            path = mouthPath,
-            color = mouthColor,
-            style = Stroke(width = 8f, cap = StrokeCap.Round)
-        )
-    }
-
-    /**
-     * 绘制说话时的嘴巴
-     */
-    private fun DrawScope.drawTalkingMouth(x: Float, y: Float, width: Float, openAmount: Float) {
-        val height = width * openAmount
-        drawOval(
-            color = mouthColor,
-            topLeft = Offset(x - width/2, y - height/2),
-            size = Size(width, height)
-        )
-    }
-
-    /**
-     * 绘制对勾动画
-     */
-    private fun DrawScope.drawCheckMark(x: Float, y: Float, size: Float, progress: Float) {
-        val path = Path()
-        val p1 = Offset(x - size * 0.5f, y)
-        val p2 = Offset(x - size * 0.1f, y + size * 0.5f)
-        val p3 = Offset(x + size * 0.6f, y - size * 0.4f)
-
-        val firstPartEnd = if (progress < 0.5f) {
-            val t = progress * 2
-            Offset(
-                p1.x + (p2.x - p1.x) * t,
-                p1.y + (p2.y - p1.y) * t
-            )
-        } else p2
-
-        path.moveTo(p1.x, p1.y)
-        path.lineTo(firstPartEnd.x, firstPartEnd.y)
-
-        if (progress >= 0.5f) {
-            val t = (progress - 0.5f) * 2
-            path.lineTo(
-                p2.x + (p3.x - p2.x) * t,
-                p2.y + (p3.y - p2.y) * t
-            )
-        }
-
-        drawPath(
-            path = path,
-            color = Color(0xFF00FF88),
-            style = Stroke(width = 12f, cap = StrokeCap.Round, join = StrokeJoin.Round)
-        )
-    }
-
-    /**
-     * 应用过渡透明度
-     */
-    private fun DrawScope.applyTransition(progress: Float) {
-        // 过渡期间可以添加淡入淡出效果，这里简单处理
-        // 实际可以通过canvas.saveLayer实现更复杂的过渡
-    }
-    // endregion
 }

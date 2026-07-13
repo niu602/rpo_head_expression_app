@@ -19,22 +19,19 @@ object ModuleStateManager {
     private const val TAG = "ModuleStateManager"
     private val expressionManager = ExpressionManager.getInstance()
 
-    // 记录TTS开始前的表情，播报结束后恢复
-    private var expressionBeforeSpeaking: ExpressionType = ExpressionType.IDLE
-
     // ==================== ASR语音识别模块对接 ====================
     /**
-     * ASR开始识别（用户开始说话）
-     * 自动切换到思考表情
+     * ASR开始监听（等待用户说话）
+     * 自动切换到识别中表情
      */
     fun onAsrStartListening() {
-        Log.d(TAG, "ASR start listening, switch to THINKING")
-        expressionManager.requestExpression(ExpressionType.THINKING)
+        Log.d(TAG, "ASR start listening, switch to RECOGNIZING")
+        expressionManager.requestExpression(ExpressionType.RECOGNIZING)
     }
 
     /**
-     * ASR识别中（正在处理语音）
-     * 自动切换到识别中表情
+     * ASR识别中（检测到用户说话，正在处理语音）
+     * 保持识别中表情
      */
     fun onAsrProcessing() {
         Log.d(TAG, "ASR processing, switch to RECOGNIZING")
@@ -43,18 +40,10 @@ object ModuleStateManager {
 
     /**
      * ASR识别结束
-     * 1秒后自动回落到待机，等待TTS播报
+     * 不需要自动切状态，后续LLM/TTS会自动抢占状态
      */
     fun onAsrFinish() {
         Log.d(TAG, "ASR finish")
-        // 1秒后自动回IDLE，如果期间TTS开始会自动抢占
-        kotlinx.coroutines.GlobalScope.launch {
-            kotlinx.coroutines.delay(1000)
-            // 只有当前还是识别相关表情才回IDLE，TTS开始后会被说话表情抢占
-            if (expressionManager.expressionState.value.type in listOf(ExpressionType.THINKING, ExpressionType.RECOGNIZING)) {
-                expressionManager.requestExpression(ExpressionType.IDLE)
-            }
-        }
     }
 
     /**
@@ -78,17 +67,10 @@ object ModuleStateManager {
 
     /**
      * LLM生成结束
-     * 500ms后自动回落到待机，等待TTS播报
+     * 不需要自动切状态，TTS开始会自动抢占为说话表情
      */
     fun onLlmFinish() {
         Log.d(TAG, "LLM finish")
-        // 500ms后自动回IDLE，如果期间TTS开始会自动抢占
-        kotlinx.coroutines.GlobalScope.launch {
-            kotlinx.coroutines.delay(500)
-            if (expressionManager.expressionState.value.type == ExpressionType.THINKING) {
-                expressionManager.requestExpression(ExpressionType.IDLE)
-            }
-        }
     }
 
     /**
@@ -103,21 +85,20 @@ object ModuleStateManager {
     // ==================== TTS语音播报模块对接 ====================
     /**
      * TTS开始播报
-     * 自动切换到说话表情，记录当前表情
+     * 自动切换到说话表情
      */
     fun onTtsStartSpeaking() {
         Log.d(TAG, "TTS start speaking, switch to SPEAKING")
-        expressionBeforeSpeaking = expressionManager.expressionState.value.type
         expressionManager.requestExpression(ExpressionType.SPEAKING)
     }
 
     /**
      * TTS播报结束
-     * 自动回落到播报前的表情
+     * 对话结束，自动回到待机表情
      */
     fun onTtsFinishSpeaking() {
-        Log.d(TAG, "TTS finish speaking, back to $expressionBeforeSpeaking")
-        expressionManager.requestExpression(expressionBeforeSpeaking, force = true)
+        Log.d(TAG, "TTS finish speaking, back to IDLE")
+        expressionManager.requestExpression(ExpressionType.IDLE, force = true)
     }
 
     /**

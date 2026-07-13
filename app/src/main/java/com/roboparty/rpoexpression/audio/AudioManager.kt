@@ -30,6 +30,16 @@ class AudioManager private constructor(private val context: Context) {
     private val asrManager: AsrManager by lazy { AsrManager.getInstance(context) }
     private val ttsManager: TtsManager by lazy { TtsManager.getInstance(context) }
 
+
+    //TTS播放完成回调接口
+    interface OnSpeakFinishListener{
+        fun onSpeakFinsh()
+    }
+    private var speakFinishListener: OnSpeakFinishListener? = null
+
+    fun setOnSpeakFinishListener(listener: OnSpeakFinishListener?) {
+        speakFinishListener = listener
+    }
     /**
      * 初始化音频模块（ASR + TTS）
      */
@@ -75,6 +85,7 @@ class AudioManager private constructor(private val context: Context) {
         if (asrManager.isListening()) {
             asrManager.stopListening()
         }
+
         ttsManager.speak(text, callback)
     }
 
@@ -100,4 +111,5 @@ class AudioManager private constructor(private val context: Context) {
         ttsManager.release()
         Log.d(TAG, "AudioManager released")
     }
+
 }
