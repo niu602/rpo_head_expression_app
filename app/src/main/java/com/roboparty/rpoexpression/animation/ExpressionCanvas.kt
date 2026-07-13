@@ -13,13 +13,10 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.remember
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
-import androidx.compose.ui.platform.LocalLifecycleOwner
-import androidx.lifecycle.Lifecycle
-import androidx.lifecycle.lifecycleScope
-import androidx.lifecycle.repeatOnLifecycle
 import com.roboparty.rpoexpression.RpoExpressionApp
 import com.roboparty.rpoexpression.expression.ExpressionManager
-import kotlinx.coroutines.launch
+import com.roboparty.rpoexpression.sensor.AmbientLightManager
+import com.roboparty.rpoexpression.animation.ExpressionRenderer// 关键：引入Renderer
 
 /**
  * 表情画布Composable
@@ -36,13 +33,17 @@ fun ExpressionCanvas(
     val app = remember { context.applicationContext as RpoExpressionApp }
     val assetLoader = remember { app.assetLoader }
     val expressionState by expressionManager.expressionState.collectAsState()
+    val lightConfig by app.ambientLightManager.lightConfig.collectAsState()
+
+    // 关键修复：正确实例化 ExpressionRenderer
     val renderer = remember { ExpressionRenderer(assetLoader) }
 
     Canvas(
         modifier = modifier.fillMaxSize()
     ) {
+        // 现在 renderer 拥有 render 方法，编译通过
         renderer.run {
-            render(expressionState, size)
+            render(expressionState, size, lightConfig)
         }
     }
 }

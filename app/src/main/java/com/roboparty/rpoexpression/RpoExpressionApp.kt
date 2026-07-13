@@ -8,18 +8,21 @@ package com.roboparty.rpoexpression
 import android.app.Application
 import android.app.NotificationChannel
 import android.app.NotificationManager
+import android.content.IntentFilter
 import android.os.Build
 import com.roboparty.rpoexpression.animation.ExpressionAssetLoader
 import com.roboparty.rpoexpression.audio.AudioManager
 import com.roboparty.rpoexpression.communication.CommunicationManager
 import com.roboparty.rpoexpression.expression.DemoSequenceManager
 import com.roboparty.rpoexpression.expression.ExpressionManager
+import com.roboparty.rpoexpression.integration.ExpressionControlReceiver
 import com.roboparty.rpoexpression.llm.LlmManager
+import com.roboparty.rpoexpression.sensor.AmbientLightManager
 import com.roboparty.rpoexpression.sensor.BrightnessManager
 import com.roboparty.rpoexpression.sensor.ImuManager
 import com.roboparty.rpoexpression.util.Constants
 import com.roboparty.rpoexpression.vision.VisionManager
-
+import android.content.Context
 /**
  * Application入口
  * 初始化各个管理器单例
@@ -31,6 +34,8 @@ class RpoExpressionApp : Application() {
     lateinit var communicationManager: CommunicationManager
         private set
     lateinit var brightnessManager: BrightnessManager
+        private set
+    lateinit var ambientLightManager: AmbientLightManager
         private set
     lateinit var demoSequenceManager: DemoSequenceManager
         private set
@@ -44,6 +49,7 @@ class RpoExpressionApp : Application() {
         private set
     lateinit var llmManager: LlmManager
         private set
+    private lateinit var expressionControlReceiver: ExpressionControlReceiver
 
     override fun onCreate() {
         super.onCreate()
@@ -52,6 +58,8 @@ class RpoExpressionApp : Application() {
         expressionManager = ExpressionManager.getInstance()
         communicationManager = CommunicationManager.getInstance()
         brightnessManager = BrightnessManager.getInstance(this)
+        ambientLightManager = AmbientLightManager.getInstance(this)
+        ambientLightManager.start()
         demoSequenceManager = DemoSequenceManager(expressionManager)
         assetLoader = ExpressionAssetLoader.getInstance(this)
         assetLoader.init() // 初始化素材检查
@@ -64,6 +72,16 @@ class RpoExpressionApp : Application() {
         visionManager.init()
         llmManager = LlmManager.getInstance(this)
         llmManager.init()
+
+        // 动态注册表情控制广播接收器（解决高版本Android静态广播限制）
+        expressionControlReceiver = ExpressionControlReceiver()
+        val controlFilter = IntentFilter().apply {
+            addAction(ExpressionControlReceiver.ACTION_SET_EXPRESSION)
+            addAction(ExpressionControlReceiver.ACTION_CLEAR_EXPRESSION)
+            addAction(ExpressionControlReceiver.ACTION_SET_STYLE)
+            addAction(ExpressionControlReceiver.ACTION_SET_INTENSITY)
+        }
+        registerReceiver(expressionControlReceiver, controlFilter, Context.RECEIVER_EXPORTED)
 
         // 配置通信地址
         communicationManager.setMasterAddress(
@@ -97,7 +115,9 @@ class RpoExpressionApp : Application() {
         audioManager.release()
         visionManager.release()
         llmManager.release()
+        unregisterReceiver(expressionControlReceiver)
         brightnessManager.stop()
+        ambientLightManager.stop()
         imuManager.stop()
         communicationManager.stop()
     }

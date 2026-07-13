@@ -5,6 +5,7 @@
 
 package com.roboparty.rpoexpression.animation
 
+import android.annotation.SuppressLint
 import android.content.Context
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
@@ -24,6 +25,7 @@ import java.io.IOException
  * 2. 命名规范：idle.png/blink.png/speaking.png/thinking.png/recognizing.png/response.png
  * 3. 自动加载对应素材，替换矢量绘制
  */
+@SuppressLint("StaticFieldLeak") // 单例持有Application Context，不会造成内存泄漏
 class ExpressionAssetLoader private constructor(private val context: Context) {
 
     companion object {
@@ -48,22 +50,34 @@ class ExpressionAssetLoader private constructor(private val context: Context) {
         }
     }
 
-    // 是否使用图片素材（素材导入完成后设置为true，自动替换矢量绘制）
+    // 是否使用图片素材（默认关闭，使用参数化矢量绘制；素材导入完成后可手动开启）
     var useImageAssets = false
         private set
 
     /**
      * 检查素材是否存在，初始化素材加载器
+     * 默认使用参数化矢量绘制，符合纯眼部参数化要求
      */
     fun init() {
         try {
             val assets = context.assets.list(ASSET_PATH)
-            useImageAssets = assets?.any { it.endsWith(".png") } == true
-            Log.d(TAG, "Expression assets found: $useImageAssets, count: ${assets?.size}")
+            val hasAssets = assets?.any { it.endsWith(".png") } == true
+            Log.d(TAG, "Expression assets found: $hasAssets, count: ${assets?.size}, using parameterized rendering by default")
+            // 默认使用参数化绘制，不自动启用图片素材
+            useImageAssets = false
         } catch (e: IOException) {
-            Log.w(TAG, "No expression assets found, using vector rendering")
+            Log.w(TAG, "No expression assets found, using parameterized rendering", e)
             useImageAssets = false
         }
+    }
+
+    /**
+     * 手动设置是否使用图片素材
+     * @param enable true=使用图片素材，false=使用参数化矢量绘制
+     */
+    fun setUseImageAssets(enable: Boolean) {
+        useImageAssets = enable
+        Log.d(TAG, "useImageAssets set to: $enable")
     }
 
     /**
@@ -77,6 +91,8 @@ class ExpressionAssetLoader private constructor(private val context: Context) {
         targetWidth: Int,
         targetHeight: Int
     ): ImageBitmap? {
+        // 默认使用参数化矢量绘制，图片素材仅作为可选覆盖
+        // 所有表情都从assets加载对应命名的png，没有素材则返回null（使用参数化绘制）
         val expressionName = when(type) {
             ExpressionType.IDLE -> "idle"
             ExpressionType.BLINK -> "blink"
@@ -84,13 +100,25 @@ class ExpressionAssetLoader private constructor(private val context: Context) {
             ExpressionType.THINKING -> "thinking"
             ExpressionType.RECOGNIZING -> "recognizing"
             ExpressionType.RESPONSE -> "response"
+            ExpressionType.HAPPY -> "happy"
+            ExpressionType.CONFUSED -> "confused"
+            ExpressionType.SURPRISED -> "surprised"
+            ExpressionType.SAD -> "sad"
+            ExpressionType.ANGRY -> "angry"
+            ExpressionType.SLEEPY -> "sleepy"
+            ExpressionType.SHY -> "shy"
+            ExpressionType.LOW_BATTERY -> "low_battery"
+            ExpressionType.CHARGING -> "charging"
+            ExpressionType.ALERT -> "alert"
+            ExpressionType.SLEEPING -> "sleeping"
+            ExpressionType.UPDATING -> "updating"
         }
         return loadExpressionBitmap(expressionName, targetWidth, targetHeight)
     }
 
     /**
      * 加载指定表情的图片素材
-     * @param expressionName 表情名称：idle/blink/speaking/thinking/recognizing/response
+     * @param expressionName 表情名称：idle/speaking/thinking/recognizing/response/confused/surprised/apologetic/happy
      * @param targetWidth 目标宽度，自动采样缩放避免OOM
      * @param targetHeight 目标高度
      */
@@ -167,6 +195,7 @@ class ExpressionAssetLoader private constructor(private val context: Context) {
     /**
      * 清空缓存，释放内存
      */
+    @Suppress("unused")
     fun clearCache() {
         memoryCache.evictAll()
         Log.d(TAG, "Asset cache cleared")

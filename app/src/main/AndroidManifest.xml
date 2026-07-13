@@ -43,7 +43,7 @@
         <activity
             android:name=".MainActivity"
             android:exported="true"
-            android:screenOrientation="portrait"
+            android:screenOrientation="landscape"
             android:configChanges="orientation|keyboardHidden|screenSize"
             android:theme="@style/Theme.RpoRobotExpression.Fullscreen"
             android:keepScreenOn="true">
@@ -52,6 +52,19 @@
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
         </activity>
+
+        <!-- 表情控制广播接收器，支持adb远程测试 -->
+        <receiver
+            android:name=".integration.ExpressionControlReceiver"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="com.roboparty.rpoexpression.ACTION_SET_EXPRESSION" />
+                <action android:name="com.roboparty.rpoexpression.ACTION_CLEAR_EXPRESSION" />
+                <action android:name="com.roboparty.rpoexpression.ACTION_SET_STYLE" />
+                <action android:name="com.roboparty.rpoexpression.ACTION_SET_INTENSITY" />
+            </intent-filter>
+        </receiver>
+
     </application>
 
 </manifest>

@@ -9,7 +9,9 @@ import android.content.Context
 import android.os.Handler
 import android.os.Looper
 import android.util.Log
+import androidx.annotation.OptIn
 import androidx.camera.core.CameraSelector
+import androidx.camera.core.ExperimentalGetImage
 import androidx.camera.core.ImageAnalysis
 import androidx.camera.core.ImageProxy
 import androidx.camera.core.Preview
@@ -62,7 +64,7 @@ class VisionManager private constructor(private val context: Context) {
      */
     interface VisionStateCallback {
         fun onStart() {} // 开始检测
-        fun onFaceDetected() {} // 检测到人脸
+        fun onFaceDetected(faceOffsetX: Float, faceOffsetY: Float, faceSize: Float) {} // 检测到人脸
         fun onFaceLost() {} // 人脸离开
         fun onTimeout() {} // 检测超时（7秒未检测到人脸）
         fun onError(errorMsg: String) {} // 检测错误
@@ -169,6 +171,7 @@ class VisionManager private constructor(private val context: Context) {
     /**
      * 处理相机帧，进行人脸检测
      */
+    @OptIn(ExperimentalGetImage::class)
     private fun processImageProxy(imageProxy: ImageProxy) {
         val mediaImage = imageProxy.image
         frameCount++
@@ -186,13 +189,42 @@ class VisionManager private constructor(private val context: Context) {
                         Log.d(TAG, "Frame #$frameCount detect result: face count=${faces.size}")
                     }
                     val faceDetected = faces.isNotEmpty()
-                    if (faceDetected && !hasFace) {
-                        // 首次检测到人脸，取消超时计时
-                        timeoutJob?.cancel()
-                        hasFace = true
-                        Log.d(TAG, "✅ Face detected, confidence=${faces[0].headEulerAngleY}")
-                        ModuleStateManager.onFaceDetectSuccess()
-                        stateCallback?.onFaceDetected()
+                    if (faceDetected) {
+                        val face = faces[0]
+                        val bounds = face.boundingBox
+                        
+                        // 计算人脸中心相对于画面中心的偏移，归一化到-1~1范围
+                        // 画面中心为(0,0)，左负右正，上负下正
+                        val imageWidth = mediaImage.width.toFloat()
+                        val imageHeight = mediaImage.height.toFloat()
+                        
+                        // 注意：前置摄像头是镜像的，X轴需要翻转
+                        // 人脸中心X坐标
+                        val faceCenterX = bounds.centerX()
+                        // 归一化X偏移：画面中心在imageWidth/2，范围-1~1
+                        var offsetX = (faceCenterX - imageWidth / 2f) / (imageWidth / 2f)
+                        // 前置摄像头镜像翻转X
+                        offsetX = -offsetX
+                        offsetX = offsetX.coerceIn(-1f, 1f)
+                        
+                        // 人脸中心Y坐标
+                        val faceCenterY = bounds.centerY()
+                        // 归一化Y偏移
+                        var offsetY = (faceCenterY - imageHeight / 2f) / (imageHeight / 2f)
+                        offsetY = offsetY.coerceIn(-1f, 1f)
+                        
+                        // 人脸大小归一化0~1
+                        val faceSize = (bounds.width().toFloat() / imageWidth).coerceIn(0f, 1f)
+                        
+                        if (!hasFace) {
+                            // 首次检测到人脸，取消超时计时
+                            timeoutJob?.cancel()
+                            hasFace = true
+                            Log.d(TAG, "✅ Face detected, offsetX=$offsetX, offsetY=$offsetY, size=$faceSize")
+                            ModuleStateManager.onFaceDetectSuccess()
+                        }
+                        // 每帧都回调更新位置，实现实时视线跟踪
+                        stateCallback?.onFaceDetected(offsetX, offsetY, faceSize)
                     } else if (!faceDetected && hasFace) {
                         // 人脸离开
                         hasFace = false

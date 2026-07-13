@@ -267,10 +267,12 @@ class CommunicationManager private constructor() {
                 }
 
                 ControlCommand.CMD_EXPRESSION -> {
-                    // 切换表情
+                    // 切换表情，支持强度参数
                     command.toExpressionType()?.let { exprType ->
+                        val intensity = command.toIntensity()
                         expressionManager.requestExpression(
                             type = exprType,
+                            intensity = intensity,
                             duration = command.duration,
                             force = command.force
                         )
@@ -287,6 +289,27 @@ class CommunicationManager private constructor() {
                 ControlCommand.CMD_CLEAR -> {
                     // 清除表情，回到待机
                     expressionManager.clearExpression()
+                }
+
+                ControlCommand.CMD_SET_STYLE -> {
+                    // 设置渲染风格，支持动态切换风格包
+                    command.toStyle()?.let { style ->
+                        Log.d(TAG, "Setting expression style to: $style")
+                        expressionManager.setStyle(style)
+                    }
+                }
+
+                ControlCommand.CMD_SET_INTENSITY -> {
+                    // 设置全局表情强度（后续表情使用此强度）
+                    val intensity = command.toIntensity()
+                    Log.d(TAG, "Setting global expression intensity to: $intensity")
+                    // 对当前表情也应用强度
+                    val currentState = expressionManager.expressionState.value
+                    expressionManager.requestExpression(
+                        type = currentState.type,
+                        intensity = intensity,
+                        force = true
+                    )
                 }
             }
 
