@@ -70,11 +70,12 @@ enum class ExpressionType(
     /**
      * 识别中状态：语音识别/人脸识别工作时触发，瞳孔聚焦 + 扫描光效
      * 优先级高于思考
+     * 设置30秒自动回落，防止异常常驻（正常识别不会超过15秒）
      */
     RECOGNIZING(
         priority = 2,
-        defaultDuration = Long.MAX_VALUE,
-        isAutoFallback = false,
+        defaultDuration = 30000L,
+        isAutoFallback = true,
         category = ExpressionCategory.FUNCTIONAL,
         description = "识别中"
     ),

@@ -37,6 +37,7 @@ import java.util.concurrent.TimeUnit
  * ASR语音识别管理器
  * 基于通义千问qwen3-asr-flash-realtime实时语音识别，WebSocket长连接
  */
+//单例模式
 class AsrManager private constructor(private val context: Context) {
 
     companion object {
@@ -81,6 +82,7 @@ class AsrManager private constructor(private val context: Context) {
     private var isWsConnected = false
     private var isSessionConfigured = false // 会话是否配置完成，配置完成后才发送音频
     private var isInitialized = false
+    private var shouldTriggerExpression = true // 当前会话是否应该触发表情（语音唤醒模式为false）
     private var resultCallback: AsrResultCallback? = null
     // 识别超时处理：15秒无结果自动超时
     private val mainHandler = Handler(Looper.getMainLooper())
@@ -88,7 +90,9 @@ class AsrManager private constructor(private val context: Context) {
         if (isRecording) {
             Log.w(TAG, "Recognition timeout after 15s")
             resultCallback?.onError("识别超时，请再说一次")
-            ModuleStateManager.onAsrError()
+            if (shouldTriggerExpression) {
+                ModuleStateManager.onAsrError()
+            }
             stopListening()
         }
     }
@@ -111,8 +115,10 @@ class AsrManager private constructor(private val context: Context) {
 
     /**
      * 开始语音识别
+     * @param callback 识别结果回调
+     * @param triggerExpression 是否触发识别中表情（语音唤醒模式传false，避免常驻显示识别中）
      */
-    fun startListening(callback: AsrResultCallback) {
+    fun startListening(callback: AsrResultCallback, triggerExpression: Boolean = true) {
         if (!isInitialized) {
             callback.onError("ASR未初始化")
             return
@@ -129,8 +135,11 @@ class AsrManager private constructor(private val context: Context) {
 
         resultCallback = callback
         isSessionConfigured = false
-        ModuleStateManager.onAsrStartListening()
-        Log.d(TAG, "Start ASR listening, connecting WebSocket...")
+        shouldTriggerExpression = triggerExpression
+        if (triggerExpression) {
+            ModuleStateManager.onAsrStartListening()
+        }
+        Log.d(TAG, "Start ASR listening, triggerExpression=$triggerExpression, connecting WebSocket...")
 
         // 建立WebSocket连接
         val request = Request.Builder()
@@ -161,7 +170,9 @@ class AsrManager private constructor(private val context: Context) {
                 if (code != 1000) {
                     // 异常关闭
                     resultCallback?.onError("连接断开: $reason")
-                    ModuleStateManager.onAsrError()
+                    if (shouldTriggerExpression) {
+                        ModuleStateManager.onAsrError()
+                    }
                 }
             }
 
@@ -171,7 +182,9 @@ class AsrManager private constructor(private val context: Context) {
                 isSessionConfigured = false
                 stopAudioRecording()
                 resultCallback?.onError("连接失败: ${t.message}")
-                ModuleStateManager.onAsrError()
+                if (shouldTriggerExpression) {
+                    ModuleStateManager.onAsrError()
+                }
             }
         })
     }
@@ -223,12 +236,16 @@ class AsrManager private constructor(private val context: Context) {
                     val errorMsg = json.get("message")?.asString ?: "未知错误"
                     Log.e(TAG, "Server error: $errorMsg")
                     resultCallback?.onError("服务端错误: $errorMsg")
-                    ModuleStateManager.onAsrError()
+                    if (shouldTriggerExpression) {
+                        ModuleStateManager.onAsrError()
+                    }
                     stopListening()
                 }
                 "input_audio_buffer.speech_started" -> {
                     Log.d(TAG, "Speech started")
-                    ModuleStateManager.onAsrProcessing()
+                    if (shouldTriggerExpression) {
+                        ModuleStateManager.onAsrProcessing()
+                    }
                 }
                 "input_audio_buffer.speech_stopped" -> {
                     Log.d(TAG, "Speech stopped")
@@ -237,7 +254,9 @@ class AsrManager private constructor(private val context: Context) {
                     // 识别完成，返回最终结果：transcript直接是结果字符串
                     val text = json.get("transcript")?.asString?.trim() ?: ""
                     Log.d(TAG, "Recognition completed: $text")
-                    ModuleStateManager.onAsrFinish()
+                    if (shouldTriggerExpression) {
+                        ModuleStateManager.onAsrFinish()
+                    }
                     if (text.isNotEmpty()) {
                         resultCallback?.onResult(text)
                     }
@@ -258,7 +277,9 @@ class AsrManager private constructor(private val context: Context) {
                     val errorMsg = json.getAsJsonObject("error")?.get("message")?.asString ?: "识别失败"
                     Log.e(TAG, "Recognition failed: $errorMsg")
                     resultCallback?.onError(errorMsg)
-                    ModuleStateManager.onAsrError()
+                    if (shouldTriggerExpression) {
+                        ModuleStateManager.onAsrError()
+                    }
                     stopListening()
                 }
                 "session.finished" -> {
@@ -291,7 +312,9 @@ class AsrManager private constructor(private val context: Context) {
             )
             if (minBufferSize == AudioRecord.ERROR_BAD_VALUE || minBufferSize == AudioRecord.ERROR) {
                 resultCallback?.onError("录音参数不支持")
-                ModuleStateManager.onAsrError()
+                if (shouldTriggerExpression) {
+                    ModuleStateManager.onAsrError()
+                }
                 return
             }
             val bufferSize = minBufferSize * Constants.AUDIO_BUFFER_SIZE_MULTIPLIER
@@ -306,7 +329,9 @@ class AsrManager private constructor(private val context: Context) {
 
             if (audioRecord?.state != AudioRecord.STATE_INITIALIZED) {
                 resultCallback?.onError("录音初始化失败")
-                ModuleStateManager.onAsrError()
+                if (shouldTriggerExpression) {
+                    ModuleStateManager.onAsrError()
+                }
                 audioRecord?.release()
                 audioRecord = null
                 return
@@ -346,7 +371,9 @@ class AsrManager private constructor(private val context: Context) {
         } catch (e: Exception) {
             Log.e(TAG, "Start recording failed", e)
             resultCallback?.onError("录音启动失败: ${e.message}")
-            ModuleStateManager.onAsrError()
+            if (shouldTriggerExpression) {
+                ModuleStateManager.onAsrError()
+            }
             stopListening()
         }
     }
@@ -393,7 +420,9 @@ class AsrManager private constructor(private val context: Context) {
         isWsConnected = false
         isSessionConfigured = false
         resultCallback = null
-        ModuleStateManager.onAsrFinish()
+        if (shouldTriggerExpression) {
+            ModuleStateManager.onAsrFinish()
+        }
     }
 
     /**

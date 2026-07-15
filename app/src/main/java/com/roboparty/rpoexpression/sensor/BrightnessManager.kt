@@ -34,9 +34,9 @@ class BrightnessManager private constructor(private val context: Context) : Sens
 
     companion object {
         private const val TAG = "BrightnessManager"
-        private const val MIN_BRIGHTNESS = 0.3f
+        private const val MIN_BRIGHTNESS = 0.5f  // 最低亮度从30%提到50%
         private const val MAX_BRIGHTNESS = 1.0f
-        private const val DARK_THRESHOLD = 10f
+        private const val DARK_THRESHOLD = 30f   // 暗光阈值从10lux提到30lux
         private const val BRIGHT_THRESHOLD = 500f
         private const val SENSOR_DELAY = 1000L  // 传感器采样间隔
         private const val BRIGHTNESS_SMOOTHING = 0.1f  // 亮度平滑系数

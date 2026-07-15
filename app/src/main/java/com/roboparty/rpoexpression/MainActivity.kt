@@ -83,9 +83,16 @@ class MainActivity : ComponentActivity() {
     private lateinit var visionManager: VisionManager
     private val REQUEST_RECORD_AUDIO_PERMISSION = 1001
     private val REQUEST_CAMERA_PERMISSION = 1002
+    private val REQUEST_ALL_PERMISSIONS = 1003
 
     // 权限申请后待执行的操作：是否为ASR单独测试模式
     private var pendingAsrOnlyTest = false
+
+    // 语音唤醒相关
+    private var isWakeUpListening = false // 是否处于唤醒监听状态
+    private var lastWakeTime = 0L // 上次唤醒时间，冷却防重复
+    private val WAKE_COOLDOWN_MS = 3000L // 唤醒冷却3秒
+    private val wakeWords = listOf("萝卜萝卜", "hirobot") // 严格匹配的唤醒词
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -110,18 +117,8 @@ class MainActivity : ComponentActivity() {
                     modifier = Modifier.fillMaxSize(),
                     color = MaterialTheme.colorScheme.background
                 ) {
-                    Box(modifier = Modifier.fillMaxSize()) {
-                        // 表情画布
-                        ExpressionCanvas(modifier = Modifier.fillMaxSize())
-
-                        // 调试面板（开发用，发布时可注释）
-                        DebugPanel(
-                            onStartConversation = { checkRecordPermissionAndStartAsr() },
-                            onStartAsrOnlyTest = { checkRecordPermissionAndStartAsrOnly() },
-                            onStartFaceDetect = { checkCameraPermissionAndStartFaceDetect() },
-                            onSendText = { text -> sendTextToLlm(text) }
-                        )
-                    }
+                    // 全屏表情画布，无调试面板
+                    ExpressionCanvas(modifier = Modifier.fillMaxSize())
                 }
             }
         }
@@ -134,6 +131,139 @@ class MainActivity : ComponentActivity() {
 
         // 注册TTS播放结束回调，播报完自动切回待机
         initTtsFinishCallback()
+
+        // 启动自动申请权限，开启摄像头和麦克风
+        autoStartPerception()
+    }
+
+    /**
+     * 启动语音唤醒持续监听
+     * 后台常驻监听唤醒词，命中后触发对话
+     */
+    private fun startWakeUpListening() {
+        // 严格防重复启动
+        if (isWakeUpListening || audioManager.isListening() || audioManager.isSpeaking()) {
+            return
+        }
+        // 先确保上一次的ASR已经停止
+        try {
+            audioManager.stopListening()
+        } catch (e: Exception) {
+            // 忽略停止异常
+        }
+        isWakeUpListening = true
+
+        try {
+            // 语音唤醒模式：不触发识别中表情，避免常驻显示识别中
+            audioManager.startListening(
+                callback = object : AsrManager.AsrResultCallback {
+                override fun onResult(text: String) {
+                    runOnUiThread {
+                        isWakeUpListening = false
+                        try {
+                            if (text.isNotEmpty()) {
+                                // 严格预处理：去除所有非字母汉字，转小写
+                                val normalizedText = text.lowercase()
+                                    .replace(Regex("[^a-z\\u4e00-\\u9fa5]"), "")
+                                // 严格匹配：必须完整包含唤醒词
+                                val hitWakeWord = wakeWords.any { word ->
+                                    normalizedText.contains(word, ignoreCase = true)
+                                }
+                                // 冷却判断：3秒内不重复唤醒
+                                val now = System.currentTimeMillis()
+                                if (hitWakeWord && now - lastWakeTime > WAKE_COOLDOWN_MS) {
+                                    lastWakeTime = now
+                                    triggerWakeUp()
+                                } else {
+                                    // 未命中或冷却中，继续监听
+                                    continueWakeUpListen()
+                                }
+                            } else {
+                                // 空结果，继续监听
+                                continueWakeUpListen()
+                            }
+                        } catch (e: Exception) {
+                            // 异常后继续监听，避免崩溃
+                            continueWakeUpListen()
+                        }
+                    }
+                }
+
+                override fun onError(errorMsg: String) {
+                    runOnUiThread {
+                        isWakeUpListening = false
+                        // 出错后延迟再监听，避免频繁重试占资源
+                        lifecycleScope.launch {
+                            delay(500)
+                            continueWakeUpListen()
+                        }
+                    }
+                }
+            }, triggerExpression = false)
+        } catch (e: Exception) {
+            isWakeUpListening = false
+            // 启动失败，延迟重试
+            lifecycleScope.launch {
+                delay(1000)
+                startWakeUpListening()
+            }
+        }
+    }
+
+    /**
+     * 继续唤醒监听（内部调用，避免重复判断）
+     */
+    private fun continueWakeUpListen() {
+        // 已经在监听或正在说话就不重复启动
+        if (isWakeUpListening || audioManager.isSpeaking()) {
+            return
+        }
+        // 延迟200ms再启动，避免频繁调用占资源
+        lifecycleScope.launch {
+            delay(200)
+            startWakeUpListening()
+        }
+    }
+
+    /**
+     * 触发唤醒：转向音源，应答，进入对话
+     */
+    private fun triggerWakeUp() {
+        isWakeUpListening = false
+        // 1. 瞳孔转向音源方向
+        val soundDir = audioManager.soundDirection.value
+        expressionManager.setPupilOffset(soundDir, 0f)
+        // 2. 触发应答表情
+        expressionManager.requestExpression(ExpressionType.RESPONSE, 800)
+        // 3. 延迟后开始聆听对话
+        lifecycleScope.launch {
+            delay(800)
+            // 重置瞳孔到中心，开始识别
+            expressionManager.setPupilOffset(0f, 0f)
+            checkRecordPermissionAndStartAsr()
+        }
+    }
+
+    /**
+     * 自动启动感知模块：申请权限后开启摄像头和麦克风
+     */
+    private fun autoStartPerception() {
+        // 先申请录音权限
+        val hasAudio = ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED
+        val hasCamera = ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED
+
+        if (hasAudio && hasCamera) {
+            // 权限都有，直接启动
+            startFaceDetect()
+            audioManager.restartVolumeDetect()
+            startWakeUpListening() // 启动语音唤醒
+        } else {
+            // 申请权限
+            val permissions = mutableListOf<String>()
+            if (!hasAudio) permissions.add(Manifest.permission.RECORD_AUDIO)
+            if (!hasCamera) permissions.add(Manifest.permission.CAMERA)
+            ActivityCompat.requestPermissions(this, permissions.toTypedArray(), REQUEST_ALL_PERMISSIONS)
+        }
     }
 
     /**
@@ -164,23 +294,46 @@ class MainActivity : ComponentActivity() {
     }
 
     /**
-     * TTS播报结束自动切回待机
+     * TTS播报结束自动切回待机，并恢复唤醒监听
      */
     private fun initTtsFinishCallback() {
-                ModuleStateManager.onTtsFinishSpeaking()
+        ModuleStateManager.onTtsFinishSpeaking()
+        // 对话结束，恢复唤醒监听
+        lifecycleScope.launch {
+            delay(500)
+            startWakeUpListening()
+        }
     }
 
     override fun onResume() {
         super.onResume()
         enableFullscreenMode()
+        // 回到前台，恢复感知功能
+        val hasAudio = ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED
+        val hasCamera = ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED
+        if (hasCamera && !visionManager.isDetecting()) {
+            startFaceDetect()
+        }
+        if (hasAudio && !isWakeUpListening && !audioManager.isSpeaking()) {
+            startWakeUpListening()
+        }
     }
 
     override fun onPause() {
         super.onPause()
-        // 退后台停止所有前台任务
-        audioManager.stopListening()
-        audioManager.stopSpeaking()
-        visionManager.stopFaceDetect()
+        // 退后台停止所有前台任务，彻底释放资源
+        isWakeUpListening = false
+        try {
+            audioManager.stopListening()
+            audioManager.stopSpeaking()
+        } catch (e: Exception) {
+            // 忽略停止异常
+        }
+        try {
+            visionManager.stopFaceDetect()
+        } catch (e: Exception) {
+            // 忽略停止异常
+        }
     }
 
     override fun onWindowFocusChanged(hasFocus: Boolean) {
@@ -310,8 +463,9 @@ class MainActivity : ComponentActivity() {
         if (audioManager.isListening() || audioManager.isSpeaking()) {
             return
         }
+        // 对话开始，暂停唤醒监听
+        isWakeUpListening = false
         // 切换到识别中表情
-        //expressionManager.requestExpression(ExpressionType.RECOGNIZING)
         ModuleStateManager.onAsrStartListening()
 
         audioManager.startListening(object : AsrManager.AsrResultCallback {
@@ -388,6 +542,20 @@ class MainActivity : ComponentActivity() {
                     audioManager.startSpeaking("请授予相机权限，否则无法进行人脸识别")
                 }
             }
+            REQUEST_ALL_PERMISSIONS -> {
+                // 检查所有权限结果
+                val audioGranted = grantResults.getOrNull(0) == PackageManager.PERMISSION_GRANTED
+                val cameraGranted = grantResults.getOrNull(1) == PackageManager.PERMISSION_GRANTED
+                // 相机权限通过就启动人脸识别
+                if (cameraGranted) {
+                    startFaceDetect()
+                }
+                // 录音权限通过就重启音量检测和唤醒监听
+                if (audioGranted) {
+                    audioManager.restartVolumeDetect()
+                    startWakeUpListening()
+                }
+            }
         }
     }
 
@@ -461,7 +629,7 @@ class MainActivity : ComponentActivity() {
         onSendText: (String) -> Unit = {}
     ) {
         // 测试时设置为true显示调试面板，发布时设置为false
-        val showDebug = true
+        val showDebug = false
 
         if (showDebug) {
             var isAsrListening by remember { mutableStateOf(audioManager.isListening()) }

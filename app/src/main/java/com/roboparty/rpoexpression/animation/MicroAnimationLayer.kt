@@ -33,6 +33,12 @@ class MicroAnimationLayer private constructor() {
     private var startTime = 0L
     private var isRunning = false
 
+    // 呼吸缩放缓存：30fps更新一次足够，减少sin计算
+    private var cachedScale = 1f
+    private var cachedOffsetY = 0f
+    private var lastCacheTime = 0L
+    private val CACHE_INTERVAL_MS = 33L // 30fps
+
     /**
      * 微动画结果：仅整体变换参数
      */
@@ -54,6 +60,7 @@ class MicroAnimationLayer private constructor() {
 
     /**
      * 叠加微动画，仅返回整体缩放和Y偏移
+     * 性能优化：呼吸缩放30fps更新一次缓存，其余帧直接读取缓存
      */
     fun apply(currentType: ExpressionType): MicroAnimResult {
         if (!isRunning) {
@@ -61,20 +68,25 @@ class MicroAnimationLayer private constructor() {
         }
 
         val now = System.currentTimeMillis()
+
+        // 缓存命中：30fps更新一次即可，呼吸动画慢，不需要60fps
+        if (now - lastCacheTime < CACHE_INTERVAL_MS) {
+            return MicroAnimResult(cachedScale, cachedOffsetY)
+        }
+        lastCacheTime = now
+
         val timeFromStart = now - startTime
 
         // 1. 呼吸缩放：3s周期±2%
-        val breathScale = 1f + sin(2f * PI.toFloat() * timeFromStart / BREATH_PERIOD_MS) * BREATH_SCALE_AMPLITUDE
+        cachedScale = 1f + sin(2f * PI.toFloat() * timeFromStart / BREATH_PERIOD_MS) * BREATH_SCALE_AMPLITUDE
 
-        // 2. 说话时头部轻微上下晃动，使用固定周期正弦值
-        var headOffsetY = 0f
-        if (currentType == ExpressionType.SPEAKING) {
-            headOffsetY = TALK_HEAD_AMPLITUDE * sin(timeFromStart * 0.01f) * 20f
+        // 2. 说话时头部轻微上下晃动
+        cachedOffsetY = if (currentType == ExpressionType.SPEAKING) {
+            TALK_HEAD_AMPLITUDE * sin(timeFromStart * 0.01f) * 20f
+        } else {
+            0f
         }
 
-        return MicroAnimResult(
-            scale = breathScale,
-            offsetY = headOffsetY
-        )
+        return MicroAnimResult(cachedScale, cachedOffsetY)
     }
 }

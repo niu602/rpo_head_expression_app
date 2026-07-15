@@ -33,10 +33,19 @@ import androidx.compose.ui.geometry.toRect
  * 纯眼部表情渲染器
  * 严格限定在眼部区域绘制，通过参数化控制所有视觉效果
  * 支持多风格动态切换，支持强度无级调节
+ *
+ * 性能优化：所有可复用对象缓存为成员变量，避免每帧分配导致 GC 卡顿
  */
-class ExpressionRenderer(
-    private val assetLoader: ExpressionAssetLoader
-) {
+class ExpressionRenderer {
+    // ========== 缓存对象，避免每帧分配 ==========
+    private val colorMatrix = ColorMatrix()
+    private val filterPaint = androidx.compose.ui.graphics.Paint()
+    private val tempPath = Path()
+
+    // 上一帧尺寸缓存，尺寸变化时才重新计算
+    private var lastSize: Size = Size.Zero
+    private var lastCenterX = 0f
+    private var lastCenterY = 0f
 
     /**
      * 主渲染方法：参数化绘制纯眼部表情
@@ -45,26 +54,19 @@ class ExpressionRenderer(
         // 绘制纯黑背景
         drawRect(color = Color.Black, size = size)
 
-        val centerX = size.width / 2f
-        val centerY = size.height / 2f
+        // 尺寸变化时更新中心缓存
+        if (size != lastSize) {
+            lastSize = size
+            lastCenterX = size.width / 2f
+            lastCenterY = size.height / 2f
+        }
+        val centerX = lastCenterX
+        val centerY = lastCenterY
         val time = System.currentTimeMillis() / 1000f
 
-        // 计算色温调整系数
-        val (rCoeff, gCoeff, bCoeff) = when {
-            lightConfig.isNightMode -> Triple(1.1f, 1.0f, 0.7f) // 夜光模式：暖黄，减少蓝光
-            lightConfig.colorTemp < 4000 -> Triple(1.08f, 1.02f, 0.85f) // 暖光
-            lightConfig.colorTemp > 6000 -> Triple(0.9f, 0.98f, 1.1f) // 冷光
-            else -> Triple(1.0f, 1.0f, 1.0f) // 中性光
-        }
-        val brightness = lightConfig.brightness
-        val colorMatrix = ColorMatrix(
-            floatArrayOf(
-                rCoeff * brightness, 0f, 0f, 0f, 0f,
-                0f, gCoeff * brightness, 0f, 0f, 0f,
-                0f, 0f, bCoeff * brightness, 0f, 0f,
-                0f, 0f, 0f, 1f, 0f
-            )
-        )
+        // 更新色温颜色矩阵（复用已有对象，不新建）
+        updateColorMatrix(lightConfig)
+        filterPaint.colorFilter = ColorFilter.colorMatrix(colorMatrix)
 
         // 应用微动画：呼吸缩放
         val microAnim = MicroAnimationLayer.getInstance().apply(state.type)
@@ -73,9 +75,7 @@ class ExpressionRenderer(
             canvas.save()
 
             // 应用环境光颜色滤镜（亮度+色温）
-            drawContext.canvas.saveLayer(bounds = size.toRect(), paint = androidx.compose.ui.graphics.Paint().apply {
-                colorFilter = ColorFilter.colorMatrix(colorMatrix)
-            })
+            drawContext.canvas.saveLayer(bounds = size.toRect(), paint = filterPaint)
 
             // 应用呼吸缩放
             scale(microAnim.scale, microAnim.scale, pivot = Offset(centerX, centerY)) {
@@ -107,7 +107,7 @@ class ExpressionRenderer(
                     // 绘制眼内特效（严格限制在瞳孔/眼周区域）
                     drawEyeEffects(leftPupil, rightPupil, pupilRadius, eyeMetrics.scale, time, lightConfig.highlight)
 
-                    // 绘制系统状态特殊叠加效果
+                    // 绘制系统状态特殊叠加效果（复用 tempPath）
                     drawSystemStateOverlays(state, centerX, centerY, size, time)
                 }
             }
@@ -116,6 +116,24 @@ class ExpressionRenderer(
             drawContext.canvas.restore()
             canvas.restore()
         }
+    }
+
+    /**
+     * 更新颜色矩阵，复用对象避免每帧新建
+     */
+    private fun updateColorMatrix(lightConfig: AmbientLightManager.LightConfig) {
+        val (rCoeff, gCoeff, bCoeff) = when {
+            lightConfig.isNightMode -> Triple(1.1f, 1.0f, 0.7f)
+            lightConfig.colorTemp < 4000 -> Triple(1.08f, 1.02f, 0.85f)
+            lightConfig.colorTemp > 6000 -> Triple(0.9f, 0.98f, 1.1f)
+            else -> Triple(1.0f, 1.0f, 1.0f)
+        }
+        val brightness = lightConfig.brightness
+        val values = colorMatrix.values
+        values[0] = rCoeff * brightness
+        values[6] = gCoeff * brightness
+        values[12] = bCoeff * brightness
+        values[18] = 1f
     }
 
     /**
@@ -234,6 +252,7 @@ class ExpressionRenderer(
     /**
      * 绘制系统状态特殊叠加效果
      * 严格不涉及下半脸元素
+     * 性能优化：复用 tempPath，避免每帧 new Path
      */
     private fun DrawScope.drawSystemStateOverlays(
         state: ExpressionState,
@@ -271,7 +290,7 @@ class ExpressionRenderer(
                 val strokeWidth = 2f * scale
                 val boxColor = Color(0xFF7C4DFF).copy(alpha = 0.8f)
 
-                // 四角
+                // 四角（直接画线，不创建对象）
                 drawLine(boxColor, Offset(boxLeft, boxTop), Offset(boxLeft + cornerLength, boxTop), strokeWidth = strokeWidth)
                 drawLine(boxColor, Offset(boxLeft, boxTop), Offset(boxLeft, boxTop + cornerLength), strokeWidth = strokeWidth)
                 drawLine(boxColor, Offset(boxLeft + boxWidth, boxTop), Offset(boxLeft + boxWidth - cornerLength, boxTop), strokeWidth = strokeWidth)
@@ -291,37 +310,35 @@ class ExpressionRenderer(
             }
 
             ExpressionType.RESPONSE -> {
-                // 应答状态：对勾动画（眼部下方）
+                // 应答状态：对勾动画（眼部下方）- 复用 tempPath
                 val progress = state.transitionProgress.coerceIn(0f, 1f)
                 val checkSize = 50f * scale
                 val checkY = centerY + size.height * 0.22f
-                val path = Path().apply {
-                    moveTo(centerX - checkSize/2, checkY)
-                    lineTo(centerX - checkSize/6, checkY + checkSize/2)
-                    lineTo(centerX + checkSize/2, checkY - checkSize/3)
-                }
+                tempPath.rewind()
+                tempPath.moveTo(centerX - checkSize/2, checkY)
+                tempPath.lineTo(centerX - checkSize/6, checkY + checkSize/2)
+                tempPath.lineTo(centerX + checkSize/2, checkY - checkSize/3)
                 drawPath(
-                    path = path,
+                    path = tempPath,
                     color = Color(0xFFFFD700).copy(alpha = progress),
                     style = Stroke(width = 5f * scale)
                 )
             }
 
             ExpressionType.CHARGING -> {
-                // 充电状态：闪电图标
+                // 充电状态：闪电图标 - 复用 tempPath
                 val boltSize = 30f * scale
                 val boltY = centerY - size.height * 0.25f
-                val boltPath = Path().apply {
-                    moveTo(centerX, boltY - boltSize)
-                    lineTo(centerX - boltSize/2, boltY)
-                    lineTo(centerX, boltY - boltSize/4)
-                    lineTo(centerX, boltY + boltSize)
-                    lineTo(centerX + boltSize/2, boltY - boltSize/4)
-                    lineTo(centerX, boltY)
-                    close()
-                }
+                tempPath.rewind()
+                tempPath.moveTo(centerX, boltY - boltSize)
+                tempPath.lineTo(centerX - boltSize/2, boltY)
+                tempPath.lineTo(centerX, boltY - boltSize/4)
+                tempPath.lineTo(centerX, boltY + boltSize)
+                tempPath.lineTo(centerX + boltSize/2, boltY - boltSize/4)
+                tempPath.lineTo(centerX, boltY)
+                tempPath.close()
                 drawPath(
-                    path = boltPath,
+                    path = tempPath,
                     color = Color(0xFF66BB6A).copy(alpha = 0.5f + 0.5f * sin(time * 2f)),
                     style = Stroke(width = 3f * scale)
                 )
