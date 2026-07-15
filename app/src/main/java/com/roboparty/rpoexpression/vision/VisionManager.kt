@@ -2,7 +2,6 @@
  * SPDX-FileCopyrightText: 2026 Roboparty Camp
  * SPDX-License-Identifier: GPL-3.0-only
  */
-
 package com.roboparty.rpoexpression.vision
 
 import android.content.Context
@@ -19,9 +18,12 @@ import androidx.camera.lifecycle.ProcessCameraProvider
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.LifecycleOwner
 import com.google.mlkit.vision.common.InputImage
+import com.google.mlkit.vision.face.Face
 import com.google.mlkit.vision.face.FaceDetection
 import com.google.mlkit.vision.face.FaceDetectorOptions
-import com.roboparty.rpoexpression.integration.ModuleStateManager
+import com.google.mlkit.vision.face.FaceLandmark
+import com.roboparty.rpoexpression.expression.ExpressionManager
+import com.roboparty.rpoexpression.expression.ExpressionType
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -31,14 +33,20 @@ import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
 
 /**
- * 视觉管理器
- * 基于ML Kit实现实时人脸检测，自动联动表情状态
+ * 视觉管理器（中端顺滑精准版）
+ * 1. 基于双眼关键点实现真实视线跟随，不再依赖人脸框
+ * 2. 均值滤波防抖，眼球移动沉稳无抖动
+ * 3. 人脸短暂丢失滞留防抖，交互更自然
+ * 4. 远近人脸兼容更好，侧脸容错提升
+ * 5. 保留休眠唤醒、首次见面问候原有业务逻辑
  */
 class VisionManager private constructor(private val context: Context) {
 
     companion object {
-        private const val TAG = "VisionManager"
-        private const val FACE_DETECT_TIMEOUT = 7000L // 人脸检测超时时间7秒
+        private const val TAG = "VisionManager-Mid"
+        private const val NO_FACE_SLEEP_DELAY = 9000L       // 无人脸9秒自动休眠
+        private const val FACE_LOST_STAY_TIME = 500L        // 人脸丢失滞留500ms再复位眼睛
+        private const val SMOOTH_FILTER_COUNT = 5           // 5帧均值平滑滤波
 
         @Volatile
         private var instance: VisionManager? = null
@@ -52,240 +60,269 @@ class VisionManager private constructor(private val context: Context) {
 
     private val scope = CoroutineScope(Dispatchers.Default)
     private val mainHandler = Handler(Looper.getMainLooper())
-    private var timeoutJob: Job? = null
 
     private var cameraProvider: ProcessCameraProvider? = null
     private var analysisExecutor: ExecutorService? = null
     private var isDetecting = false
+    private var isStopping = false  // 停止中标记，防止启停冲突
     private var hasFace = false
+    private var hasTriggeredGreeting = false
 
-    /**
-     * 人脸检测状态回调
-     */
+    // 降低跳帧，提升流畅度
+    private val FRAME_SKIP = 1
+    private var frameSkipCounter = 0
+
+    // 平滑滤波缓存队列
+    private val offsetXBuffer = ArrayDeque<Float>(SMOOTH_FILTER_COUNT)
+    private val offsetYBuffer = ArrayDeque<Float>(SMOOTH_FILTER_COUNT)
+
+    // 人脸丢失滞留计时
+    private var faceLostStayJob: Job? = null
+    private var sleepTimeoutJob: Job? = null
+
     interface VisionStateCallback {
-        fun onStart() {} // 开始检测
-        fun onFaceDetected(faceOffsetX: Float, faceOffsetY: Float, faceSize: Float) {} // 检测到人脸
-        fun onFaceLost() {} // 人脸离开
-        fun onTimeout() {} // 检测超时（7秒未检测到人脸）
-        fun onError(errorMsg: String) {} // 检测错误
-        fun onStop() {} // 停止检测
+        fun onStart() {}
+        fun onFaceDetected(faceOffsetX: Float, faceOffsetY: Float, faceSize: Float) {}
+        fun onFaceLost() {}
+        fun onTimeout() {}
+        fun onError(errorMsg: String) {}
+        fun onStop() {}
     }
 
     private var stateCallback: VisionStateCallback? = null
 
-    // 帧计数，用于打日志
-    private var frameCount = 0
-
-    // ML Kit人脸检测器，配置快速检测模式
+    // 中端配置：精准模式 + 仅双眼关键点 + 远距离人脸
     private val faceDetector by lazy {
         val options = FaceDetectorOptions.Builder()
-            .setPerformanceMode(FaceDetectorOptions.PERFORMANCE_MODE_FAST) // 快速模式，低延迟
-            .setLandmarkMode(FaceDetectorOptions.LANDMARK_MODE_NONE) // 不检测关键点，提高速度
-            .setClassificationMode(FaceDetectorOptions.CLASSIFICATION_MODE_NONE) // 不检测表情分类
-            .setMinFaceSize(0.1f) // 最小人脸大小10%，支持更远距离检测
+            .setPerformanceMode(FaceDetectorOptions.PERFORMANCE_MODE_ACCURATE)
+            .setLandmarkMode(FaceDetectorOptions.LANDMARK_MODE_ALL)
+            .setClassificationMode(FaceDetectorOptions.CLASSIFICATION_MODE_NONE)
+            .setMinFaceSize(0.08f)
             .build()
         FaceDetection.getClient(options)
     }
 
-    /**
-     * 初始化视觉模块
-     */
     fun init() {
-        Log.d(TAG, "VisionManager initialized")
+        Log.d(TAG, "VisionManager 中端精准版初始化完成")
+        clearSmoothBuffer()
     }
 
-    /**
-     * 开始人脸检测
-     * @param lifecycleOwner 生命周期所有者，用于绑定CameraX
-     * @param callback 状态回调
-     */
+    private fun clearSmoothBuffer() {
+        offsetXBuffer.clear()
+        offsetYBuffer.clear()
+    }
+
     fun startFaceDetect(lifecycleOwner: LifecycleOwner, callback: VisionStateCallback? = null) {
-        if (isDetecting) {
-            Log.w(TAG, "Face detect already running")
+        if (isDetecting || isStopping) {
+            Log.w(TAG, "人脸检测已在运行或正在停止，跳过启动 isDetecting=$isDetecting, isStopping=$isStopping")
             return
         }
         this.stateCallback = callback
         isDetecting = true
         hasFace = false
+        hasTriggeredGreeting = false
+        clearSmoothBuffer()
 
-        // 开始检测，联动表情
-        ModuleStateManager.onFaceDetectStart()
         stateCallback?.onStart()
-        Log.d(TAG, "Start face detection")
+        Log.d(TAG, "启动中端精准人脸视线跟随")
 
-        // 初始化分析线程
+        // 启动前先确保旧线程池已彻底关闭
+        analysisExecutor?.shutdownNow()
         analysisExecutor = Executors.newSingleThreadExecutor()
 
-        // 绑定相机
         val cameraProviderFuture = ProcessCameraProvider.getInstance(context)
         cameraProviderFuture.addListener({
             try {
-                cameraProvider = cameraProviderFuture.get()
+                val provider = cameraProviderFuture.get()
+                cameraProvider = provider
+                // 先彻底解绑所有之前的用例，确保干净状态
+                provider.unbindAll()
 
-                // 预览用例（不需要显示，仅用于获取帧）
                 val preview = Preview.Builder().build()
-
-                // 图像分析用例
                 val imageAnalysis = ImageAnalysis.Builder()
-                    .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST) // 只保留最新帧，降低延迟
+                    .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
                     .build()
                     .also {
                         it.setAnalyzer(analysisExecutor!!) { imageProxy ->
                             processImageProxy(imageProxy)
                         }
                     }
-
-                // 选择前置摄像头
                 val cameraSelector = CameraSelector.DEFAULT_FRONT_CAMERA
-
-                // 解绑所有用例，重新绑定
-                cameraProvider?.unbindAll()
-                cameraProvider?.bindToLifecycle(
-                    lifecycleOwner,
-                    cameraSelector,
-                    preview,
-                    imageAnalysis
-                )
-                // 相机启动成功，启动超时计时：7秒未检测到人脸触发超时
-                timeoutJob?.cancel()
-                timeoutJob = scope.launch {
-                    delay(FACE_DETECT_TIMEOUT)
-                    if (isDetecting && !hasFace) {
-                        Log.d(TAG, "⚠️ Face detect timeout, 7s no face detected")
-                        // 超时回调切主线程，停止检测和TTS播放由回调处理
-                        mainHandler.post {
-                            stateCallback?.onTimeout()
-                        }
-                    }
-                }
+                provider.bindToLifecycle(lifecycleOwner, cameraSelector, preview, imageAnalysis)
+                resetSleepTimer()
+                Log.d(TAG, "相机绑定成功，人脸检测启动完成")
             } catch (e: Exception) {
-                Log.e(TAG, "Start face detect failed", e)
+                Log.e(TAG, "启动相机失败", e)
                 isDetecting = false
-                ModuleStateManager.onFaceDetectFailed()
-                stateCallback?.onError(e.message ?: "相机启动失败")
+                stateCallback?.onError(e.message ?: "相机异常")
                 stateCallback?.onStop()
             }
         }, ContextCompat.getMainExecutor(context))
     }
 
-    /**
-     * 处理相机帧，进行人脸检测
-     */
     @OptIn(ExperimentalGetImage::class)
     private fun processImageProxy(imageProxy: ImageProxy) {
-        val mediaImage = imageProxy.image
-        frameCount++
-        if (mediaImage != null) {
-            val rotation = imageProxy.imageInfo.rotationDegrees
-            // 每10帧打一次调试日志，方便排查
-            if (frameCount % 10 == 0) {
-                Log.d(TAG, "Process frame #$frameCount, rotation=$rotation, size=${mediaImage.width}x${mediaImage.height}")
-            }
-            val image = InputImage.fromMediaImage(mediaImage, rotation)
-            faceDetector.process(image)
-                .addOnSuccessListener { faces ->
-                    // 每10帧打一次检测结果
-                    if (frameCount % 10 == 0) {
-                        Log.d(TAG, "Frame #$frameCount detect result: face count=${faces.size}")
-                    }
-                    val faceDetected = faces.isNotEmpty()
-                    if (faceDetected) {
-                        val face = faces[0]
-                        val bounds = face.boundingBox
-                        
-                        // 计算人脸中心相对于画面中心的偏移，归一化到-1~1范围
-                        // 画面中心为(0,0)，左负右正，上负下正
-                        val imageWidth = mediaImage.width.toFloat()
-                        val imageHeight = mediaImage.height.toFloat()
-                        
-                        // 注意：前置摄像头是镜像的，X轴需要翻转
-                        // 人脸中心X坐标
-                        val faceCenterX = bounds.centerX()
-                        // 归一化X偏移：画面中心在imageWidth/2，范围-1~1
-                        var offsetX = (faceCenterX - imageWidth / 2f) / (imageWidth / 2f)
-                        // 前置摄像头镜像翻转X
-                        offsetX = -offsetX
-                        offsetX = offsetX.coerceIn(-1f, 1f)
-                        
-                        // 人脸中心Y坐标
-                        val faceCenterY = bounds.centerY()
-                        // 归一化Y偏移
-                        var offsetY = (faceCenterY - imageHeight / 2f) / (imageHeight / 2f)
-                        offsetY = offsetY.coerceIn(-1f, 1f)
-                        
-                        // 人脸大小归一化0~1
-                        val faceSize = (bounds.width().toFloat() / imageWidth).coerceIn(0f, 1f)
-                        
-                        if (!hasFace) {
-                            // 首次检测到人脸，取消超时计时
-                            timeoutJob?.cancel()
-                            hasFace = true
-                            Log.d(TAG, "✅ Face detected, offsetX=$offsetX, offsetY=$offsetY, size=$faceSize")
-                            ModuleStateManager.onFaceDetectSuccess()
-                        }
-                        // 每帧都回调更新位置，实现实时视线跟踪
-                        stateCallback?.onFaceDetected(offsetX, offsetY, faceSize)
-                    } else if (!faceDetected && hasFace) {
-                        // 人脸离开
-                        hasFace = false
-                        Log.d(TAG, "❌ Face lost")
-                        ModuleStateManager.onFaceDetectStart() // 回到识别中状态
-                        stateCallback?.onFaceLost()
-                    }
-                }
-                .addOnFailureListener { e ->
-                    Log.e(TAG, "❌ Face detect process failed", e)
-                }
-                .addOnCompleteListener {
-                    imageProxy.close()
-                }
-        } else {
-            Log.w(TAG, "Frame #$frameCount mediaImage is null")
+        val mediaImage = imageProxy.image ?: run {
             imageProxy.close()
+            return
+        }
+
+        frameSkipCounter++
+        if (frameSkipCounter < FRAME_SKIP) {
+            imageProxy.close()
+            return
+        }
+        frameSkipCounter = 0
+
+        val rotation = imageProxy.imageInfo.rotationDegrees
+        val inputImage = InputImage.fromMediaImage(mediaImage, rotation)
+
+        faceDetector.process(inputImage)
+            .addOnSuccessListener { faces ->
+                if (faces.isNotEmpty()) {
+                    val face = faces[0]
+                    cancelFaceLostStayJob()
+                    handleFacePresent(face, mediaImage.width.toFloat(), mediaImage.height.toFloat())
+                } else {
+                    handleFaceAbsent()
+                }
+            }
+            .addOnFailureListener {
+                Log.e(TAG, "人脸检测异常", it)
+            }
+            .addOnCompleteListener {
+                imageProxy.close()
+            }
+    }
+
+    private fun handleFacePresent(face: Face, imgW: Float, imgH: Float) {
+        // 优先取双眼关键点计算视线中心
+        val leftEye = face.getLandmark(FaceLandmark.LEFT_EYE)
+        val rightEye = face.getLandmark(FaceLandmark.RIGHT_EYE)
+
+        val eyeCenterX: Float
+        val eyeCenterY: Float
+
+        if (leftEye != null && rightEye != null) {
+            eyeCenterX = (leftEye.position.x + rightEye.position.x) / 2f
+            eyeCenterY = (leftEye.position.y + rightEye.position.y) / 2f
+        } else {
+            // 无关键点回退人脸框中心
+            val bounds = face.boundingBox
+            eyeCenterX = bounds.centerX().toFloat()
+            eyeCenterY = bounds.centerY().toFloat()
+        }
+
+        // 归一化 + 前置摄像头镜像翻转
+        var rawOffsetX = (eyeCenterX - imgW / 2f) / (imgW / 2f)
+        rawOffsetX = -rawOffsetX.coerceIn(-1f, 1f)
+        val rawOffsetY = ((eyeCenterY - imgH / 2f) / (imgH / 2f)).coerceIn(-1f, 1f)
+
+        // 加入平滑滤波
+        val smoothX = getSmoothValue(offsetXBuffer, rawOffsetX)
+        val smoothY = getSmoothValue(offsetYBuffer, rawOffsetY)
+        val faceSize = (face.boundingBox.width().toFloat() / imgW).coerceIn(0f, 1f)
+
+        if (!hasFace) {
+            hasFace = true
+            cancelSleepTimer()
+            if (!hasTriggeredGreeting) {
+                hasTriggeredGreeting = true
+                mainHandler.post {
+                    ExpressionManager.getInstance().requestExpression(ExpressionType.RESPONSE, 1000)
+                }
+                mainHandler.postDelayed({
+                    ExpressionManager.getInstance().requestExpression(ExpressionType.IDLE)
+                }, 1100)
+                Log.d(TAG, "首次检测到人眼 -> 应答打招呼")
+            }
+        }
+        stateCallback?.onFaceDetected(smoothX, smoothY, faceSize)
+    }
+
+    private fun handleFaceAbsent() {
+        if (hasFace) {
+            hasFace = false
+            stateCallback?.onFaceLost()
+            startFaceLostStayTimer()
+            resetSleepTimer()
         }
     }
 
-    /**
-     * 停止人脸检测
-     */
+    // 均值平滑滤波
+    private fun getSmoothValue(buffer: ArrayDeque<Float>, newValue: Float): Float {
+        if (buffer.size >= SMOOTH_FILTER_COUNT) buffer.removeFirst()
+        buffer.addLast(newValue)
+        return buffer.average().toFloat()
+    }
+
+    // 人脸丢失滞留倒计时
+    private fun startFaceLostStayTimer() {
+        faceLostStayJob?.cancel()
+        faceLostStayJob = scope.launch {
+            delay(FACE_LOST_STAY_TIME)
+            mainHandler.post {
+                ExpressionManager.getInstance().setPupilOffset(0f, 0f)
+                clearSmoothBuffer()
+            }
+        }
+    }
+
+    private fun cancelFaceLostStayJob() {
+        faceLostStayJob?.cancel()
+        faceLostStayJob = null
+    }
+
+    private fun resetSleepTimer() {
+        sleepTimeoutJob?.cancel()
+        sleepTimeoutJob = scope.launch {
+            delay(NO_FACE_SLEEP_DELAY)
+            if (isDetecting && !hasFace) {
+                mainHandler.post {
+                    ExpressionManager.getInstance().requestExpression(ExpressionType.SLEEPING, force = true)
+                }
+            }
+        }
+    }
+
+    private fun cancelSleepTimer() {
+        sleepTimeoutJob?.cancel()
+        sleepTimeoutJob = null
+    }
+
     fun stopFaceDetect() {
-        if (!isDetecting) return
+        if (!isDetecting || isStopping) return
+        isStopping = true  // 标记停止中，防止启停冲突
         isDetecting = false
         hasFace = false
-        frameCount = 0
-        timeoutJob?.cancel()
-        timeoutJob = null
+        cancelSleepTimer()
+        cancelFaceLostStayJob()
+        clearSmoothBuffer()
 
-        // CameraX操作必须在主线程执行
         mainHandler.post {
             try {
+                // 先解绑所有用例，释放相机
                 cameraProvider?.unbindAll()
+                Log.d(TAG, "相机已解绑")
             } catch (e: Exception) {
-                Log.e(TAG, "Unbind camera failed", e)
+                Log.e(TAG, "解绑相机失败", e)
+            } finally {
+                cameraProvider = null
+                // 彻底关闭分析线程池，中断正在执行的任务
+                analysisExecutor?.shutdownNow()
+                analysisExecutor = null
+                isStopping = false
+                stateCallback?.onStop()
+                Log.d(TAG, "已停止中端人脸视线检测，资源已释放")
             }
-            cameraProvider = null
-            analysisExecutor?.shutdown()
-            analysisExecutor = null
-
-            // 停止检测，回到待机
-            ModuleStateManager.onFaceDetectFailed()
-            stateCallback?.onStop()
-            Log.d(TAG, "Stop face detection success")
         }
     }
 
-    /**
-     * 是否正在检测
-     */
     fun isDetecting(): Boolean = isDetecting
 
-    /**
-     * 释放相机和检测器资源
-     */
     fun release() {
         stopFaceDetect()
         faceDetector.close()
         stateCallback = null
-        Log.d(TAG, "VisionManager released")
     }
 }

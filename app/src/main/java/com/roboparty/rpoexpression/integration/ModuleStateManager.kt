@@ -48,11 +48,11 @@ object ModuleStateManager {
 
     /**
      * ASR识别错误
-     * 显示应答错误表情（暂时用RESPONSE，后续可扩展错误表情）
+     * 强制回到待机状态，避免卡在识别中
      */
     fun onAsrError() {
-        Log.d(TAG, "ASR error")
-        expressionManager.requestExpression(ExpressionType.RESPONSE, duration = 1000)
+        Log.d(TAG, "ASR error, fallback to IDLE")
+        expressionManager.requestExpression(ExpressionType.IDLE, force = true)
     }
 
     // ==================== LLM大模型模块对接 ====================
@@ -75,11 +75,11 @@ object ModuleStateManager {
 
     /**
      * LLM请求错误
-     * 显示错误应答表情
+     * 强制回到待机状态，避免卡在思考/识别中
      */
     fun onLlmError() {
-        Log.d(TAG, "LLM error")
-        expressionManager.requestExpression(ExpressionType.RESPONSE, duration = 1000)
+        Log.d(TAG, "LLM error, fallback to IDLE")
+        expressionManager.requestExpression(ExpressionType.IDLE, force = true)
     }
 
     // ==================== TTS语音播报模块对接 ====================
@@ -103,20 +103,21 @@ object ModuleStateManager {
 
     /**
      * TTS播报错误
+     * 强制回到待机状态
      */
     fun onTtsError() {
-        Log.d(TAG, "TTS error")
-        expressionManager.requestExpression(ExpressionType.RESPONSE, duration = 1000)
+        Log.d(TAG, "TTS error, fallback to IDLE")
+        expressionManager.requestExpression(ExpressionType.IDLE, force = true)
     }
 
     // ==================== 人脸识别模块对接 ====================
     /**
      * 人脸识别开始
-     * 自动切换到识别中表情
+     * 静默检测模式：不触发识别中表情，仅后台运行
      */
     fun onFaceDetectStart() {
-        Log.d(TAG, "Face detect start, switch to RECOGNIZING")
-        expressionManager.requestExpression(ExpressionType.RECOGNIZING, duration = 4000)
+        Log.d(TAG, "Face detect start (silent mode, no expression)")
+        // 静默人脸检测不显示识别中表情，避免频繁切换
     }
 
     /**

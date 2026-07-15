@@ -11,38 +11,45 @@ import androidx.compose.ui.graphics.Color
  * 表情参数映射器
  * 为每种表情类型定义对应的基础眼部参数
  * 所有参数严格限定在眼部区域，不涉及下半脸
+ *
+ * 性能优化：所有表情参数预加载缓存，避免每帧创建新对象
  */
 object EyeParameterMapper {
 
+    // 预加载缓存：所有19种表情的基础参数在初始化时一次性创建
+    private val paramsCache: Map<ExpressionType, EyeParameters>
+
+    init {
+        paramsCache = mapOf(
+            // 功能类
+            ExpressionType.IDLE to idleParams(),
+            ExpressionType.BLINK to blinkParams(),
+            ExpressionType.SPEAKING to speakingParams(),
+            ExpressionType.THINKING to thinkingParams(),
+            ExpressionType.RECOGNIZING to recognizingParams(),
+            ExpressionType.RESPONSE to responseParams(),
+            // 情绪类
+            ExpressionType.HAPPY to happyParams(),
+            ExpressionType.CONFUSED to confusedParams(),
+            ExpressionType.SURPRISED to surprisedParams(),
+            ExpressionType.SAD to sadParams(),
+            ExpressionType.ANGRY to angryParams(),
+            ExpressionType.SLEEPY to sleepyParams(),
+            ExpressionType.SHY to shyParams(),
+            // 系统状态类
+            ExpressionType.LOW_BATTERY to lowBatteryParams(),
+            ExpressionType.CHARGING to chargingParams(),
+            ExpressionType.ALERT to alertParams(),
+            ExpressionType.SLEEPING to sleepingParams(),
+            ExpressionType.UPDATING to updatingParams()
+        )
+    }
+
     /**
-     * 获取指定表情类型的基础眼部参数
+     * 获取指定表情类型的基础眼部参数（从缓存读取，零分配）
      */
     fun getBaseParameters(type: ExpressionType): EyeParameters {
-        return when (type) {
-            // ==================== 功能类表情 ====================
-            ExpressionType.IDLE -> idleParams()
-            ExpressionType.BLINK -> blinkParams()
-            ExpressionType.SPEAKING -> speakingParams()
-            ExpressionType.THINKING -> thinkingParams()
-            ExpressionType.RECOGNIZING -> recognizingParams()
-            ExpressionType.RESPONSE -> responseParams()
-
-            // ==================== 情绪类表情 ====================
-            ExpressionType.HAPPY -> happyParams()
-            ExpressionType.CONFUSED -> confusedParams()
-            ExpressionType.SURPRISED -> surprisedParams()
-            ExpressionType.SAD -> sadParams()
-            ExpressionType.ANGRY -> angryParams()
-            ExpressionType.SLEEPY -> sleepyParams()
-            ExpressionType.SHY -> shyParams()
-
-            // ==================== 系统状态类表情 ====================
-            ExpressionType.LOW_BATTERY -> lowBatteryParams()
-            ExpressionType.CHARGING -> chargingParams()
-            ExpressionType.ALERT -> alertParams()
-            ExpressionType.SLEEPING -> sleepingParams()
-            ExpressionType.UPDATING -> updatingParams()
-        }
+        return paramsCache[type] ?: idleParams()
     }
 
     // ==================== 功能类参数实现 ====================

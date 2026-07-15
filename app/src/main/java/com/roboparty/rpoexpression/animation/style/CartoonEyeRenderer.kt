@@ -19,14 +19,16 @@ import kotlin.math.sin
  * 圆润可爱的卡通风格，大眼睛，柔和高光
  */
 class CartoonEyeRenderer : EyeStyleRenderer {
-
+    //画布扩展函数
     override fun DrawScope.drawEyes(
+        //统一眼睛状态入参
         params: EyeParameters,
         centerX: Float,
         centerY: Float,
         size: Size,
         time: Float
     ) {
+        //眼睛尺寸自动计算
         val metrics = calculateEyeMetrics(params, centerX, centerY, size)
 
         // 绘制眼周光晕
@@ -39,7 +41,7 @@ class CartoonEyeRenderer : EyeStyleRenderer {
 
     private fun DrawScope.drawGlow(params: EyeParameters, metrics: EyeMetrics, time: Float) {
         if (params.glowIntensity <= 0f) return
-
+        //呼吸动态光晕
         val glowAlpha = if (params.glowBlink) {
             params.glowIntensity * (0.5f + 0.5f * sin(time * 8f))
         } else {
@@ -66,6 +68,7 @@ class CartoonEyeRenderer : EyeStyleRenderer {
         metrics: EyeMetrics,
         time: Float
     ) {
+        //眼睑眨眼实现
         val eyeHeight = metrics.eyeHeight * params.eyelidOpenness
         val eyeWidth = metrics.eyeWidth
 
@@ -90,6 +93,7 @@ class CartoonEyeRenderer : EyeStyleRenderer {
 
         // 瞳孔
         if (params.pupilSize > 0f && params.eyelidOpenness > 0.1f) {
+            //瞳孔视线偏移
             val pupilCenter = calculatePupilPosition(eyeCenter, eyeWidth, eyeHeight, params)
             val pupilRadius = (eyeWidth * 0.4f * params.pupilSize * params.pupilScale)
                 .coerceAtMost(eyeHeight * 0.8f)
@@ -130,7 +134,9 @@ class CartoonEyeRenderer : EyeStyleRenderer {
             color = Color.Black,
             topLeft = Offset(eyeCenter.x - eyeWidth/2, eyeCenter.y - eyeHeight/2),
             size = Size(eyeWidth, eyeHeight),
+            //圆角矩形眼睛
             cornerRadius = CornerRadius(eyeWidth/2, eyeHeight/2),
+            //眼眶描边
             style = Stroke(width = 3f * metrics.scale)
         )
     }

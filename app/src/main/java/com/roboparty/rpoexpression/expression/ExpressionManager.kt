@@ -7,6 +7,7 @@ package com.roboparty.rpoexpression.expression
 
 import android.util.Log
 import com.roboparty.rpoexpression.animation.MicroAnimationLayer
+import com.roboparty.rpoexpression.sensor.ImuManager
 import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -30,7 +31,7 @@ class ExpressionManager private constructor() {
 
     companion object {
         private const val TAG = "ExpressionManager"
-        private const val TRANSITION_DURATION = 400L  // 表情切换过渡时长400ms，柔和自然
+        private const val TRANSITION_DURATION = 600L  // 表情切换过渡时长600ms，极致丝滑无抖动
         private const val DEBOUNCE_INTERVAL = 100L  // 防抖间隔100ms，短时间重复指令忽略
         private const val BLINK_INTERVAL_MIN = 2000L  // 最小眨眼间隔2秒
         private const val BLINK_INTERVAL_MAX = 5000L  // 最大眨眼间隔5秒
@@ -51,6 +52,9 @@ class ExpressionManager private constructor() {
     // 当前渲染风格
     private var currentStyle = ExpressionStyle.CARTOON
 
+    // 当前全局表情强度 0-100
+    private var currentIntensity = 100
+
     // 表情状态流 - UI层订阅此流进行渲染
     private val _expressionState = MutableStateFlow(
         ExpressionState(
@@ -65,7 +69,7 @@ class ExpressionManager private constructor() {
     private var managerJob: Job? = null
     private var autoFallbackJob: Job? = null
     private var blinkJob: Job? = null
-    private val scope = CoroutineScope(Dispatchers.Default + SupervisorJob())
+    internal val scope = CoroutineScope(Dispatchers.Default + SupervisorJob())
 
     // 待执行的表情序列（Demo演示用）
     private val expressionSequence = mutableListOf<ExpressionType>()
@@ -82,6 +86,38 @@ class ExpressionManager private constructor() {
     internal var pupilOffsetX = 0f
     internal var pupilOffsetY = 0f
 
+    // 瞳孔平滑滤波状态（修复 data class 拷贝导致状态丢失的 BUG）
+    private var smoothedPupilX = 0f
+    private var smoothedPupilY = 0f
+    private val PUPIL_SMOOTH_FACTOR = 0.15f  // 平滑系数，越大跟随越快，0.15兼顾灵敏与平滑
+    private val PUPIL_DEAD_ZONE = 0.005f     // 死区阈值，小于此值直接对齐，过滤微抖
+
+    /**
+     * 更新并返回平滑后的瞳孔X偏移（低通滤波）
+     */
+    internal fun updateSmoothedPupilX(target: Float): Float {
+        val diff = target - smoothedPupilX
+        if (kotlin.math.abs(diff) < PUPIL_DEAD_ZONE) {
+            smoothedPupilX = target
+        } else {
+            smoothedPupilX += diff * PUPIL_SMOOTH_FACTOR
+        }
+        return smoothedPupilX
+    }
+
+    /**
+     * 更新并返回平滑后的瞳孔Y偏移（低通滤波）
+     */
+    internal fun updateSmoothedPupilY(target: Float): Float {
+        val diff = target - smoothedPupilY
+        if (kotlin.math.abs(diff) < PUPIL_DEAD_ZONE) {
+            smoothedPupilY = target
+        } else {
+            smoothedPupilY += diff * PUPIL_SMOOTH_FACTOR
+        }
+        return smoothedPupilY
+    }
+
     // 语音微动任务
     private var speechMicroMotionJob: Job? = null
     // 待机自主微动作任务
@@ -93,6 +129,43 @@ class ExpressionManager private constructor() {
     // 当前眼内特效
     private val _currentEffect = MutableStateFlow(EyeEffectType.NONE)
     val currentEffect: StateFlow<EyeEffectType> = _currentEffect.asStateFlow()
+
+    // IMU临时效果偏移
+    internal var tempEyelidOffset = 0f // 眼睑临时偏移：-1全闭，1睁大
+    internal var tempPupilShakeX = 0f // 瞳孔临时晃动偏移
+    // 视觉模仿：用户眼睛开合度
+    internal var mimicEyelidOpenness = 1f
+    // 音频情绪眼型：-1柔和弯月，0正常，1锐利上扬
+    internal var audioEyeShape = 0f
+    // 声源方向瞳孔偏移
+    internal var soundPupilOffsetX = 0f
+    // 触摸临时偏移（优先级最高，不会被人脸识别覆盖）
+    internal var touchPupilOffsetX = 0f
+    internal var touchPupilOffsetY = 0f
+
+    fun setAudioEyeShape(shape: Float) { audioEyeShape = shape.coerceIn(-1f, 1f) }
+    fun setSoundPupilOffset(offset: Float) { soundPupilOffsetX = offset.coerceIn(-1f, 1f) }
+    fun setTouchPupilOffset(x: Float, y: Float) {
+        touchPupilOffsetX = x.coerceIn(-1f, 1f)
+        touchPupilOffsetY = y.coerceIn(-1f, 1f)
+    }
+
+    // 公开方法供外部调用
+    fun setMimicEyelidOpenness(openness: Float) { 
+        mimicEyelidOpenness = openness.coerceIn(0.2f, 1f) 
+    }
+    fun isBlinking() = isBlinking
+    fun performBlink(type: BlinkType = BlinkType.NORMAL) {
+        if (!isBlinking) {
+            performBlinkInternal(type)
+        }
+    }
+    fun setTempEyelidOffset(offset: Float) { tempEyelidOffset = offset }
+    fun setTempPupilShakeX(offset: Float) { tempPupilShakeX = offset }
+//    fun setPupilOffset(x: Float, y: Float) {
+//        pupilOffsetX = x.coerceIn(-1f, 1f)
+//        pupilOffsetY = y.coerceIn(-1f, 1f)
+//    }
 
     /**
      * 根据表情自动匹配对应特效
@@ -162,6 +235,24 @@ class ExpressionManager private constructor() {
     fun getCurrentStyle(): ExpressionStyle = currentStyle
 
     /**
+     * 设置全局表情强度 0-100
+     */
+    fun setIntensity(intensity: Int) {
+        currentIntensity = intensity.coerceIn(0, 100)
+        Log.d(TAG, "Expression intensity changed to: $currentIntensity")
+    }
+
+    /**
+     * 获取当前表情类型
+     */
+    fun getCurrentExpression(): ExpressionType = _expressionState.value.type
+
+    /**
+     * 获取当前全局强度
+     */
+    fun getCurrentIntensity(): Int = currentIntensity
+
+    /**
      * 请求切换表情 - 外部模块调用入口
      *
      * @param type 目标表情类型
@@ -178,7 +269,7 @@ class ExpressionManager private constructor() {
     ): Boolean {
         // 眨眼是内部状态，外部不直接调用
         if (type == ExpressionType.BLINK) {
-            return performBlink()
+            return performBlinkInternal()
         }
 
         val currentTime = System.currentTimeMillis()
@@ -245,7 +336,7 @@ class ExpressionManager private constructor() {
             // 取消之前的回落协程，避免多个回落任务冲突
             autoFallbackJob?.cancel()
             // 保存回落目标为设置临时表情前的表情
-            temporaryFallbackTarget = currentState.type
+            temporaryFallbackTarget = ExpressionType.IDLE
             temporaryFallbackIntensity = currentState.intensity
             autoFallbackJob = scope.launch {
                 delay(actualDuration)
@@ -304,9 +395,9 @@ class ExpressionManager private constructor() {
     }
 
     enum class BlinkType(val duration: Long) {
-        NORMAL(150L),    // 正常眨眼
-        SLOW(300L),      // 慢眨眼（困倦）
-        FAST(80L)        // 快眨眼（说话快/紧张）
+        NORMAL(240L),    // 正常眨眼，放慢避免抖动感
+        SLOW(400L),      // 慢眨眼（困倦）
+        FAST(120L)       // 快眨眼（说话快/紧张）
     }
 
     // 眨眼叠加值，0=不眨眼，1=完全闭眼
@@ -315,7 +406,7 @@ class ExpressionManager private constructor() {
     /**
      * 执行眨眼动画（在当前表情基础上叠加眼睑闭合，不改变其他参数）
      */
-    private fun performBlink(type: BlinkType = BlinkType.NORMAL): Boolean {
+    private fun performBlinkInternal(type: BlinkType = BlinkType.NORMAL): Boolean {
         if (isBlinking) return false
         val currentState = _expressionState.value
 
@@ -357,7 +448,7 @@ class ExpressionManager private constructor() {
                 val blinkInterval = Random.nextLong(300, 800)
                 delay(blinkInterval)
                 if (isActive && !isBlinking) {
-                    performBlink(BlinkType.FAST)
+                    performBlinkInternal(BlinkType.FAST)
                 }
 
                 // 2. 瞳孔微小跳动，幅度极小，速度极慢，几乎不可察觉
@@ -373,7 +464,7 @@ class ExpressionManager private constructor() {
                     val t = (elapsed.toFloat() / smoothTime).coerceIn(0f, 1f)
                     microPupilOffsetX = startX + (targetX - startX) * t
                     microPupilOffsetY = startY + (targetY - startY) * t
-                    delay(16)
+                    delay(33) // 30fps足够，微动作不需要60fps
                     elapsed = System.currentTimeMillis() - startTime
                 }
                 delay(300 + Random.nextLong(300))
@@ -388,7 +479,7 @@ class ExpressionManager private constructor() {
                 val t = (elapsed.toFloat() / smoothTime).coerceIn(0f, 1f)
                 microPupilOffsetX = startX * (1 - t)
                 microPupilOffsetY = startY * (1 - t)
-                delay(16)
+                delay(33) // 30fps
                 elapsed = System.currentTimeMillis() - startTime
             }
             microPupilOffsetX = 0f
@@ -423,7 +514,7 @@ class ExpressionManager private constructor() {
                             val easedT = EyeParameters.decelerateEasing(t)
                             microPupilOffsetX = startX + (targetX - startX) * easedT
                             microPupilOffsetY = startY + (targetY - startY) * easedT
-                            delay(16)
+                            delay(33) // 30fps足够，扫视是慢动作
                             elapsed = System.currentTimeMillis() - startTime
                         }
 
@@ -439,7 +530,7 @@ class ExpressionManager private constructor() {
                             val easedT = EyeParameters.decelerateEasing(t)
                             microPupilOffsetX = targetX + (0f - targetX) * easedT
                             microPupilOffsetY = targetY + (0f - targetY) * easedT
-                            delay(16)
+                            delay(33) // 30fps
                             elapsed = System.currentTimeMillis() - backStart
                         }
                         microPupilOffsetX = 0f
@@ -459,7 +550,7 @@ class ExpressionManager private constructor() {
                             val t = (elapsed.toFloat() / smoothTime).coerceIn(0f, 1f)
                             microPupilOffsetX = startX + (targetX - startX) * t
                             microPupilOffsetY = startY + (targetY - startY) * t
-                            delay(16)
+                            delay(33) // 30fps
                             elapsed = System.currentTimeMillis() - startTime
                         }
                         delay(Random.nextLong(2500, 4000))
@@ -471,7 +562,7 @@ class ExpressionManager private constructor() {
                             val t = (elapsed.toFloat() / backTime).coerceIn(0f, 1f)
                             microPupilOffsetX = targetX * (1 - t)
                             microPupilOffsetY = targetY * (1 - t)
-                            delay(16)
+                            delay(33) // 30fps
                             elapsed = System.currentTimeMillis() - backStart
                         }
                         microPupilOffsetX = 0f
@@ -489,9 +580,9 @@ class ExpressionManager private constructor() {
                             else -> BlinkType.FAST        // 5%快眨眼
                         }
                         if (!isBlinking) {
-                            performBlink(blinkType)
+                            performBlinkInternal(blinkType)
                         }
-                        delay(Random.nextLong(4000, 7000)) // 眨眼间隔拉长，非常自然
+                        delay(Random.nextLong(5000, 9000)) // 眨眼间隔5-9秒，自然不频繁
                     }
                 }
             }
@@ -513,7 +604,7 @@ class ExpressionManager private constructor() {
                 delay(interval)
 
                 if (isRunning.get() && !isBlinking) {
-                    performBlink()
+                    performBlinkInternal()
                 }
             }
         }
@@ -521,17 +612,19 @@ class ExpressionManager private constructor() {
 
     /**
      * 状态更新主循环
-     * 60fps更新过渡动画进度
+     * 50fps更新过渡动画进度，同时递增帧计数器驱动持续重绘
+     * 瞳孔跟随、眨眼、微动作等动态效果都依赖每帧重绘
      */
     private fun startStateUpdateLoop() {
         managerJob = scope.launch {
+            var frameCount = 0L
             while (isActive && isRunning.get()) {
                 val currentState = _expressionState.value
                 val updatedState = currentState.updateProgress(TRANSITION_DURATION)
-                _expressionState.value = updatedState
-
-                // 60fps
-                delay(16L)
+                // 每帧递增动画帧计数器，强制驱动重绘，确保瞳孔跟随/眨眼/微动作实时更新
+                _expressionState.value = updatedState.copy(animFrame = frameCount++)
+                // 50fps：眼部动画足够流畅，减少调度开销
+                delay(20L)
             }
         }
     }

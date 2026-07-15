@@ -22,7 +22,8 @@ data class ExpressionState(
     val style: ExpressionStyle = ExpressionStyle.CARTOON,
     val startTime: Long = System.currentTimeMillis(),
     val duration: Long = type.defaultDuration,
-    val transitionProgress: Float = 1f
+    val transitionProgress: Float = 1f,
+    val animFrame: Long = 0L  // 动画帧计数器，驱动持续重绘（瞳孔跟随、眨眼、微动作等依赖每帧更新）
 ) {
     /**
      * 表情是否已过期（需要自动回落）
@@ -46,12 +47,9 @@ data class ExpressionState(
         )
     }
 
-    // 瞳孔位置滞后缓存，实现物理惯性
-    private var lastPupilX = 0f
-    private var lastPupilY = 0f
-
     /**
-     * 获取应用了强度、眨眼、瞳孔滞后的最终眼部参数
+     * 获取应用了强度、眨眼的最终眼部参数
+     * 瞳孔滞后滤波统一移至 ExpressionManager 中管理，避免 data class 拷贝导致状态丢失
      */
     fun getEyeParameters(): EyeParameters {
         val baseParams = EyeParameterMapper.getBaseParameters(ExpressionType.IDLE)
@@ -62,37 +60,41 @@ data class ExpressionState(
         val transitionedParams = EyeParameters.lerp(baseParams, targetParams, easedProgress)
         val finalParams = EyeParameters.applyIntensity(transitionedParams, baseParams, intensity)
 
-        // 瞳孔偏移使用减速缓动，实现物理滞后效果
         val manager = ExpressionManager.getInstance()
-        val targetPupilX = finalParams.pupilOffsetX + 
-                manager.pupilOffsetX * 0.6f + 
-                manager.microPupilOffsetX
-        val targetPupilY = finalParams.pupilOffsetY + 
-                manager.pupilOffsetY * 0.6f + 
-                manager.microPupilOffsetY
-        // 瞳孔低通滤波，系数0.06，非常平滑，消除抖动
-        val dx = targetPupilX - lastPupilX
-        val dy = targetPupilY - lastPupilY
-        // 死区：差值小于0.005时直接对齐，避免微小抖动
-        if (kotlin.math.abs(dx) < 0.005f) {
-            lastPupilX = targetPupilX
-        } else {
-            lastPupilX += dx * 0.06f
-        }
-        if (kotlin.math.abs(dy) < 0.005f) {
-            lastPupilY = targetPupilY
-        } else {
-            lastPupilY += dy * 0.06f
-        }
 
-        // 应用眨眼叠加：在当前眼睑开合度基础上乘以(1 - blinkOverlay)
-        val blinkOverlay = ExpressionManager.getInstance().blinkOverlay
-        val finalEyelidOpenness = finalParams.eyelidOpenness * (1f - blinkOverlay)
+        // 计算目标瞳孔偏移（表情基础偏移 + 视线跟踪 + 微动作 + 临时晃动 + 声源 + 触摸）
+        val targetPupilX = finalParams.pupilOffsetX +
+                manager.pupilOffsetX * 0.8f +
+                manager.microPupilOffsetX +
+                manager.tempPupilShakeX +
+                manager.soundPupilOffsetX * 0.5f +
+                manager.touchPupilOffsetX
+        val targetPupilY = finalParams.pupilOffsetY +
+                manager.pupilOffsetY * 0.8f +
+                manager.microPupilOffsetY +
+                manager.touchPupilOffsetY
+
+        // 瞳孔低通滤波（状态保存在 ExpressionManager 单例中，确保跨帧持久化）
+        val smoothedPupilX = manager.updateSmoothedPupilX(targetPupilX)
+        val smoothedPupilY = manager.updateSmoothedPupilY(targetPupilY)
+
+        // 应用眨眼叠加、IMU临时偏移、视觉模仿
+        val blinkOverlay = manager.blinkOverlay
+        val tempEyelidOffset = manager.tempEyelidOffset
+        val mimicEyelid = manager.mimicEyelidOpenness
+        val finalEyelidOpenness = ((finalParams.eyelidOpenness * (1f - blinkOverlay) + tempEyelidOffset) * mimicEyelid)
+            .coerceIn(0f, 1f)
+
+        // 叠加音频情绪效果
+        val adjustedEyeTail = finalParams.eyeTailAngle + manager.audioEyeShape * 0.5f
+        val adjustedPupilSize = finalParams.pupilSize * (1f - manager.audioEyeShape * 0.2f)
 
         return finalParams.copy(
             eyelidOpenness = finalEyelidOpenness,
-            pupilOffsetX = lastPupilX,
-            pupilOffsetY = lastPupilY
+            pupilOffsetX = smoothedPupilX + manager.soundPupilOffsetX * 0.3f,
+            pupilOffsetY = smoothedPupilY,
+            eyeTailAngle = adjustedEyeTail.coerceIn(-1f, 1f),
+            pupilSize = adjustedPupilSize.coerceIn(0.5f, 1.2f)
         )
     }
 }
