@@ -7,6 +7,7 @@ package com.roboparty.rpoexpression.communication
 
 import android.util.Log
 import com.roboparty.rpoexpression.communication.link.*
+import com.roboparty.rpoexpression.system.SystemStatusMonitor
 import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -34,6 +35,7 @@ class MultiLinkManager private constructor() {
         private const val HEALTH_CHECK_INTERVAL = 500L  // 500ms检测一次
         private const val LINK_TIMEOUT_MS = 1000L       // 1秒无数据判定为故障
         private const val LINK_RECOVERY_CHECK = 3       // 连续3次检测正常判定为恢复
+        private const val ALL_LINK_LOST_ALERT_MS = 5000L // 所有链路断开5秒触发告警
 
         // 切换原因
         const val SWITCH_REASON_MAIN_RECOVER = 1
@@ -74,6 +76,9 @@ class MultiLinkManager private constructor() {
 
     // 链路恢复计数器
     private val linkRecoveryCounter = mutableMapOf<CommLink.LinkType, Int>()
+    // 全链路断开开始时间
+    private var allLinkLostStartTime = 0L
+    private var commAlertTriggered = false
 
     // 数据接收回调
     private var dataCallback: ((ByteArray) -> Unit)? = null
@@ -236,7 +241,27 @@ class MultiLinkManager private constructor() {
             // 没有可用链路，尝试重连
             _isConnected.value = false
             tryReconnectLinks()
+
+            // 全链路断连计时，超过5秒触发告警
+            val now = System.currentTimeMillis()
+            if (allLinkLostStartTime == 0L) {
+                allLinkLostStartTime = now
+            } else if (!commAlertTriggered && now - allLinkLostStartTime > ALL_LINK_LOST_ALERT_MS) {
+                commAlertTriggered = true
+                Log.e(TAG, "All links lost for ${ALL_LINK_LOST_ALERT_MS}ms, triggering ALERT")
+                SystemStatusMonitor.getInstance().triggerCommunicationLostAlert()
+            }
             return
+        }
+
+        // 有可用链路，重置断连计时
+        if (allLinkLostStartTime != 0L) {
+            allLinkLostStartTime = 0L
+            if (commAlertTriggered) {
+                commAlertTriggered = false
+                Log.i(TAG, "Link recovered, clearing communication alert")
+                SystemStatusMonitor.getInstance().clearCommunicationAlert()
+            }
         }
 
         // 3. 检查是否有更高优先级链路恢复（自动切回主链路）

@@ -61,6 +61,9 @@ class RpoExpressionApp : Application() {
     override fun onCreate() {
         super.onCreate()
 
+        // 初始化配置管理器（最先初始化，其他模块读取配置）
+        com.roboparty.rpoexpression.config.ConfigManager.getInstance().init(this)
+
         // 初始化核心管理器
         expressionManager = ExpressionManager.getInstance()
         communicationManager = CommunicationManager.getInstance()
