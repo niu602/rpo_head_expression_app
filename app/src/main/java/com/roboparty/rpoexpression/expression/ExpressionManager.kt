@@ -12,6 +12,7 @@ import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlin.coroutines.coroutineContext
 import java.util.concurrent.atomic.AtomicBoolean
 import kotlin.random.Random
 
@@ -49,8 +50,11 @@ class ExpressionManager private constructor() {
     // 上次表情切换时间，用于防抖
     private var lastSwitchTime = 0L
 
-    // 当前渲染风格
-    private var currentStyle = ExpressionStyle.CARTOON
+    // 当前渲染风格（默认女款）
+    private var currentStyle = ExpressionStyle.FEMALE
+
+    // 风格变更回调列表（用于联动 TTS 音色等外部模块）
+    private val styleChangeCallbacks = mutableListOf<(ExpressionStyle) -> Unit>()
 
     // 当前全局表情强度 0-100
     private var currentIntensity = 100
@@ -130,9 +134,47 @@ class ExpressionManager private constructor() {
     private val _currentEffect = MutableStateFlow(EyeEffectType.NONE)
     val currentEffect: StateFlow<EyeEffectType> = _currentEffect.asStateFlow()
 
+    // 待机状态电量修饰（不改变表情类型，仅在IDLE时叠加视觉效果）
+    // 用于在不干扰业务逻辑的前提下，通过待机状态的颜色/闪烁反映电量状态
+    enum class IdleBatteryState {
+        NORMAL,     // 正常电量，无修饰
+        LOW_BATTERY, // 低电量，橙黄闪烁
+        CHARGING     // 充电中，绿色呼吸
+    }
+    private val _idleBatteryState = MutableStateFlow(IdleBatteryState.NORMAL)
+    val idleBatteryState: StateFlow<IdleBatteryState> = _idleBatteryState.asStateFlow()
+
     // IMU临时效果偏移
     internal var tempEyelidOffset = 0f // 眼睑临时偏移：-1全闭，1睁大
     internal var tempPupilShakeX = 0f // 瞳孔临时晃动偏移
+    // 距离感知瞳孔缩放：1.0为基准，<1缩小（走近对焦），>1放大（走远放松）
+    internal var distancePupilScale = 1f
+
+    // ==================== 休眠梦境系统 ====================
+    /**
+     * 睡眠子状态：外部统一使用 SLEEPING 表情，内部分阶段
+     */
+    enum class SleepStage {
+        AWAKE,          // 清醒（非睡眠状态）
+        YAWNING,        // 打哈欠：入睡前过渡，闭合→微睁→闭合
+        LIGHT_SLEEP,    // 浅眠：眼睛半闭，偶尔微动
+        DEEP_SLEEP,     // 深眠：低亮度安静状态
+        WAKING          // 唤醒：快速睁眼
+    }
+
+    private var sleepStage = SleepStage.AWAKE
+    private var sleepJob: Job? = null
+
+    // 睡眠参数配置
+    private val YAWNING_DURATION_MS = 2500L      // 打哈欠总时长
+    private val LIGHT_SLEEP_DURATION_MS = 15000L  // 浅眠持续约15秒后进入深眠
+    private val LIGHT_SLEEP_EYELID_OPEN = 0.45f   // 浅眠眼睑开合度（半睁状态，清晰可见）
+    private val DEEP_SLEEP_EYELID_OPEN = 0.12f    // 深眠眼睑开合度（低亮度，安静休息）
+    private val WAKING_DURATION_MS = 300L         // 快速唤醒时长（快速睁眼，不阻塞交互）
+
+    // 浅眠微动参数
+    private val LIGHT_MICRO_INTERVAL_MS = 1500L   // 浅眠微动间隔
+    private val LIGHT_MICRO_AMPLITUDE = 0.12f     // 浅眠微动幅度
     // 视觉模仿：用户眼睛开合度
     internal var mimicEyelidOpenness = 1f
     // 音频情绪眼型：-1柔和弯月，0正常，1锐利上扬
@@ -154,6 +196,20 @@ class ExpressionManager private constructor() {
     fun setMimicEyelidOpenness(openness: Float) { 
         mimicEyelidOpenness = openness.coerceIn(0.2f, 1f) 
     }
+
+    /**
+     * 设置待机状态电量修饰
+     * 仅在IDLE状态下生效，不改变表情类型，仅叠加视觉效果
+     * 用于反映电量状态而不干扰业务逻辑
+     */
+    fun setIdleBatteryState(state: IdleBatteryState) {
+        if (_idleBatteryState.value != state) {
+            _idleBatteryState.value = state
+            Log.d(TAG, "Idle battery state changed: $state")
+        }
+    }
+
+    fun getIdleBatteryState(): IdleBatteryState = _idleBatteryState.value
     fun isBlinking() = isBlinking
     fun performBlink(type: BlinkType = BlinkType.NORMAL) {
         if (!isBlinking) {
@@ -162,6 +218,49 @@ class ExpressionManager private constructor() {
     }
     fun setTempEyelidOffset(offset: Float) { tempEyelidOffset = offset }
     fun setTempPupilShakeX(offset: Float) { tempPupilShakeX = offset }
+
+    /**
+     * 设置距离感知瞳孔缩放系数
+     * @param scale 1.0为基准，<1缩小（走近对焦感），>1放大（走远放松感）
+     *              有效范围 0.85 ~ 1.15
+     */
+    fun setDistancePupilScale(scale: Float) {
+        distancePupilScale = scale.coerceIn(0.85f, 1.15f)
+    }
+
+    // ==================== 休眠梦境系统公开方法 ====================
+
+    /**
+     * 进入睡眠模式（带打哈欠过渡动画）
+     * 自动流转：打哈欠 → 浅眠 → 深眠
+     */
+    fun enterSleepWithDream() {
+        if (sleepStage != SleepStage.AWAKE) return
+        Log.d(TAG, "进入睡眠梦境模式")
+        startSleepCycle()
+    }
+
+    /**
+     * 从睡眠中立即唤醒（无过渡动画）
+     * 检测到人脸后直接重置状态，优先响应高优先级反馈表情
+     */
+    fun wakeFromSleep(): Long {
+        if (sleepStage == SleepStage.AWAKE) return 0L
+        Log.d(TAG, "从睡眠中立即唤醒，阶段=$sleepStage")
+        sleepJob?.cancel()
+        resetSleepState()
+        return 0L
+    }
+
+    /**
+     * 获取当前睡眠子阶段
+     */
+    fun getCurrentSleepStage(): SleepStage = sleepStage
+
+    /**
+     * 是否处于睡眠状态（任意睡眠子阶段）
+     */
+    fun isSleeping(): Boolean = sleepStage != SleepStage.AWAKE
 //    fun setPupilOffset(x: Float, y: Float) {
 //        pupilOffsetX = x.coerceIn(-1f, 1f)
 //        pupilOffsetY = y.coerceIn(-1f, 1f)
@@ -223,10 +322,28 @@ class ExpressionManager private constructor() {
      * 设置全局渲染风格
      */
     fun setStyle(style: ExpressionStyle) {
+        if (currentStyle == style) return
         currentStyle = style
         val currentState = _expressionState.value
         _expressionState.value = currentState.copy(style = style)
         Log.d(TAG, "Expression style changed to: $style")
+        // 触发风格变更回调，联动 TTS 音色等外部模块
+        styleChangeCallbacks.forEach { it(style) }
+    }
+
+    /**
+     * 注册风格变更回调
+     * @param callback 回调函数，参数为新风格
+     */
+    fun addStyleChangeCallback(callback: (ExpressionStyle) -> Unit) {
+        styleChangeCallbacks.add(callback)
+    }
+
+    /**
+     * 移除风格变更回调
+     */
+    fun removeStyleChangeCallback(callback: (ExpressionStyle) -> Unit) {
+        styleChangeCallbacks.remove(callback)
     }
 
     /**
@@ -647,5 +764,198 @@ class ExpressionManager private constructor() {
             speechMicroMotionJob?.cancel()
             startIdleMicroMotion()
         }
+    }
+
+    // ==================== 休眠梦境系统内部实现 ====================
+
+    /**
+     * 启动完整睡眠周期：打哈欠 → 浅眠 → 深眠
+     */
+    private fun startSleepCycle() {
+        sleepJob?.cancel()
+        sleepJob = scope.launch {
+            try {
+                // 阶段1：打哈欠过渡
+                playYawningAnimation()
+
+                // 阶段2：浅眠
+                sleepStage = SleepStage.LIGHT_SLEEP
+                playLightSleep()
+
+                // 阶段3：深眠（持续直到被唤醒）
+                sleepStage = SleepStage.DEEP_SLEEP
+                playDeepSleep()
+            } catch (e: Exception) {
+                Log.e(TAG, "睡眠周期异常", e)
+                resetSleepState()
+            }
+        }
+    }
+
+    /**
+     * 打哈欠动画：缓慢闭合 → 微睁一下 → 再缓慢闭合
+     * 总时长约2.5秒，模拟真实打哈欠的眼部动作
+     */
+    private suspend fun playYawningAnimation() {
+        sleepStage = SleepStage.YAWNING
+        val startTime = System.currentTimeMillis()
+        val totalDuration = YAWNING_DURATION_MS
+
+        while (coroutineContext.isActive && sleepStage == SleepStage.YAWNING) {
+            val elapsed = System.currentTimeMillis() - startTime
+            if (elapsed >= totalDuration) break
+
+            val progress = (elapsed.toFloat() / totalDuration).coerceIn(0f, 1f)
+
+            // 打哈欠曲线：0→闭合(40%)→微睁(60%)→闭合(100%)
+            // 第一段：0~40% 眼睛慢慢闭上（打哈欠开始）
+            // 第二段：40%~60% 眼睛微微睁开一下（哈欠顶点）
+            // 第三段：60%~100% 眼睛再次闭上，进入睡眠
+            val eyelidProgress = when {
+                progress < 0.4f -> {
+                    // 闭合阶段：从正常到全闭
+                    progress / 0.4f  // 0 → 1
+                }
+                progress < 0.6f -> {
+                    // 微睁阶段：从全闭到半睁再回到全闭
+                    val subProgress = (progress - 0.4f) / 0.2f  // 0 → 1
+                    // 正弦波：0 → 1 → 0，形成一个小凸起
+                    val wave = Math.sin(subProgress * Math.PI).toFloat()
+                    1f - wave * 0.3f  // 全闭状态下睁开30%
+                }
+                else -> {
+                    // 再次闭合：从微睁到全闭
+                    val subProgress = (progress - 0.6f) / 0.4f  // 0 → 1
+                    0.7f + subProgress * 0.3f  // 70%闭合 → 100%闭合
+                }
+            }
+
+            // tempEyelidOffset：负值表示闭合，SLEEPING基础是0（全闭）
+            // 这里用offset控制睁开程度：0 = 全闭，1 = 全睁
+            // SLEEPING基础eyelidOpenness=0，叠加tempEyelidOffset控制睁开
+            tempEyelidOffset = (1f - eyelidProgress) * 0.8f
+
+            delay(16) // ~60fps
+        }
+
+        // 确保最终完全闭合
+        tempEyelidOffset = 0f
+    }
+
+    /**
+     * 浅眠阶段：眼睛半闭，偶尔轻微微动
+     * 持续约15秒，然后自动进入深眠
+     */
+    private suspend fun playLightSleep() {
+        val startTime = System.currentTimeMillis()
+        var lastMicroMoveTime = 0L
+
+        while (coroutineContext.isActive && sleepStage == SleepStage.LIGHT_SLEEP) {
+            val elapsed = System.currentTimeMillis() - startTime
+            if (elapsed >= LIGHT_SLEEP_DURATION_MS) break
+
+            // 浅眠眼睑：半睁状态，带明显呼吸波动，与深眠形成显著视觉差异
+            val breathPhase = (elapsed % 3000L) / 3000f
+            val breathWave = Math.sin(breathPhase * Math.PI * 2).toFloat() * 0.05f
+            tempEyelidOffset = LIGHT_SLEEP_EYELID_OPEN + breathWave
+
+            // 偶尔轻微微动（每2秒左右一次小幅度移动）
+            val now = System.currentTimeMillis()
+            if (now - lastMicroMoveTime > LIGHT_MICRO_INTERVAL_MS) {
+                lastMicroMoveTime = now
+                // 随机小幅度偏移
+                val targetX = (Random.nextFloat() - 0.5f) * 2 * LIGHT_MICRO_AMPLITUDE
+                val targetY = (Random.nextFloat() - 0.5f) * 2 * LIGHT_MICRO_AMPLITUDE
+
+                // 缓慢移动过去
+                val moveDuration = 600L
+                val moveStart = System.currentTimeMillis()
+                val startX = microPupilOffsetX
+                val startY = microPupilOffsetY
+
+                while (coroutineContext.isActive && sleepStage == SleepStage.LIGHT_SLEEP) {
+                    val moveElapsed = System.currentTimeMillis() - moveStart
+                    if (moveElapsed >= moveDuration) break
+                    val t = (moveElapsed.toFloat() / moveDuration).coerceIn(0f, 1f)
+                    val eased = EyeParameters.decelerateEasing(t)
+                    microPupilOffsetX = startX + (targetX - startX) * eased
+                    microPupilOffsetY = startY + (targetY - startY) * eased
+                    delay(16)
+                }
+            }
+
+            delay(16)
+        }
+
+        // 进入深眠前，瞳孔归位
+        microPupilOffsetX = 0f
+        microPupilOffsetY = 0f
+    }
+
+    /**
+     * 深眠阶段：简单低亮度安静状态
+     * 保持微开的细缝，带极微弱呼吸，无复杂动效
+     */
+    private suspend fun playDeepSleep() {
+        var breathStartTime = System.currentTimeMillis()
+
+        while (coroutineContext.isActive && sleepStage == SleepStage.DEEP_SLEEP) {
+            val elapsed = System.currentTimeMillis() - breathStartTime
+
+            // 深眠：低亮度（0.12），极微弱呼吸感，安静休息
+            val breathPhase = (elapsed % 4000L) / 4000f
+            val breathWave = Math.sin(breathPhase * Math.PI * 2).toFloat() * 0.02f
+            tempEyelidOffset = DEEP_SLEEP_EYELID_OPEN + breathWave
+
+            delay(33) // 30fps，深眠降低刷新率省电
+        }
+    }
+
+    /**
+     * 快速唤醒：300ms快速睁眼，不阻塞后续交互
+     * 检测到人脸后立即唤醒，优先响应人脸识别反馈表情
+     */
+    private fun startWakeTransition() {
+        sleepJob?.cancel()
+        sleepStage = SleepStage.WAKING
+
+        sleepJob = scope.launch {
+            try {
+                val startTime = System.currentTimeMillis()
+                val totalDuration = WAKING_DURATION_MS
+                val startEyelid = tempEyelidOffset
+
+                // 快速睁眼：300ms内从当前睡眠亮度线性睁开到1.0
+                // 不做复杂动画，不阻塞后续高优先级表情（如问候、微笑回应）
+                while (coroutineContext.isActive && sleepStage == SleepStage.WAKING) {
+                    val elapsed = System.currentTimeMillis() - startTime
+                    if (elapsed >= totalDuration) break
+
+                    val progress = (elapsed.toFloat() / totalDuration).coerceIn(0f, 1f)
+                    val eased = EyeParameters.fastOutSlowInEasing(progress)
+                    tempEyelidOffset = startEyelid + (1f - startEyelid) * eased
+
+                    delay(16)
+                }
+
+                // 唤醒完成，重置状态
+                resetSleepState()
+            } catch (e: Exception) {
+                Log.e(TAG, "唤醒过渡异常", e)
+                resetSleepState()
+            }
+        }
+    }
+
+    /**
+     * 重置睡眠状态到清醒
+     * 注意：不重置 tempEyelidOffset，避免 SLEEPING 表情下瞬间全闭造成闪烁
+     * 切到 IDLE 后 tempEyelidOffset 残留值不影响最终亮度（IDLE 基础 1.0，叠加后 clamp 仍为 1.0）
+     */
+    private fun resetSleepState() {
+        sleepStage = SleepStage.AWAKE
+        microPupilOffsetX = 0f
+        microPupilOffsetY = 0f
+        sleepJob = null
     }
 }

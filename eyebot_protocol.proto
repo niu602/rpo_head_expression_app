@@ -1,0 +1,281 @@
+syntax = "proto3";
+
+package eyebot.protocol;
+option java_package = "com.eyebot.protocol";
+option java_outer_classname = "EyeBotProto";
+
+// ============================================================
+//  纯眼部单载体机器人 - 通信协议定义 (Protobuf v3)
+//  版本: v1.0
+//  说明: 替代JSON协议，TCP承载关键指令，UDP承载高频状态
+// ============================================================
+
+// ---------- 通用枚举 ----------
+
+// 链路类型
+enum LinkType {
+  LINK_UNKNOWN = 0;
+  LINK_TCP = 1;       // TCP 主链路
+  LINK_UDP = 2;       // UDP 状态上报
+  LINK_USB_SERIAL = 3; // USB 串口 备用链路
+  LINK_BLE = 4;       // 蓝牙 BLE 备用链路
+}
+
+// 指令类型
+enum CmdType {
+  CMD_UNKNOWN = 0;
+  // 下行指令 (主控 → 设备)
+  CMD_EXPRESSION_SET = 1;     // 设置单帧表情
+  CMD_SEQUENCE_PLAY = 2;      // 播放表情序列
+  CMD_SHORTCUT_TRIGGER = 3;   // 触发快捷指令
+  CMD_STATUS_QUERY = 4;       // 查询设备状态
+  CMD_CONFIG_SYNC = 5;        // 同步配置
+  CMD_MODE_SWITCH = 6;        // 切换工作模式
+  CMD_HEARTBEAT = 7;          // 心跳保活
+
+  // 上行事件 (设备 → 主控)
+  EVT_TOUCH = 101;            // 触摸事件
+  EVT_FACE_DETECT = 102;      // 人脸检测事件
+  EVT_GESTURE = 103;          // 手势识别事件
+  EVT_AUDIO_SOURCE = 104;     // 声源定位事件
+  EVT_STATUS_REPORT = 105;    // 状态周期上报
+  EVT_SEQUENCE_FINISH = 106;  // 序列播放完成事件
+  EVT_LINK_SWITCH = 107;      // 链路切换通知
+  EVT_ACK = 199;              // 通用应答
+}
+
+// 错误码
+enum ErrorCode {
+  ERR_OK = 0;
+  ERR_PARAM_INVALID = 1001;
+  ERR_CMD_UNSUPPORTED = 1002;
+  ERR_SHORTCUT_NOT_FOUND = 2001;
+  ERR_SEQUENCE_NOT_FOUND = 2002;
+  ERR_DEVICE_BUSY = 3001;
+  ERR_INTERNAL = 9001;
+}
+
+// 眼型枚举
+enum EyeShape {
+  SHAPE_NORMAL = 0;
+  SHAPE_HAPPY = 1;
+  SHAPE_SAD = 2;
+  SHAPE_ANGRY = 3;
+  SHAPE_SURPRISED = 4;
+  SHAPE_SLEEPY = 5;
+}
+
+// 工作模式
+enum WorkMode {
+  MODE_NORMAL = 0;     // 正常模式
+  MODE_STANDBY = 1;    // 待机模式
+  MODE_DEMO = 2;       // 演示模式
+  MODE_SLEEP = 3;      // 休眠模式
+}
+
+// ---------- 消息信封 ----------
+
+// 统一消息头 (所有消息共用)
+message MessageHeader {
+  uint32 msg_id = 1;           // 消息ID，递增，用于应答匹配
+  CmdType cmd_type = 2;        // 指令/事件类型
+  uint64 timestamp = 3;        // 毫秒级时间戳
+  LinkType link_type = 4;      // 当前链路类型
+  uint32 seq = 5;              // 序列号 (UDP可靠性辅助)
+}
+
+// 统一消息信封
+message EyeBotMessage {
+  MessageHeader header = 1;
+  oneof payload {
+    // 下行指令体
+    ExpressionSet expression_set = 10;
+    SequencePlay sequence_play = 11;
+    ShortcutTrigger shortcut_trigger = 12;
+    StatusQuery status_query = 13;
+    ConfigSync config_sync = 14;
+    ModeSwitch mode_switch = 15;
+    Heartbeat heartbeat = 16;
+
+    // 上行事件体
+    TouchEvent touch_event = 20;
+    FaceDetectEvent face_detect_event = 21;
+    GestureEvent gesture_event = 22;
+    AudioSourceEvent audio_source_event = 23;
+    StatusReport status_report = 24;
+    SequenceFinishEvent sequence_finish_event = 25;
+    LinkSwitchEvent link_switch_event = 26;
+    Ack ack = 29;
+  }
+}
+
+// ---------- 下行: 表情控制 ----------
+
+// 设置单帧表情
+message ExpressionSet {
+  float eyelid_open = 1;       // 眼睑开合度 0.0~1.0
+  float pupil_size = 2;        // 瞳孔大小 0.3~1.0
+  float pupil_offset_x = 3;    // 瞳孔水平偏移 -1.0~1.0
+  float pupil_offset_y = 4;    // 瞳孔垂直偏移 -1.0~1.0
+  EyeShape eye_shape = 5;      // 眼型预设
+  float glow_intensity = 6;    // 眼周光效强度 0.0~1.0
+  uint32 glow_color = 7;       // 光效颜色 ARGB
+  uint32 transition_ms = 8;    // 过渡时长 ms
+}
+
+// 播放表情序列
+message SequencePlay {
+  string sequence_id = 1;      // 序列ID
+  uint32 loop = 2;             // 循环次数 0=无限
+  float speed = 3;             // 播放速度倍率 0.5~2.0
+}
+
+// 触发快捷指令
+message ShortcutTrigger {
+  string shortcut_id = 1;      // 快捷指令ID
+}
+
+// 查询状态
+message StatusQuery {
+  bool full_detail = 1;        // 是否返回详细信息
+}
+
+// 同步配置
+message ConfigSync {
+  bytes config_data = 1;       // 配置数据 (JSON or 专用结构)
+  string config_type = 2;      // 配置类型 keymap/system
+}
+
+// 切换模式
+message ModeSwitch {
+  WorkMode target_mode = 1;
+  uint32 transition_ms = 2;
+}
+
+// 心跳
+message Heartbeat {
+  uint32 interval_ms = 1;      // 建议心跳间隔
+}
+
+// ---------- 上行: 感知事件 ----------
+
+// 触摸事件
+message TouchEvent {
+  uint32 touch_id = 1;         // 触摸点ID
+  float x = 2;                 // 相对X坐标 0.0~1.0
+  float y = 3;                 // 相对Y坐标 0.0~1.0
+  TouchAction action = 4;      // 触摸动作
+  uint64 duration_ms = 5;      // 触摸持续时间
+  uint32 pointer_count = 6;    // 触点数量
+
+  enum TouchAction {
+    TOUCH_DOWN = 0;
+    TOUCH_MOVE = 1;
+    TOUCH_UP = 2;
+    TOUCH_LONG_PRESS = 3;
+    TOUCH_DOUBLE_TAP = 4;
+  }
+}
+
+// 人脸检测事件
+message FaceDetectEvent {
+  bool has_face = 1;           // 是否检测到人脸
+  uint32 face_count = 2;       // 人脸数量
+  repeated FaceInfo faces = 3; // 人脸列表
+
+  message FaceInfo {
+    float center_x = 1;        // 人脸中心X 相对坐标
+    float center_y = 2;        // 人脸中心Y 相对坐标
+    float width_ratio = 3;     // 人脸宽度占比
+    float confidence = 4;      // 置信度 0.0~1.0
+  }
+}
+
+// 手势识别事件
+message GestureEvent {
+  GestureType gesture = 1;     // 手势类型
+  float confidence = 2;        // 置信度
+  float direction_x = 3;       // 手势方向X (挥手等)
+  float direction_y = 4;       // 手势方向Y
+
+  enum GestureType {
+    GESTURE_UNKNOWN = 0;
+    GESTURE_WAVE = 1;          // 挥手
+    GESTURE_POINT = 2;         // 指向
+    GESTURE_OPEN_PALM = 3;     // 张开手掌
+    GESTURE_FIST = 4;          // 握拳
+    GESTURE_THUMB_UP = 5;      // 点赞
+  }
+}
+
+// 声源定位事件
+message AudioSourceEvent {
+  bool has_sound = 1;          // 是否检测到声音
+  float angle = 2;             // 声源角度 -180~180度
+  float energy = 3;            // 声音能量 0.0~1.0
+  uint32 duration_ms = 4;      // 持续时间
+}
+
+// ---------- 上行: 状态与系统事件 ----------
+
+// 状态周期上报 (UDP高频发送)
+message StatusReport {
+  WorkMode current_mode = 1;
+  float eyelid_open = 2;
+  float pupil_size = 3;
+  float pupil_offset_x = 4;
+  float pupil_offset_y = 5;
+  EyeShape eye_shape = 6;
+  uint32 battery_level = 7;    // 电量 0~100
+  float cpu_usage = 8;         // CPU使用率 0.0~1.0
+  uint32 memory_usage_kb = 9;  // 内存占用 KB
+  uint32 fps = 10;             // 当前渲染帧率
+  LinkType active_link = 11;   // 当前活跃链路
+  uint64 uptime_ms = 12;       // 运行时长
+}
+
+// 序列播放完成事件
+message SequenceFinishEvent {
+  string sequence_id = 1;
+  uint32 played_count = 2;
+  bool interrupted = 3;        // 是否被中断
+}
+
+// 链路切换通知
+message LinkSwitchEvent {
+  LinkType old_link = 1;
+  LinkType new_link = 2;
+  SwitchReason reason = 3;
+
+  enum SwitchReason {
+    REASON_UNKNOWN = 0;
+    REASON_MAIN_RECOVER = 1;   // 主链路恢复，切回主链路
+    REASON_MAIN_LOST = 2;      // 主链路丢失，切备用
+    REASON_MANUAL = 3;         // 手动切换
+    REASON_QUALITY_DROP = 4;   // 链路质量下降
+  }
+}
+
+// 通用应答
+message Ack {
+  uint32 ack_msg_id = 1;       // 应答的消息ID
+  ErrorCode code = 2;
+  string msg = 3;
+}
+
+// ---------- 链路握手 ----------
+
+// 连接握手请求
+message HandshakeRequest {
+  string device_id = 1;
+  string protocol_version = 2;
+  repeated LinkType supported_links = 3;
+}
+
+// 连接握手响应
+message HandshakeResponse {
+  ErrorCode code = 1;
+  string server_version = 2;
+  uint32 heartbeat_interval_ms = 3;
+  uint32 udp_report_interval_ms = 4;
+}

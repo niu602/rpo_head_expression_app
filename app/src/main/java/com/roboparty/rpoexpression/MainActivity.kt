@@ -2,7 +2,6 @@
  * SPDX-FileCopyrightText: 2026 Roboparty Camp
  * SPDX-License-Identifier: GPL-3.0-only
  */
-
 package com.roboparty.rpoexpression
 
 import android.Manifest
@@ -26,7 +25,6 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.rememberScrollState
-import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.Divider
 import androidx.compose.material3.Text
 import androidx.compose.material3.Button
@@ -66,7 +64,7 @@ import androidx.compose.ui.Alignment
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.ui.graphics.Color as ComposeColor
 import androidx.compose.ui.text.font.FontWeight
-
+import androidx.compose.foundation.verticalScroll
 /**
  * 主Activity
  * 实现全屏沉浸式表情显示，完成ASR→LLM→TTS全链路对话
@@ -92,7 +90,71 @@ class MainActivity : ComponentActivity() {
     private var isWakeUpListening = false // 是否处于唤醒监听状态
     private var lastWakeTime = 0L // 上次唤醒时间，冷却防重复
     private val WAKE_COOLDOWN_MS = 3000L // 唤醒冷却3秒
-    private val wakeWords = listOf("萝卜萝卜", "hirobot") // 严格匹配的唤醒词
+    private val wakeWords = listOf(
+        "萝卜", "萝卜萝卜", "罗布", "罗波",   // 中文宽松
+        "hiro", "hirobot", "hi bot"           // 英文宽松
+    )
+
+    // 连续对话相关
+    private var isInContinuousConversation = false // 是否处于连续对话模式（唤醒后无需重复唤醒）
+    private val exitWords = listOf(
+        "结束对话", "结束", "拜拜", "拜", "再见", "再会", "退下"  // 结束词
+    )
+
+    // ========== [新增] 连续对话空闲超时：一段时间没说话自动退出连续对话 ==========
+    private val CONTINUOUS_CONVERSATION_TIMEOUT_MS = 30000L // 30秒
+    private var continuousConversationTimeoutJob: kotlinx.coroutines.Job? = null
+
+    // ========== [新增] TTS播放结束回调监听器，解决原来只执行一次的问题 ==========
+    private var ttsFinishListener: (() -> Unit)? = null
+
+    /**
+     * 宽松唤醒词匹配
+     * 规则：
+     * 1. 中文：匹配≥2个字；英文：匹配≥3个字母
+     * 2. 支持：开头匹配 / 结尾匹配 / 中间包含
+     * 3. 自动过滤太短的识别结果（<3字直接忽略）
+     */
+    private fun isFuzzyMatch(input: String, wakeWord: String): Boolean {
+        // 太短直接不匹配，防误触
+        if (input.length < 3) return false
+
+        val minMatchLen = if (wakeWord.any { it.isChinese() }) 2 else 3
+
+        // 情况1：输入包含唤醒词（原逻辑）
+        if (input.contains(wakeWord, ignoreCase = true)) return true
+
+        // 情况2：开头匹配（如：萝卜、萝卜萝）
+        if (input.startsWith(wakeWord.take(minMatchLen), ignoreCase = true)) return true
+
+        // 情况3：结尾匹配（如：萝卜、卜萝卜）
+        if (input.endsWith(wakeWord.takeLast(minMatchLen), ignoreCase = true)) return true
+
+        // 情况4：唤醒词包含输入片段，降低漏触发
+        if (wakeWord.contains(input.take(minMatchLen), ignoreCase = true)) return true
+
+        return false
+    }
+
+    // 辅助：判断是否汉字
+    private fun Char.isChinese(): Boolean = this in '\u4e00'..'\u9fa5'
+
+    /**
+     * 结束词宽松匹配
+     * 规则：
+     * 1. 只判断清洗后的文本
+     * 2. 输入包含结束词才命中
+     * 3. 去掉原来反向包含，减少误触
+     */
+    private fun isExitWord(input: String): Boolean {
+        val trimmed = input.trim()
+        if (trimmed.length < 2) return false
+
+        // ========== [修改] 只做正向包含，避免“结束工作”“再见一面”这类句子误触发 ==========
+        return exitWords.any { word ->
+            trimmed.contains(word, ignoreCase = true)
+        }
+    }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -129,7 +191,6 @@ class MainActivity : ComponentActivity() {
         // 启动各个管理器
         startManagers()
 
-        // 注册TTS播放结束回调，播报完自动切回待机
         initTtsFinishCallback()
 
         // 启动自动申请权限，开启摄像头和麦克风
@@ -145,6 +206,12 @@ class MainActivity : ComponentActivity() {
         if (isWakeUpListening || audioManager.isListening() || audioManager.isSpeaking()) {
             return
         }
+
+        // ========== [修改] 只有明确进入唤醒监听时，才退出连续对话 ==========
+        if (isInContinuousConversation) {
+            exitContinuousConversation()
+        }
+
         // 先确保上一次的ASR已经停止
         try {
             audioManager.stopListening()
@@ -157,49 +224,49 @@ class MainActivity : ComponentActivity() {
             // 语音唤醒模式：不触发识别中表情，避免常驻显示识别中
             audioManager.startListening(
                 callback = object : AsrManager.AsrResultCallback {
-                override fun onResult(text: String) {
-                    runOnUiThread {
-                        isWakeUpListening = false
-                        try {
-                            if (text.isNotEmpty()) {
-                                // 严格预处理：去除所有非字母汉字，转小写
-                                val normalizedText = text.lowercase()
-                                    .replace(Regex("[^a-z\\u4e00-\\u9fa5]"), "")
-                                // 严格匹配：必须完整包含唤醒词
-                                val hitWakeWord = wakeWords.any { word ->
-                                    normalizedText.contains(word, ignoreCase = true)
-                                }
-                                // 冷却判断：3秒内不重复唤醒
-                                val now = System.currentTimeMillis()
-                                if (hitWakeWord && now - lastWakeTime > WAKE_COOLDOWN_MS) {
-                                    lastWakeTime = now
-                                    triggerWakeUp()
+                    override fun onResult(text: String) {
+                        runOnUiThread {
+                            isWakeUpListening = false
+                            try {
+                                if (text.isNotEmpty()) {
+                                    // 清洗：只保留汉字+英文，转小写
+                                    val raw = text.lowercase()
+                                        .replace(Regex("[^a-z\\u4e00-\\u9fa5]"), "")
+                                    //宽松匹配：任一唤醒词满足“部分匹配+最小长度”
+                                    val hitWakeWord = wakeWords.any { word ->
+                                        isFuzzyMatch(raw, word)
+                                    }
+                                    // 冷却判断：3秒内不重复唤醒
+                                    val now = System.currentTimeMillis()
+                                    if (hitWakeWord && now - lastWakeTime > WAKE_COOLDOWN_MS) {
+                                        lastWakeTime = now
+                                        triggerWakeUp()
+                                    } else {
+                                        // 未命中或冷却中，继续监听
+                                        continueWakeUpListen()
+                                    }
                                 } else {
-                                    // 未命中或冷却中，继续监听
+                                    // 空结果，继续监听
                                     continueWakeUpListen()
                                 }
-                            } else {
-                                // 空结果，继续监听
+                            } catch (e: Exception) {
+                                // 异常后继续监听，避免崩溃
                                 continueWakeUpListen()
                             }
-                        } catch (e: Exception) {
-                            // 异常后继续监听，避免崩溃
-                            continueWakeUpListen()
                         }
                     }
-                }
 
-                override fun onError(errorMsg: String) {
-                    runOnUiThread {
-                        isWakeUpListening = false
-                        // 出错后延迟再监听，避免频繁重试占资源
-                        lifecycleScope.launch {
-                            delay(500)
-                            continueWakeUpListen()
+                    override fun onError(errorMsg: String) {
+                        runOnUiThread {
+                            isWakeUpListening = false
+                            // 出错后延迟再监听，避免频繁重试占资源
+                            lifecycleScope.launch {
+                                delay(500)
+                                continueWakeUpListen()
+                            }
                         }
                     }
-                }
-            }, triggerExpression = false)
+                }, triggerExpression = false)
         } catch (e: Exception) {
             isWakeUpListening = false
             // 启动失败，延迟重试
@@ -230,6 +297,11 @@ class MainActivity : ComponentActivity() {
      */
     private fun triggerWakeUp() {
         isWakeUpListening = false
+        isInContinuousConversation = true // 进入连续对话模式，后续无需重复唤醒
+
+        // ========== [新增] 启动连续对话空闲超时计时 ==========
+        resetContinuousConversationTimeout()
+
         // 1. 瞳孔转向音源方向
         val soundDir = audioManager.soundDirection.value
         expressionManager.setPupilOffset(soundDir, 0f)
@@ -294,27 +366,102 @@ class MainActivity : ComponentActivity() {
     }
 
     /**
-     * TTS播报结束自动切回待机，并恢复唤醒监听
+     * TTS播报结束回调注册
+     * 修复原来只在onCreate执行一次的问题
      */
     private fun initTtsFinishCallback() {
-        ModuleStateManager.onTtsFinishSpeaking()
-        // 对话结束，恢复唤醒监听
-        lifecycleScope.launch {
-            delay(500)
-            startWakeUpListening()
+        ttsFinishListener = {
+            ModuleStateManager.onTtsFinishSpeaking()
+
+            lifecycleScope.launch {
+                delay(500)
+
+                if (isInContinuousConversation) {
+                    // 连续对话模式：自动继续聆听，无需唤醒词
+                    startAsrRecognition()
+                } else {
+                    // 非连续对话：回到唤醒监听状态
+                    startWakeUpListening()
+                }
+            }
         }
+        // 注册到 AudioManager，TTS 结束时会自动触发
+        audioManager.setOnSpeakFinishListener(object : AudioManager.OnSpeakFinishListener {
+            override fun onSpeakFinsh() {
+                runOnUiThread {
+                    ttsFinishListener?.invoke()
+                }
+            }
+        })
+
+        // ===== 注册打断（Barge-in）回调 =====
+        audioManager.setOnBargeInListener(object : AudioManager.OnBargeInListener {
+            override fun onBargeIn(text: String) {
+                runOnUiThread {
+                    // 用户打断了当前播报
+                    // 1. 取消正在进行的LLM请求
+                    llmManager.cancelRequest()
+                    // 2. 标记为识别中状态
+                    ModuleStateManager.onAsrStartListening()
+                    ModuleStateManager.onAsrFinish()
+                    // 3. 进入连续对话模式（如果还没进入）
+                    if (!isInContinuousConversation) {
+                        isInContinuousConversation = true
+                    }
+                    // 4. 处理打断时的识别结果
+                    processAsrResult(text, asrOnly = false)
+                }
+            }
+        })
+    }
+
+    /**
+     * 重置连续对话空闲超时
+     */
+    private fun resetContinuousConversationTimeout() {
+        continuousConversationTimeoutJob?.cancel()
+
+        continuousConversationTimeoutJob = lifecycleScope.launch {
+            delay(CONTINUOUS_CONVERSATION_TIMEOUT_MS)
+
+            if (isInContinuousConversation && !audioManager.isSpeaking() && !audioManager.isListening()) {
+                exitContinuousConversation()
+                expressionManager.requestExpression(ExpressionType.IDLE, force = true)
+                startWakeUpListening()
+            }
+        }
+    }
+
+    /**
+     * 退出连续对话模式
+     */
+    private fun exitContinuousConversation() {
+        isInContinuousConversation = false
+        continuousConversationTimeoutJob?.cancel()
+        continuousConversationTimeoutJob = null
     }
 
     override fun onResume() {
         super.onResume()
         enableFullscreenMode()
-        // 回到前台，恢复感知功能
+
+        // ========== [修改] onResume不再强制打断连续对话 ==========
         val hasAudio = ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED
         val hasCamera = ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED
+
         if (hasCamera && !visionManager.isDetecting()) {
             startFaceDetect()
         }
-        if (hasAudio && !isWakeUpListening && !audioManager.isSpeaking()) {
+
+        if (!hasAudio || audioManager.isSpeaking() || audioManager.isListening()) {
+            return
+        }
+
+        if (isInContinuousConversation) {
+            // 保持连续对话，继续聆听
+            startAsrRecognition()
+        } else {
+            // 回到唤醒监听
             startWakeUpListening()
         }
     }
@@ -323,6 +470,10 @@ class MainActivity : ComponentActivity() {
         super.onPause()
         // 退后台停止所有前台任务，彻底释放资源
         isWakeUpListening = false
+        isInContinuousConversation = false // 退出连续对话模式
+        continuousConversationTimeoutJob?.cancel()
+        continuousConversationTimeoutJob = null
+
         try {
             audioManager.stopListening()
             audioManager.stopSpeaking()
@@ -349,11 +500,36 @@ class MainActivity : ComponentActivity() {
 
     /**
      * 处理手柄按键事件
+     *
+     * 按键映射总览：
+     * ┌─────────────────────────────────────────────────┐
+     * │ ABXY 核心操作区                                  │
+     * │   A / X  → 开始语音对话                          │
+     * │   B      → 停止所有操作，回到待机                 │
+     * │   Y      → 循环切换渲染风格                       │
+     * ├─────────────────────────────────────────────────┤
+     * │ 肩键 表情快捷区                                   │
+     * │   L1     → 上一个表情                            │
+     * │   R1     → 下一个表情                            │
+     * │   L2     → 快捷触发「开心」表情                   │
+     * │   R2     → 快捷触发「疑惑」表情                   │
+     * ├─────────────────────────────────────────────────┤
+     * │ 十字键 参数调节区                                 │
+     * │   ↑ 上   → 表情强度 +10%                         │
+     * │   ↓ 下   → 表情强度 -10%                         │
+     * │   ← 左   → 上一种渲染风格                        │
+     * │   → 右   → 下一种渲染风格                        │
+     * ├─────────────────────────────────────────────────┤
+     * │ 菜单键 系统功能区                                 │
+     * │   Start  → 开启/关闭人脸识别                     │
+     * │   Select → 播放演示Demo序列                      │
+     * └─────────────────────────────────────────────────┘
      */
     @SuppressLint("RestrictedApi")
     override fun dispatchKeyEvent(event: KeyEvent): Boolean {
         if (event.action == KeyEvent.ACTION_DOWN) {
             when (event.keyCode) {
+                // ========== ABXY 核心操作区 ==========
                 // X/A键：开始语音对话
                 KeyEvent.KEYCODE_BUTTON_X, KeyEvent.KEYCODE_BUTTON_A -> {
                     checkRecordPermissionAndStartAsr()
@@ -362,6 +538,7 @@ class MainActivity : ComponentActivity() {
                 // B键：停止所有操作，回到待机
                 KeyEvent.KEYCODE_BUTTON_B -> {
                     demoSequenceManager.stopDemo()
+                    exitContinuousConversation() // 退出连续对话模式
                     audioManager.stopSpeaking()
                     audioManager.stopListening()
                     llmManager.cancelRequest()
@@ -377,18 +554,32 @@ class MainActivity : ComponentActivity() {
                     expressionManager.setStyle(styles[nextIndex])
                     return true
                 }
+
+                // ========== 肩键 表情快捷区 ==========
                 // L1键：上一个表情
-                KeyEvent.KEYCODE_BUTTON_L1, KeyEvent.KEYCODE_BUTTON_R2 -> {
+                KeyEvent.KEYCODE_BUTTON_L1 -> {
                     currentExpressionIndex = (currentExpressionIndex - 1 + expressionList.size) % expressionList.size
                     expressionManager.requestExpression(expressionList[currentExpressionIndex], force = true)
                     return true
                 }
                 // R1键：下一个表情
-                KeyEvent.KEYCODE_BUTTON_R1, KeyEvent.KEYCODE_BUTTON_L2 -> {
+                KeyEvent.KEYCODE_BUTTON_R1 -> {
                     currentExpressionIndex = (currentExpressionIndex + 1) % expressionList.size
                     expressionManager.requestExpression(expressionList[currentExpressionIndex], force = true)
                     return true
                 }
+                // L2键：快捷触发开心表情（正向反馈）
+                KeyEvent.KEYCODE_BUTTON_L2 -> {
+                    expressionManager.requestExpression(ExpressionType.HAPPY, duration = 1500)
+                    return true
+                }
+                // R2键：快捷触发疑惑表情（疑问反馈）
+                KeyEvent.KEYCODE_BUTTON_R2 -> {
+                    expressionManager.requestExpression(ExpressionType.CONFUSED, duration = 1200)
+                    return true
+                }
+
+                // ========== 十字键 参数调节区 ==========
                 // 十字键上：增加表情强度
                 KeyEvent.KEYCODE_DPAD_UP -> {
                     val currentIntensity = (expressionManager.expressionState.value.intensity + 10).coerceIn(0, 100)
@@ -409,6 +600,24 @@ class MainActivity : ComponentActivity() {
                     )
                     return true
                 }
+                // 十字键左：上一种渲染风格
+                KeyEvent.KEYCODE_DPAD_LEFT -> {
+                    val styles = ExpressionStyle.values()
+                    val currentStyle = expressionManager.getCurrentStyle()
+                    val prevIndex = (currentStyle.ordinal - 1 + styles.size) % styles.size
+                    expressionManager.setStyle(styles[prevIndex])
+                    return true
+                }
+                // 十字键右：下一种渲染风格
+                KeyEvent.KEYCODE_DPAD_RIGHT -> {
+                    val styles = ExpressionStyle.values()
+                    val currentStyle = expressionManager.getCurrentStyle()
+                    val nextIndex = (currentStyle.ordinal + 1) % styles.size
+                    expressionManager.setStyle(styles[nextIndex])
+                    return true
+                }
+
+                // ========== 菜单键 系统功能区 ==========
                 // Start键：开始/停止人脸识别
                 KeyEvent.KEYCODE_BUTTON_START, KeyEvent.KEYCODE_MENU -> {
                     if (visionManager.isDetecting()) {
@@ -440,6 +649,8 @@ class MainActivity : ComponentActivity() {
         if (ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
             ActivityCompat.requestPermissions(this, arrayOf(Manifest.permission.RECORD_AUDIO), REQUEST_RECORD_AUDIO_PERMISSION)
         } else {
+            isInContinuousConversation = true // 手动触发也进入连续对话模式
+            resetContinuousConversationTimeout() // 重置空闲超时
             startAsrRecognition(pendingAsrOnlyTest)
         }
     }
@@ -463,6 +674,12 @@ class MainActivity : ComponentActivity() {
         if (audioManager.isListening() || audioManager.isSpeaking()) {
             return
         }
+
+        // ========== [修改] 先重置连续对话空闲超时，避免每次说话后很快退出 ==========
+        if (isInContinuousConversation) {
+            resetContinuousConversationTimeout()
+        }
+
         // 对话开始，暂停唤醒监听
         isWakeUpListening = false
         // 切换到识别中表情
@@ -472,26 +689,72 @@ class MainActivity : ComponentActivity() {
             override fun onResult(text: String) {
                 runOnUiThread {
                     ModuleStateManager.onAsrFinish()
-                    if (text.isNotEmpty()) {
-                        if (asrOnly) {
-                            audioManager.startSpeaking("识别结果：$text")
-                        } else {
-                            sendTextToLlm(text)
-                        }
-                    } else {
-                        expressionManager.requestExpression(ExpressionType.IDLE, force = true)
-                    }
+                    processAsrResult(text, asrOnly)
                 }
             }
 
             override fun onError(errorMsg: String) {
                 runOnUiThread {
                     ModuleStateManager.onAsrFinish()
-                    expressionManager.requestExpression(ExpressionType.CONFUSED)
-                    audioManager.startSpeaking("抱歉，我没有听清，请再说一遍")
+
+                    if (isInContinuousConversation) {
+                        // 连续对话模式：出错后自动继续聆听
+                        expressionManager.requestExpression(ExpressionType.CONFUSED, duration = 1000, force = true)
+                        lifecycleScope.launch {
+                            delay(1000)
+                            startAsrRecognition()
+                        }
+                    } else {
+                        expressionManager.requestExpression(ExpressionType.CONFUSED)
+                        audioManager.startSpeaking("抱歉，我没有听清，请再说一遍")
+                    }
                 }
             }
         })
+    }
+
+    /**
+     * 统一处理ASR识别结果（正常识别 / 打断场景共用）
+     */
+    private fun processAsrResult(text: String, asrOnly: Boolean = false) {
+        if (asrOnly) {
+            audioManager.startSpeaking("识别结果：$text")
+            return
+        }
+
+        if (text.isNotEmpty()) {
+            // 重置连续对话空闲超时
+            if (isInContinuousConversation) {
+                resetContinuousConversationTimeout()
+            }
+
+            // 统一清洗文本
+            val raw = text.lowercase()
+                .replace(Regex("[^a-z\\u4e00-\\u9fa5]"), "")
+
+            // 结束词检测
+            if (isInContinuousConversation && isExitWord(raw)) {
+                exitContinuousConversation()
+
+                expressionManager.requestExpression(ExpressionType.HAPPY, duration = 1200, force = true)
+                audioManager.startSpeaking("好的，随时可以叫我，拜拜")
+                return
+            }
+
+            sendTextToLlm(text)
+        } else {
+            // 未识别到内容
+            if (isInContinuousConversation) {
+                // 连续对话模式：没听清就继续听，不退出
+                expressionManager.requestExpression(ExpressionType.CONFUSED, duration = 800, force = true)
+                lifecycleScope.launch {
+                    delay(800)
+                    startAsrRecognition()
+                }
+            } else {
+                expressionManager.requestExpression(ExpressionType.IDLE, force = true)
+            }
+        }
     }
 
     /**
@@ -501,6 +764,12 @@ class MainActivity : ComponentActivity() {
         if (text.isBlank()) {
             return
         }
+
+        // ========== [修改] 开始请求LLM时也重置超时，避免思考和回复期间误退出 ==========
+        if (isInContinuousConversation) {
+            resetContinuousConversationTimeout()
+        }
+
         // 切换到思考表情
         //expressionManager.requestExpression(ExpressionType.THINKING)
         ModuleStateManager.onLlmStartThinking()
@@ -509,6 +778,12 @@ class MainActivity : ComponentActivity() {
             override fun onSuccess(response: String) {
                 runOnUiThread {
                     ModuleStateManager.onLlmFinish()
+
+                    // ========== [修改] TTS开始前再次重置超时，确保回复过程中不退出 ==========
+                    if (isInContinuousConversation) {
+                        resetContinuousConversationTimeout()
+                    }
+
                     // 切换到说话表情，开始播报
                     expressionManager.requestExpression(ExpressionType.SPEAKING)
                     audioManager.startSpeaking(response)
@@ -518,6 +793,12 @@ class MainActivity : ComponentActivity() {
             override fun onError(errorMsg: String) {
                 runOnUiThread {
                     ModuleStateManager.onLlmFinish()
+
+                    // ========== [修改] 请求失败也重置超时，避免连续对话异常退出 ==========
+                    if (isInContinuousConversation) {
+                        resetContinuousConversationTimeout()
+                    }
+
                     expressionManager.requestExpression(ExpressionType.SAD)
                     audioManager.startSpeaking("抱歉，我现在无法回答你的问题，请稍后再试")
                 }
@@ -579,6 +860,17 @@ class MainActivity : ComponentActivity() {
                 super.onFaceDetected(faceOffsetX, faceOffsetY, faceSize)
                 // 实时更新瞳孔偏移，实现视线跟踪
                 expressionManager.setPupilOffset(faceOffsetX, faceOffsetY)
+            }
+
+            override fun onUserSmile(smileProb: Float) {
+                super.onUserSmile(smileProb)
+            }
+
+            override fun onUserBlink() {
+                super.onUserBlink()
+            }
+            override fun onUserSurprised() {
+                super.onUserSurprised()
             }
 
             override fun onFaceLost() {
@@ -687,10 +979,8 @@ class MainActivity : ComponentActivity() {
                 Text("🎨 渲染风格", color = ComposeColor.White, fontSize = 12.sp, fontWeight = androidx.compose.ui.text.font.FontWeight.Bold)
                 Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(4.dp)) {
                     val styles = listOf(
-                        ExpressionStyle.CARTOON to "卡通圆眼",
-                        ExpressionStyle.CYBERPUNK to "机械赛博",
-                        ExpressionStyle.MINIMAL to "极简线条",
-                        ExpressionStyle.PIXEL to "像素8bit"
+                        ExpressionStyle.MALE to "男款丹凤",
+                        ExpressionStyle.FEMALE to "女款杏眼"
                     )
                     styles.forEach { (style, name) ->
                         Button(

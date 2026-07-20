@@ -174,10 +174,9 @@ data class EyeParameters(
 
 /**
  * 表情风格枚举
+ * 男女两款风格，适配不同角色设定
  */
 enum class ExpressionStyle(val description: String) {
-    CARTOON("卡通圆眼风格"),
-    CYBERPUNK("机械赛博风格"),
-    MINIMAL("极简线条风格"),
-    PIXEL("像素眼风格")
+    MALE("男款·丹凤眼风格"),
+    FEMALE("女款·杏眼风格")
 }

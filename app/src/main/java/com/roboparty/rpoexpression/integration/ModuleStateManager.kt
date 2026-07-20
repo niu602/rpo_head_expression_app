@@ -40,10 +40,11 @@ object ModuleStateManager {
 
     /**
      * ASR识别结束
-     * 不需要自动切状态，后续LLM/TTS会自动抢占状态
+     * 释放识别中表情，回落到待机，让后续思考/说话表情可以正常抢占
      */
     fun onAsrFinish() {
-        Log.d(TAG, "ASR finish")
+        Log.d(TAG, "ASR finish, release RECOGNIZING")
+        expressionManager.requestExpression(ExpressionType.IDLE)
     }
 
     /**
@@ -58,11 +59,11 @@ object ModuleStateManager {
     // ==================== LLM大模型模块对接 ====================
     /**
      * LLM开始思考生成回复
-     * 自动切换到思考表情
+     * 自动切换到思考表情（强制切换，确保能从识别中状态切过来）
      */
     fun onLlmStartThinking() {
         Log.d(TAG, "LLM start thinking, switch to THINKING")
-        expressionManager.requestExpression(ExpressionType.THINKING)
+        expressionManager.requestExpression(ExpressionType.THINKING, force = true)
     }
 
     /**

@@ -10,7 +10,7 @@ package com.roboparty.rpoexpression.util
  */
 object Constants {
     // 通信配置
-    const val DEFAULT_MASTER_IP = "10.43.2.89"
+    const val DEFAULT_MASTER_IP = "10.43.2.69"
     const val DEFAULT_MASTER_PORT = 8899
     const val SOCKET_TIMEOUT = 5000
 
