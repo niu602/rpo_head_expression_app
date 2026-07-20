@@ -6,6 +6,7 @@
 package com.roboparty.rpoexpression.communication
 
 import android.util.Log
+import com.roboparty.rpoexpression.config.ConfigManager
 import com.roboparty.rpoexpression.expression.ExpressionManager
 import com.roboparty.rpoexpression.communication.link.CommLink
 import kotlinx.coroutines.*
@@ -327,28 +328,58 @@ class CommunicationManager private constructor() {
     private fun processJsonCommand(json: String) {
         try {
             val gson = com.google.gson.Gson()
-            val command = gson.fromJson(json, ControlCommand::class.java)
-            commandListener?.invoke(command)
+            // 先解析为Map判断指令类型
+            val cmdMap = gson.fromJson(json, Map::class.java) as? Map<String, Any>
+            val cmd = cmdMap?.get("cmd") as? String
 
-            when (command.command) {
-                ControlCommand.CMD_PING -> {
-                    sendCommand(ControlCommand(
-                        command = "pong",
-                        source = "expression_app"
-                    ))
-                }
-                ControlCommand.CMD_EXPRESSION -> {
-                    command.toExpressionType()?.let { exprType ->
-                        expressionManager.requestExpression(
-                            type = exprType,
-                            intensity = command.toIntensity(),
-                            duration = command.duration,
-                            force = command.force
+            when (cmd) {
+                // 配置热更新指令
+                "config" -> {
+                    val configJson = cmdMap["config"]?.let { gson.toJson(it) }
+                    if (configJson != null) {
+                        val success = ConfigManager.getInstance().updateFromJson(configJson, persist = true)
+                        Log.i(TAG, "Config update from TCP: success=$success")
+                        // 回复ACK
+                        val ack = codec.encodeAck(
+                            msgId = multiLinkManager.nextMsgId(),
+                            seq = multiLinkManager.nextSeq(),
+                            ackMsgId = 0,
+                            code = if (success) 0 else 1
                         )
+                        multiLinkManager.send(ack)
                     }
                 }
-                ControlCommand.CMD_CLEAR -> {
-                    expressionManager.clearExpression()
+                // 重置配置指令
+                "reset_config" -> {
+                    ConfigManager.getInstance().resetToDefault()
+                    Log.i(TAG, "Config reset to default from TCP command")
+                }
+                // 普通表情控制指令
+                else -> {
+                    val command = gson.fromJson(json, ControlCommand::class.java)
+                    commandListener?.invoke(command)
+
+                    when (command.command) {
+                        ControlCommand.CMD_PING -> {
+                            sendCommand(ControlCommand(
+                                command = "pong",
+                                source = "expression_app"
+                            ))
+                        }
+                        ControlCommand.CMD_EXPRESSION -> {
+                            command.toExpressionType()?.let { exprType ->
+                                expressionManager.requestExpression(
+                                    type = exprType,
+                                    intensity = command.toIntensity(),
+                                    duration = command.duration,
+                                    force = command.force
+                                )
+                            }
+                        }
+                        ControlCommand.CMD_CLEAR -> {
+                            expressionManager.clearExpression()
+                        }
+                    }
                 }
             }
         } catch (e: Exception) {

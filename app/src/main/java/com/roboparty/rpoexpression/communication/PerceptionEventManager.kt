@@ -61,7 +61,12 @@ class PerceptionEventManager private constructor() {
         lastTouchReport.set(now)
 
         try {
-            val data = codec.Writer().apply {
+            val msg = codec.encodePerceptionEvent(
+                msgId = multiLinkManager.nextMsgId(),
+                seq = multiLinkManager.nextSeq(),
+                eventType = 1, // 触摸
+                linkType = multiLinkManager.getActiveLinkType().value,
+            ) {
                 // TouchEvent field 20
                 writeMessage(20) {
                     writeFloat(2, x)
@@ -70,16 +75,6 @@ class PerceptionEventManager private constructor() {
                     writeUint64(5, durationMs)
                     writeUint32(6, pointerCount)
                 }
-            }.toByteArray()
-
-            val msg = codec.encodePerceptionEvent(
-                msgId = multiLinkManager.nextMsgId(),
-                seq = multiLinkManager.nextSeq(),
-                eventType = 1, // 触摸
-                linkType = multiLinkManager.getActiveLinkType().value,
-            ) {
-                // 写入触摸事件payload
-                writeBytes(20, data.sliceArray(2 until data.size)) // 去掉头直接写payload
             }
 
             // 触摸事件走UDP（高频低延迟）
@@ -114,33 +109,26 @@ class PerceptionEventManager private constructor() {
         lastFaceReport.set(now)
 
         try {
-            val data = codec.Writer().apply {
-                // FaceDetectEvent field 21
-                writeMessage(21) {
-                    writeBool(1, hasFace)
-                    writeUint32(2, faceCount)
-                    // FaceInfo
-                    if (hasFace && faceCount > 0) {
-                        val faceInfo = codec.Writer().apply {
-                            writeFloat(1, centerX)
-                            writeFloat(2, centerY)
-                            writeFloat(3, faceSize)
-                            writeFloat(4, smileProb)
-                        }.toByteArray()
-                        // repeated faces field 3
-                        // 简化：只写第一个人脸
-                        writeBytes(3, faceInfo)
-                    }
-                }
-            }.toByteArray()
-
             val msg = codec.encodePerceptionEvent(
                 msgId = multiLinkManager.nextMsgId(),
                 seq = multiLinkManager.nextSeq(),
                 eventType = 2, // 人脸
                 linkType = multiLinkManager.getActiveLinkType().value,
             ) {
-                writeBytes(21, data.sliceArray(2 until data.size))
+                // FaceDetectEvent field 21
+                writeMessage(21) {
+                    writeBool(1, hasFace)
+                    writeUint32(2, faceCount)
+                    // FaceInfo (第一个人脸)
+                    if (hasFace && faceCount > 0) {
+                        writeMessage(3) {
+                            writeFloat(1, centerX)
+                            writeFloat(2, centerY)
+                            writeFloat(3, faceSize)
+                            writeFloat(4, smileProb)
+                        }
+                    }
+                }
             }
 
             multiLinkManager.sendUdp(msg)
@@ -170,23 +158,19 @@ class PerceptionEventManager private constructor() {
         lastImuReport.set(now)
 
         try {
-            // IMU事件复用GestureEvent field 22
-            val data = codec.Writer().apply {
-                writeMessage(22) {
-                    writeEnum(1, action)
-                    writeFloat(2, 0.9f) // confidence
-                    writeFloat(3, yaw)
-                    writeFloat(4, pitch)
-                }
-            }.toByteArray()
-
             val msg = codec.encodePerceptionEvent(
                 msgId = multiLinkManager.nextMsgId(),
                 seq = multiLinkManager.nextSeq(),
                 eventType = 3, // IMU/手势
                 linkType = multiLinkManager.getActiveLinkType().value,
             ) {
-                writeBytes(22, data.sliceArray(2 until data.size))
+                // GestureEvent field 22
+                writeMessage(22) {
+                    writeEnum(1, action)
+                    writeFloat(2, 0.9f) // confidence
+                    writeFloat(3, yaw)
+                    writeFloat(4, pitch)
+                }
             }
 
             multiLinkManager.sendUdp(msg)
