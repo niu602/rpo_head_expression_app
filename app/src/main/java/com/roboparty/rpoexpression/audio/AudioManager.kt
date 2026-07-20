@@ -20,6 +20,7 @@ import java.io.IOException
 import kotlin.math.log10
 import kotlin.random.Random
 import kotlinx.coroutines.isActive
+import com.roboparty.rpoexpression.expression.ExpressionStyle
 /**
  * 音频管理器
  * 统一管理ASR语音识别和TTS语音播报，对外提供统一接口
@@ -54,6 +55,21 @@ class AudioManager private constructor(private val context: Context) {
     // 声源方向：-1左，0中，1右
     private val _soundDirection = MutableStateFlow(0f)
     val soundDirection: StateFlow<Float> = _soundDirection.asStateFlow()
+
+    // ========== 打断（Barge-in）功能 ==========
+    var bargeInEnabled = true          // 是否启用语音打断：TTS播报时用户说话自动停止播报
+    var bargeInGuardMs = 600L          // TTS开头保护时间，防回声误触（毫秒）
+    var ttsStartTime = 0L              // 当前TTS播报开始时间戳
+
+    // 打断回调接口
+    interface OnBargeInListener {
+        fun onBargeIn(text: String)
+    }
+    private var bargeInListener: OnBargeInListener? = null
+
+    fun setOnBargeInListener(listener: OnBargeInListener?) {
+        bargeInListener = listener
+    }
 
     //TTS播放完成回调接口
     interface OnSpeakFinishListener{
@@ -186,18 +202,88 @@ class AudioManager private constructor(private val context: Context) {
      * @param callback 播报状态回调
      */
     fun startSpeaking(text: String, callback: TtsManager.TtsStateCallback? = null) {
-        // 如果正在识别，先停止
-        if (asrManager.isListening()) {
+        // 打断模式关闭时，播报前先停止ASR；开启时保留ASR运行以支持打断
+        if (!bargeInEnabled && asrManager.isListening()) {
             asrManager.stopListening()
         }
 
-        ttsManager.speak(text, callback)
+        // 记录TTS开始时间，用于开头防回声保护
+        ttsStartTime = System.currentTimeMillis()
+
+        // 包装回调：TTS结束时同时触发全局 speakFinishListener
+        val wrappedCallback = object : TtsManager.TtsStateCallback {
+            override fun onStart() {
+                callback?.onStart()
+                // 打断模式：TTS开始后启动后台静默ASR监听，用于检测用户打断
+                if (bargeInEnabled && !asrManager.isListening()) {
+                    startBargeInListen()
+                }
+            }
+            override fun onDone() {
+                // TTS正常结束，停止打断监听
+                stopBargeInListen()
+                callback?.onDone()
+                // 触发全局播放完成回调
+                speakFinishListener?.onSpeakFinsh()
+            }
+            override fun onError(errorCode: Int) {
+                stopBargeInListen()
+                callback?.onError(errorCode)
+                // 出错也触发结束回调，避免卡住
+                speakFinishListener?.onSpeakFinsh()
+            }
+        }
+
+        ttsManager.speak(text, wrappedCallback)
+    }
+
+    /**
+     * 启动打断专用的静默ASR监听
+     * 不触发表情变化，只在后台识别用户语音
+     */
+    private fun startBargeInListen() {
+        try {
+            asrManager.startListening(object : AsrManager.AsrResultCallback {
+                override fun onResult(text: String) {
+                    val elapsed = System.currentTimeMillis() - ttsStartTime
+                    // TTS开头保护期内的结果忽略，防回声误触发
+                    if (elapsed < bargeInGuardMs) return
+                    // 有效识别结果：触发打断
+                    if (text.isNotBlank() && text.length >= 2) {
+                        // 停止TTS播报
+                        ttsManager.stop()
+                        stopBargeInListen()
+                        // 通知上层发生了打断
+                        bargeInListener?.onBargeIn(text)
+                    }
+                }
+                override fun onError(errorMsg: String) {
+                    // 打断监听出错静默处理，不影响TTS播放
+                }
+            }, triggerExpression = false) // 静默模式，不触发识别中表情
+        } catch (e: Exception) {
+            Log.e(TAG, "Start barge-in listen failed", e)
+        }
+    }
+
+    /**
+     * 停止打断监听
+     */
+    private fun stopBargeInListen() {
+        try {
+            if (asrManager.isListening()) {
+                asrManager.stopListening()
+            }
+        } catch (e: Exception) {
+            // 忽略停止异常
+        }
     }
 
     /**
      * 停止TTS播报
      */
     fun stopSpeaking() {
+        stopBargeInListen()
         ttsManager.stop()
     }
 
@@ -206,6 +292,20 @@ class AudioManager private constructor(private val context: Context) {
      */
     fun isSpeaking(): Boolean {
         return ttsManager.isSpeaking()
+    }
+
+    /**
+     * 根据渲染风格切换 TTS 音色
+     * 男款 → 低沉稳重，女款 → 清亮灵动
+     * 与表情风格联动，保持视觉听觉统一
+     */
+    fun applyVoiceStyle(style: ExpressionStyle) {
+        try {
+            ttsManager.applyVoiceStyle(style)
+            Log.d(TAG, "Voice style synced to: $style")
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to apply voice style", e)
+        }
     }
 
     /**

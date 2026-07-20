@@ -74,10 +74,8 @@ data class ControlCommand(
     fun toStyle(): ExpressionStyle? {
         val styleName = data?.get("style")?.toString()?.lowercase()
         return when (styleName) {
-            "cartoon", "0" -> ExpressionStyle.CARTOON
-            "cyberpunk", "cyber", "1" -> ExpressionStyle.CYBERPUNK
-            "minimal", "line", "2" -> ExpressionStyle.MINIMAL
-            "pixel", "8bit", "3" -> ExpressionStyle.PIXEL
+            "male", "man", "boy", "0", "男", "男款" -> ExpressionStyle.MALE
+            "female", "woman", "girl", "1", "女", "女款" -> ExpressionStyle.FEMALE
             else -> null
         }
     }

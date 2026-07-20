@@ -42,10 +42,10 @@ interface EyeStyleRenderer {
         size: Size
     ): EyeMetrics {
         val scale = Math.min(size.width, size.height) / 1080f
-        // 调大尺寸，让眼睛占满整个屏幕
-        val eyeSpacing = 650f * scale  // 双眼间距
-        val baseEyeWidth = 480f * scale * params.eyeWidthRatio  // 单眼宽度
-        val baseEyeHeight = 420f * scale * params.eyeHeightRatio  // 单眼高度
+        // 放大眼睛整体尺寸，让眼白+瞳孔区域在屏幕上占比更大，视觉更饱满
+        val eyeSpacing = 560f * scale  // 双眼中心间距（半距），随尺寸微调避免拥挤
+        val baseEyeWidth = 700f * scale * params.eyeWidthRatio  // 单眼宽度
+        val baseEyeHeight = 610f * scale * params.eyeHeightRatio  // 单眼高度
 
         return EyeMetrics(
             leftEyeCenter = Offset(centerX - eyeSpacing, centerY),

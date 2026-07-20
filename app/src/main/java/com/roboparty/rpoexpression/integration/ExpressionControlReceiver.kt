@@ -12,6 +12,7 @@ import android.util.Log
 import com.roboparty.rpoexpression.expression.ExpressionManager
 import com.roboparty.rpoexpression.expression.ExpressionStyle
 import com.roboparty.rpoexpression.expression.ExpressionType
+import com.roboparty.rpoexpression.system.SystemStatusMonitor
 
 /**
  * 表情控制广播接收器
@@ -29,6 +30,12 @@ class ExpressionControlReceiver : BroadcastReceiver() {
         const val ACTION_CLEAR_EXPRESSION = "com.roboparty.rpoexpression.ACTION_CLEAR_EXPRESSION"
         const val ACTION_SET_STYLE = "com.roboparty.rpoexpression.ACTION_SET_STYLE"
         const val ACTION_SET_INTENSITY = "com.roboparty.rpoexpression.ACTION_SET_INTENSITY"
+        // ===== 系统状态测试专用 Action =====
+        const val ACTION_TEST_LOW_BATTERY = "com.roboparty.rpoexpression.ACTION_TEST_LOW_BATTERY"
+        const val ACTION_TEST_CHARGING = "com.roboparty.rpoexpression.ACTION_TEST_CHARGING"
+        const val ACTION_TEST_ALERT = "com.roboparty.rpoexpression.ACTION_TEST_ALERT"
+        const val ACTION_TEST_SLEEPING = "com.roboparty.rpoexpression.ACTION_TEST_SLEEPING"
+        const val ACTION_REFRESH_SYSTEM_STATUS = "com.roboparty.rpoexpression.ACTION_REFRESH_SYSTEM_STATUS"
     }
 
     override fun onReceive(context: Context, intent: Intent) {
@@ -60,10 +67,8 @@ class ExpressionControlReceiver : BroadcastReceiver() {
             ACTION_SET_STYLE -> {
                 val styleStr = intent.getStringExtra("style")?.lowercase()
                 val style = when (styleStr) {
-                    "cartoon", "0" -> ExpressionStyle.CARTOON
-                    "cyberpunk", "cyber", "1" -> ExpressionStyle.CYBERPUNK
-                    "minimal", "line", "2" -> ExpressionStyle.MINIMAL
-                    "pixel", "8bit", "3" -> ExpressionStyle.PIXEL
+                    "male", "man", "boy", "0", "男", "男款" -> ExpressionStyle.MALE
+                    "female", "woman", "girl", "1", "女", "女款" -> ExpressionStyle.FEMALE
                     else -> {
                         Log.e(TAG, "Unknown style: $styleStr")
                         return
@@ -81,6 +86,27 @@ class ExpressionControlReceiver : BroadcastReceiver() {
                     intensity = intensity,
                     force = true
                 )
+            }
+            // ===== 系统状态测试专用 Action =====
+            ACTION_TEST_LOW_BATTERY -> {
+                Log.d(TAG, "Test: trigger LOW_BATTERY expression")
+                expressionManager.requestExpression(ExpressionType.LOW_BATTERY, force = true)
+            }
+            ACTION_TEST_CHARGING -> {
+                Log.d(TAG, "Test: trigger CHARGING expression")
+                expressionManager.requestExpression(ExpressionType.CHARGING, force = true)
+            }
+            ACTION_TEST_ALERT -> {
+                Log.d(TAG, "Test: trigger ALERT expression")
+                expressionManager.requestExpression(ExpressionType.ALERT, force = true)
+            }
+            ACTION_TEST_SLEEPING -> {
+                Log.d(TAG, "Test: trigger SLEEPING expression")
+                expressionManager.requestExpression(ExpressionType.SLEEPING, force = true)
+            }
+            ACTION_REFRESH_SYSTEM_STATUS -> {
+                Log.d(TAG, "Refresh system status monitor")
+                SystemStatusMonitor.getInstance().refreshStatus()
             }
         }
     }

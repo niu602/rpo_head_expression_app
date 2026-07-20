@@ -24,6 +24,7 @@ import com.roboparty.rpoexpression.llm.LlmManager
 import com.roboparty.rpoexpression.sensor.AmbientLightManager
 import com.roboparty.rpoexpression.sensor.BrightnessManager
 import com.roboparty.rpoexpression.sensor.ImuManager
+import com.roboparty.rpoexpression.system.SystemStatusMonitor
 import com.roboparty.rpoexpression.util.Constants
 import com.roboparty.rpoexpression.vision.VisionManager
 import android.content.Context
@@ -51,6 +52,8 @@ class RpoExpressionApp : Application() {
     lateinit var visionManager: VisionManager
         private set
     lateinit var llmManager: LlmManager
+        private set
+    lateinit var systemStatusMonitor: SystemStatusMonitor
         private set
     private lateinit var expressionControlReceiver: ExpressionControlReceiver
     private val appScope = CoroutineScope(Dispatchers.Default + Job())
@@ -155,6 +158,18 @@ class RpoExpressionApp : Application() {
         } catch (e: Exception) {
             Log.e("RpoExpressionApp", "AudioManager init failed", e)
         }
+
+        // 风格-音色联动：切换渲染风格时同步切换 TTS 音色，保持视觉听觉统一
+        try {
+            expressionManager.addStyleChangeCallback { style ->
+                audioManager.applyVoiceStyle(style)
+            }
+            // 初始化时应用一次默认风格（女款）对应的音色
+            audioManager.applyVoiceStyle(expressionManager.getCurrentStyle())
+            Log.d("RpoExpressionApp", "Style-voice sync registered")
+        } catch (e: Exception) {
+            Log.e("RpoExpressionApp", "Style-voice sync init failed", e)
+        }
         try {
             visionManager = VisionManager.getInstance(this)
             visionManager.init()
@@ -168,6 +183,16 @@ class RpoExpressionApp : Application() {
             Log.e("RpoExpressionApp", "LlmManager init failed", e)
         }
 
+        // 初始化系统状态监控器（电量、充电状态自动同步表情）
+        try {
+            systemStatusMonitor = SystemStatusMonitor.getInstance()
+            systemStatusMonitor.init(this)
+            systemStatusMonitor.start()
+            Log.d("RpoExpressionApp", "SystemStatusMonitor started")
+        } catch (e: Exception) {
+            Log.e("RpoExpressionApp", "SystemStatusMonitor init failed", e)
+        }
+
         // 动态注册表情控制广播接收器（解决高版本Android静态广播限制）
         expressionControlReceiver = ExpressionControlReceiver()
         val controlFilter = IntentFilter().apply {
@@ -175,6 +200,12 @@ class RpoExpressionApp : Application() {
             addAction(ExpressionControlReceiver.ACTION_CLEAR_EXPRESSION)
             addAction(ExpressionControlReceiver.ACTION_SET_STYLE)
             addAction(ExpressionControlReceiver.ACTION_SET_INTENSITY)
+            // 系统状态测试 Action
+            addAction(ExpressionControlReceiver.ACTION_TEST_LOW_BATTERY)
+            addAction(ExpressionControlReceiver.ACTION_TEST_CHARGING)
+            addAction(ExpressionControlReceiver.ACTION_TEST_ALERT)
+            addAction(ExpressionControlReceiver.ACTION_TEST_SLEEPING)
+            addAction(ExpressionControlReceiver.ACTION_REFRESH_SYSTEM_STATUS)
         }
         try {
             registerReceiver(expressionControlReceiver, controlFilter, Context.RECEIVER_EXPORTED)
@@ -215,6 +246,7 @@ class RpoExpressionApp : Application() {
         visionManager.release()
         llmManager.release()
         unregisterReceiver(expressionControlReceiver)
+        systemStatusMonitor.stop()
         brightnessManager.stop()
         ambientLightManager.stop()
         imuManager.stop()

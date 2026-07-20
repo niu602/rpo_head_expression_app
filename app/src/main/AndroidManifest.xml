@@ -6,6 +6,19 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
     xmlns:tools="http://schemas.android.com/tools">
 
+    <!-- Android 11+ 包可见性声明：TTS引擎 -->
+    <queries>
+        <intent>
+            <action android:name="android.intent.action.TTS_SERVICE" />
+        </intent>
+        <!-- 常见TTS引擎包名 -->
+        <package android:name="com.google.android.tts" />
+        <package android:name="com.xiaomi.mibrain.speech" />
+        <package android:name="com.baidu.duersdk.opensdk" />
+        <package android:name="com.iflytek.speechcloud" />
+        <package android:name="com.samsung.SMT" />
+    </queries>
+
     <!-- 网络权限：TCP Socket与主控通信、大模型请求 -->
     <uses-permission android:name="android.permission.BLUETOOTH_ADVERTISE" />
     <uses-permission android:name="android.permission.BLUETOOTH_CONNECT" />

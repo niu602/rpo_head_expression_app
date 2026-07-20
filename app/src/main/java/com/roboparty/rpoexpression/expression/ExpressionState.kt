@@ -19,7 +19,7 @@ package com.roboparty.rpoexpression.expression
 data class ExpressionState(
     val type: ExpressionType = ExpressionType.IDLE,
     val intensity: Int = 100,
-    val style: ExpressionStyle = ExpressionStyle.CARTOON,
+    val style: ExpressionStyle = ExpressionStyle.FEMALE,
     val startTime: Long = System.currentTimeMillis(),
     val duration: Long = type.defaultDuration,
     val transitionProgress: Float = 1f,
@@ -85,9 +85,11 @@ data class ExpressionState(
         val finalEyelidOpenness = ((finalParams.eyelidOpenness * (1f - blinkOverlay) + tempEyelidOffset) * mimicEyelid)
             .coerceIn(0f, 1f)
 
-        // 叠加音频情绪效果
+        // 叠加音频情绪效果 + 距离感知瞳孔缩放
         val adjustedEyeTail = finalParams.eyeTailAngle + manager.audioEyeShape * 0.5f
-        val adjustedPupilSize = finalParams.pupilSize * (1f - manager.audioEyeShape * 0.2f)
+        val adjustedPupilSize = finalParams.pupilSize * 
+                (1f - manager.audioEyeShape * 0.2f) * 
+                manager.distancePupilScale
 
         return finalParams.copy(
             eyelidOpenness = finalEyelidOpenness,

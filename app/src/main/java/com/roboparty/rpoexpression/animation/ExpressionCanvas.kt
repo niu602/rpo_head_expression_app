@@ -69,7 +69,7 @@ fun ExpressionCanvas(
                         val cheekBottomY = h * 0.82f       // 脸颊区下边界
 
                         // 横向边界
-                        val centerHalfWidth = w * 0.25f    // 眉心居中半宽（扩大到50%屏宽）
+                        val centerHalfWidth = w * 0.25f    // 眉心居中半宽
                         val eyeInnerX = centerX - w * 0.08f  // 眼睛内侧边界（中间留16%间距）
                         val eyeOuterLeftX = w * 0.08f      // 左眼外侧边界
                         val eyeOuterRightX = w * 0.92f     // 右眼外侧边界
