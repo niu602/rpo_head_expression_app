@@ -6,21 +6,12 @@
 package com.roboparty.rpoexpression.audio
 
 import android.content.Context
-import android.media.MediaRecorder
+import android.os.Handler
+import android.os.Looper
 import android.util.Log
-import kotlinx.coroutines.CoroutineScope
-import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.Job
-import kotlinx.coroutines.delay
-import kotlinx.coroutines.flow.MutableStateFlow
-import kotlinx.coroutines.flow.StateFlow
-import kotlinx.coroutines.flow.asStateFlow
-import kotlinx.coroutines.launch
-import java.io.IOException
-import kotlin.math.log10
-import kotlin.random.Random
-import kotlinx.coroutines.isActive
 import com.roboparty.rpoexpression.expression.ExpressionStyle
+import kotlinx.coroutines.*
+
 /**
  * 音频管理器
  * 统一管理ASR语音识别和TTS语音播报，对外提供统一接口
@@ -40,26 +31,24 @@ class AudioManager private constructor(private val context: Context) {
         }
     }
 
+    private val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
+    private val mainHandler = Handler(Looper.getMainLooper())
+
     private val asrManager: AsrManager by lazy { AsrManager.getInstance(context) }
     private val ttsManager: TtsManager by lazy { TtsManager.getInstance(context) }
 
-    // 音量检测
-    private var mediaRecorder: MediaRecorder? = null
-    private val scope = CoroutineScope(Dispatchers.IO + Job())
-    private var volumeDetectJob: Job? = null
-
-    // 当前音量dB
-    private val _audioVolume = MutableStateFlow(0f)
-    val audioVolume: StateFlow<Float> = _audioVolume.asStateFlow()
-
-    // 声源方向：-1左，0中，1右
-    private val _soundDirection = MutableStateFlow(0f)
-    val soundDirection: StateFlow<Float> = _soundDirection.asStateFlow()
-
     // ========== 打断（Barge-in）功能 ==========
     var bargeInEnabled = true          // 是否启用语音打断：TTS播报时用户说话自动停止播报
-    var bargeInGuardMs = 600L          // TTS开头保护时间，防回声误触（毫秒）
-    var ttsStartTime = 0L              // 当前TTS播报开始时间戳
+    var bargeInGuardMs = 2500L         // TTS开头保护时间，防回声误触（毫秒），从麦克风实际开始录音算起
+    var ttsStartTime = 0L              // 当前TTS播报实际开始时间戳（在onRecordingStarted回调中设置）
+
+    // 语音持续确认：检测到speech_started后，再确认语音持续了这么久才真正触发打断
+    // 避免短促的回声/爆音/点击声被误判为用户说话
+    private val bargeInConfirmMs = 200L
+    private var bargeInConfirmRunnable: Runnable? = null
+    @Volatile private var isSpeechOngoing = false  // 当前VAD是否检测到语音正在进行
+    @Volatile private var isBargeInTriggering = false  // 防止triggerBargeIn重入
+    @Volatile private var suppressSpeakFinish = false  // 打断/取消时抑制speakFinish回调，避免双重启动ASR
 
     // 打断回调接口
     interface OnBargeInListener {
@@ -80,90 +69,35 @@ class AudioManager private constructor(private val context: Context) {
     fun setOnSpeakFinishListener(listener: OnSpeakFinishListener?) {
         speakFinishListener = listener
     }
+
     /**
-     * 初始化音频模块（ASR + TTS + 音量检测）
+     * 初始化音频模块（ASR + TTS 并行启动）
+     *
+     * ASR和TTS互不依赖，使用协程async同时初始化，
+     * 耗时从 t_asr + t_tts 降低到 max(t_asr, t_tts)。
+     * - ASR：OkHttpClient构建，跑在IO线程
+     * - TTS：TextToSpeech绑定，本身已post到主线程
      */
     fun init() {
-        try {
-            asrManager.init()
-            ttsManager.init()
-            startVolumeDetect()
-            Log.d(TAG, "AudioManager initialized")
-        } catch (e: Exception) {
-            Log.e(TAG, "AudioManager init failed, skip audio module", e)
-        }
-    }
-
-    /**
-     * 启动音量检测
-     */
-    private fun startVolumeDetect() {
-        try {
-            //用MediaRecorder后台静默录音，不保存文件，只读取麦克风最大振幅
-            mediaRecorder = MediaRecorder().apply {
-                setAudioSource(MediaRecorder.AudioSource.MIC)
-                setOutputFormat(MediaRecorder.OutputFormat.THREE_GPP)
-                setAudioEncoder(MediaRecorder.AudioEncoder.AMR_NB)
-                setOutputFile("/dev/null")
-                prepare()
-                start()
-            }
-        } catch (e: Exception) {
-            // 捕获所有异常（权限不足、不支持等），避免闪退
-            Log.e(TAG, "Start volume detect failed, skip audio perception", e)
-            mediaRecorder = null
-            return
-        }
-
-        if (mediaRecorder == null) return
-
-        volumeDetectJob = scope.launch {
-            var lastSoundTime = 0L
-            while (isActive) {
-                mediaRecorder?.let { recorder ->
-                    val amplitude = recorder.maxAmplitude
-                    //分贝计算，把麦克风原始振幅转为人耳感知分贝值
-                    val db = if (amplitude > 0)  20 * log10(amplitude / 32768.0f) + 90 else 0f
-                    _audioVolume.value = db.coerceIn(0f, 100f)
-
-                    // 有声音的时候，随机转向声源方向（单麦模拟）
-                    if (db > 30f) {
-                        if (System.currentTimeMillis() - lastSoundTime > 1000) {
-                            lastSoundTime = System.currentTimeMillis()
-                            _soundDirection.value = (Random.nextFloat() - 0.5f) * 2f // -1~1
-                            delay(800)
-                            _soundDirection.value = 0f
-                        }
-                    } else {
-                        _soundDirection.value = 0f
-                    }
+        scope.launch {
+            val asrDeferred = async(Dispatchers.IO) {
+                try {
+                    asrManager.init()
+                } catch (e: Exception) {
+                    Log.e(TAG, "ASR init failed", e)
                 }
-                delay(100)
             }
+            val ttsDeferred = async(Dispatchers.Main) {
+                try {
+                    ttsManager.init()
+                } catch (e: Exception) {
+                    Log.e(TAG, "TTS init failed", e)
+                }
+            }
+            asrDeferred.await()
+            ttsDeferred.await()
+            Log.d(TAG, "AudioManager initialized (ASR + TTS parallel)")
         }
-    }
-
-    /**
-     * 重新启动音量检测（权限授予后调用）
-     */
-    fun restartVolumeDetect() {
-        if (volumeDetectJob?.isActive == true) return
-        startVolumeDetect()
-    }
-
-    /**
-     * 停止音量检测
-     */
-    private fun stopVolumeDetect() {
-        volumeDetectJob?.cancel()
-        volumeDetectJob = null
-        try {
-            mediaRecorder?.stop()
-            mediaRecorder?.release()
-        } catch (e: Exception) {
-            Log.e(TAG, "Stop volume detect failed", e)
-        }
-        mediaRecorder = null
     }
 
     /**
@@ -202,17 +136,18 @@ class AudioManager private constructor(private val context: Context) {
      * @param callback 播报状态回调
      */
     fun startSpeaking(text: String, callback: TtsManager.TtsStateCallback? = null) {
-        // 打断模式关闭时，播报前先停止ASR；开启时保留ASR运行以支持打断
-        if (!bargeInEnabled && asrManager.isListening()) {
+        // 重置 suppress 标记，新的一轮TTS正常走 speakFinish
+        suppressSpeakFinish = false
+        // TTS播报前先停止所有ASR会话，确保扬声器播放时只有一个音频消费者
+        // 避免TTS声音被麦克风录入导致误触发
+        if (asrManager.isListening()) {
             asrManager.stopListening()
         }
-
-        // 记录TTS开始时间，用于开头防回声保护
-        ttsStartTime = System.currentTimeMillis()
 
         // 包装回调：TTS结束时同时触发全局 speakFinishListener
         val wrappedCallback = object : TtsManager.TtsStateCallback {
             override fun onStart() {
+                Log.d(TAG, "TTS actual start, barge-in guard will begin when mic starts")
                 callback?.onStart()
                 // 打断模式：TTS开始后启动后台静默ASR监听，用于检测用户打断
                 if (bargeInEnabled && !asrManager.isListening()) {
@@ -220,70 +155,350 @@ class AudioManager private constructor(private val context: Context) {
                 }
             }
             override fun onDone() {
-                // TTS正常结束，停止打断监听
                 stopBargeInListen()
                 callback?.onDone()
-                // 触发全局播放完成回调
-                speakFinishListener?.onSpeakFinsh()
+                // 打断/取消导致的stop不走speakFinish，避免双重启动ASR
+                if (!suppressSpeakFinish) {
+                    speakFinishListener?.onSpeakFinsh()
+                } else {
+                    Log.d(TAG, "speakFinish suppressed (barge-in/cancel)")
+                }
             }
             override fun onError(errorCode: Int) {
                 stopBargeInListen()
                 callback?.onError(errorCode)
-                // 出错也触发结束回调，避免卡住
-                speakFinishListener?.onSpeakFinsh()
+                if (!suppressSpeakFinish) {
+                    speakFinishListener?.onSpeakFinsh()
+                }
             }
         }
 
         ttsManager.speak(text, wrappedCallback)
     }
 
+    // ========== 流式播报（LLM边生成边播）==========
+
+    private var streamBuffer = StringBuilder()
+    private var streamFirstSent = false
+    // 断句分隔符：句号、感叹号、问号、换行、分号、中文逗号也可做软断句
+    private val sentenceDelimiters = charArrayOf('。', '！', '？', '\n', '；', '!', '?', '.')
+    // 最小缓冲长度：不足一个句子时先攒着，但超过这个长度强制发（防止标点缺失时卡太久）
+    private val minFlushLen = 40
+
+    /**
+     * 开始流式播报会话
+     *
+     * 在 LLM 流式请求开始前调用，重置内部状态。
+     * 之后每次收到 LLM delta 调 [feedStreamChunk]。
+     */
+    fun startStreaming(callback: TtsManager.TtsStateCallback? = null) {
+        // 重置 suppress 标记，新的一轮流式播报正常走 speakFinish
+        suppressSpeakFinish = false
+        // TTS播报前先停止所有ASR会话
+        if (asrManager.isListening()) {
+            asrManager.stopListening()
+        }
+        streamBuffer.setLength(0)
+        streamFirstSent = false
+
+        // 包装回调
+        val wrappedCallback = object : TtsManager.TtsStateCallback {
+            override fun onStart() {
+                Log.d(TAG, "TTS stream start, barge-in guard will begin when mic starts")
+                callback?.onStart()
+                if (bargeInEnabled && !asrManager.isListening()) {
+                    startBargeInListen()
+                }
+            }
+            override fun onDone() {
+                stopBargeInListen()
+                callback?.onDone()
+                if (!suppressSpeakFinish) {
+                    speakFinishListener?.onSpeakFinsh()
+                } else {
+                    Log.d(TAG, "speakFinish suppressed (barge-in/cancel)")
+                }
+            }
+            override fun onError(errorCode: Int) {
+                stopBargeInListen()
+                callback?.onError(errorCode)
+                if (!suppressSpeakFinish) {
+                    speakFinishListener?.onSpeakFinsh()
+                }
+            }
+        }
+
+        // 告诉 TTSManager 用流式模式的回调
+        ttsManager.setStateCallback(wrappedCallback)
+        // 注意：不在这里立即 speak，等第一个 chunk 到来才 speakChunk
+    }
+
+    /**
+     * 喂入一段 LLM 增量文本
+     *
+     * 内部做句子切分：收到完整句子就立即送 TTS 播放（首句立即开始，后续排队）。
+     * 未到句号的碎片先攒在 buffer 里，达到阈值也强制 flush。
+     * 必须在主线程调用（TextToSpeech.speak 需要主线程）。
+     */
+    fun feedStreamChunk(delta: String) {
+        if (delta.isEmpty()) return
+        streamBuffer.append(delta)
+
+        // 尝试按句子切分并 flush
+        flushCompleteSentences(force = false)
+    }
+
+    /**
+     * 流式播报结束：把 buffer 里剩余的碎片全部播出去
+     */
+    fun finishStreaming() {
+        // 强制 flush 剩余内容
+        flushCompleteSentences(force = true)
+        ttsManager.endStream()
+
+        // 边界情况：LLM 返回空内容，一个 chunk 都没发出去
+        // 此时 TTS 队列为空，UtteranceProgressListener 不会回调 onDone
+        // 需要手动触发 speakFinish，否则对话流程会卡死
+        if (!streamFirstSent) {
+            Log.w(TAG, "Stream TTS: no chunk was ever sent, manually trigger finish")
+            stopBargeInListen()
+            if (!suppressSpeakFinish) {
+                speakFinishListener?.onSpeakFinsh()
+            }
+        }
+
+        Log.d(TAG, "Stream TTS finished, buffer cleared")
+    }
+
+    /**
+     * 从 buffer 中提取完整句子送 TTS
+     */
+    private fun flushCompleteSentences(force: Boolean) {
+        while (streamBuffer.isNotEmpty()) {
+            // 找最早的句子结束符
+            val cutIdx = streamBuffer.indexOfAny(sentenceDelimiters)
+            if (cutIdx >= 0) {
+                // 包含分隔符在内作为一个完整句子
+                val sentence = streamBuffer.substring(0, cutIdx + 1).trim()
+                streamBuffer.delete(0, cutIdx + 1)
+                if (sentence.isNotEmpty()) {
+                    ttsManager.speakChunk(sentence, isFirst = !streamFirstSent)
+                    streamFirstSent = true
+                }
+            } else if (force) {
+                // 强制 flush：没有句子结束符也把剩余全送出去
+                val remaining = streamBuffer.toString().trim()
+                streamBuffer.setLength(0)
+                if (remaining.isNotEmpty()) {
+                    ttsManager.speakChunk(remaining, isFirst = !streamFirstSent)
+                    streamFirstSent = true
+                }
+                break
+            } else if (streamBuffer.length >= minFlushLen) {
+                // 没有标点但已经太长了，强制 flush 防止延迟
+                val remaining = streamBuffer.toString().trim()
+                streamBuffer.setLength(0)
+                if (remaining.isNotEmpty()) {
+                    ttsManager.speakChunk(remaining, isFirst = !streamFirstSent)
+                    streamFirstSent = true
+                }
+                break
+            } else {
+                // 不够长也没有句子结束，继续等
+                break
+            }
+        }
+    }
+
     /**
      * 启动打断专用的静默ASR监听
      * 不触发表情变化，只在后台识别用户语音
+     *
+     * 防误触三重保障：
+     * 1. 保护期（bargeInGuardMs）：麦克风开始录音后的前 N 毫秒内完全忽略语音，防TTS开头强回声
+     * 2. VAD高阈值：barge-in会话使用 0.65 的高VAD阈值，降低对回声的灵敏度
+     * 3. 语音持续确认（bargeInConfirmMs）：检测到speech_started后再确认200ms，
+     *    语音仍在持续才真正打断，避免短促爆音/点击声/瞬时回声误触发
      */
     private fun startBargeInListen() {
         try {
+            // 重置状态
+            isSpeechOngoing = false
+            isBargeInTriggering = false
+            // 只移除 barge-in 确认任务，不影响 mainHandler 上的其他回调
+            bargeInConfirmRunnable?.let { mainHandler.removeCallbacks(it) }
+            bargeInConfirmRunnable = null
+
             asrManager.startListening(object : AsrManager.AsrResultCallback {
-                override fun onResult(text: String) {
+                /**
+                 * 麦克风开始录音 → 记录准确的保护期起点
+                 * WebSocket连接+session配置可能耗时数百毫秒，
+                 * 从TTS onStart算起会导致保护期提前过期
+                 */
+                override fun onRecordingStarted() {
+                    ttsStartTime = asrManager.recordingStartTime
+                    Log.d(TAG, "Barge-in mic started, guard period = ${bargeInGuardMs}ms, " +
+                            "VAD threshold = 0.65 (barge-in mode)")
+                }
+
+                /**
+                 * 检测到语音开始 → 进入"持续确认"状态
+                 * 不立即打断，等确认语音持续足够长时间后再打断，
+                 * 避免短促的回声/爆音误触发
+                 */
+                override fun onSpeechStarted() {
+                    // 边界保护：如果录音还没正式开始（ttsStartTime仍为0），
+                    // 说明时序异常，保护期尚未生效，直接忽略
+                    if (ttsStartTime == 0L) {
+                        Log.w(TAG, "Barge-in: speech_started but ttsStartTime=0, ignored (boundary guard)")
+                        return
+                    }
+
                     val elapsed = System.currentTimeMillis() - ttsStartTime
-                    // TTS开头保护期内的结果忽略，防回声误触发
+                    // 第一重保障：保护期内完全忽略，防TTS开头强回声
+                    if (elapsed < bargeInGuardMs) {
+                        Log.d(TAG, "Barge-in: speech_started within guard period " +
+                                "(${elapsed}ms < ${bargeInGuardMs}ms), ignored")
+                        return
+                    }
+
+                    Log.d(TAG, "Barge-in: speech detected at ${elapsed}ms, entering confirm phase (${bargeInConfirmMs}ms)")
+                    isSpeechOngoing = true
+
+                    // 第三重保障：语音持续确认
+                    // 延迟 bargeInConfirmMs 后再检查，如果语音仍在持续才真正打断
+                    // 使用主线程Handler，避免协程异常问题
+                    bargeInConfirmRunnable?.let { mainHandler.removeCallbacks(it) }
+                    val confirmRunnable = Runnable {
+                        if (isSpeechOngoing && !isBargeInTriggering) {
+                            Log.d(TAG, "Barge-in: confirmed speech ongoing after ${bargeInConfirmMs}ms, triggering barge-in")
+                            triggerBargeIn("")
+                        } else {
+                            Log.d(TAG, "Barge-in: speech stopped within confirm window, likely echo/noise, ignored")
+                        }
+                        bargeInConfirmRunnable = null
+                    }
+                    bargeInConfirmRunnable = confirmRunnable
+                    mainHandler.postDelayed(confirmRunnable, bargeInConfirmMs)
+                }
+
+                /**
+                 * 检测到语音结束 → 取消确认任务
+                 * 如果确认任务还没执行，说明语音持续时间太短，是回声/噪声的可能性大
+                 */
+                override fun onSpeechStopped() {
+                    Log.d(TAG, "Barge-in: speech stopped")
+                    isSpeechOngoing = false
+                    bargeInConfirmRunnable?.let {
+                        mainHandler.removeCallbacks(it)
+                        Log.d(TAG, "Barge-in: confirm runnable removed due to speech_stop")
+                    }
+                    bargeInConfirmRunnable = null
+                }
+
+                override fun onResult(text: String) {
+                    // 边界保护：录音未开始时忽略
+                    if (ttsStartTime == 0L) return
+
+                    // 完整识别结果作为备用：如果onSpeechStarted没触发到（极端情况），这里兜底
+                    val elapsed = System.currentTimeMillis() - ttsStartTime
                     if (elapsed < bargeInGuardMs) return
-                    // 有效识别结果：触发打断
+
                     if (text.isNotBlank() && text.length >= 2) {
-                        // 停止TTS播报
-                        ttsManager.stop()
-                        stopBargeInListen()
-                        // 通知上层发生了打断
-                        bargeInListener?.onBargeIn(text)
+                        Log.d(TAG, "Barge-in fallback: got full result (${elapsed}ms): $text")
+                        triggerBargeIn(text)
                     }
                 }
+
                 override fun onError(errorMsg: String) {
                     // 打断监听出错静默处理，不影响TTS播放
+                    Log.w(TAG, "Barge-in listen error: $errorMsg")
+                    isSpeechOngoing = false
+                    bargeInConfirmRunnable?.let { mainHandler.removeCallbacks(it) }
+                    bargeInConfirmRunnable = null
                 }
-            }, triggerExpression = false) // 静默模式，不触发识别中表情
+            }, triggerExpression = false, bargeIn = true) // 打断监听模式：静默 + 标记为barge-in（使用高VAD阈值）
         } catch (e: Exception) {
             Log.e(TAG, "Start barge-in listen failed", e)
         }
     }
 
     /**
-     * 停止打断监听
+     * 执行打断操作
+     * 封装统一的打断逻辑，确保 onSpeechStarted 确认路径和 onResult 兜底路径行为一致
+     *
+     * 关键顺序：
+     * 1. 设 suppress 标记，让后续 ttsManager.stop() 触发的 onDone 不走 speakFinishListener
+     * 2. 停止 barge-in 监听
+     * 3. 停止 TTS
+     * 4. 通知上层（上层负责启动新 ASR）
      */
-    private fun stopBargeInListen() {
-        try {
-            if (asrManager.isListening()) {
-                asrManager.stopListening()
+    private fun triggerBargeIn(text: String) {
+        // 防止重入
+        if (isBargeInTriggering) {
+            Log.w(TAG, "Barge-in already triggering, skip duplicate call")
+            return
+        }
+        isBargeInTriggering = true
+        suppressSpeakFinish = true  // 抑制 stop() 引发的 speakFinishListener
+
+        Log.d(TAG, "Barge-in triggered! Stopping barge-in listen first, then TTS")
+
+        // 第一步：先停止barge-in监听，清除所有回调
+        stopBargeInListenInternal()
+
+        // 第二步：停止TTS播报（切到主线程，TextToSpeech.speak/stop 要求主线程）
+        mainHandler.post {
+            ttsManager.stop()
+
+            // 第三步：通知上层发生了打断
+            try {
+                bargeInListener?.onBargeIn(text)
+            } catch (e: Exception) {
+                Log.e(TAG, "Error in bargeInListener callback", e)
+            } finally {
+                isBargeInTriggering = false
+                suppressSpeakFinish = false
             }
-        } catch (e: Exception) {
-            // 忽略停止异常
         }
     }
 
     /**
-     * 停止TTS播报
+     * 停止打断监听（对外安全版本）
+     * 仅停止标记为 barge-in 的会话，不影响正在进行的正常识别
+     */
+    private fun stopBargeInListen() {
+        stopBargeInListenInternal()
+    }
+
+    /**
+     * 内部停止barge-in监听的实现
+     * 清理所有状态，取消延迟任务
+     */
+    private fun stopBargeInListenInternal() {
+        try {
+            // 取消语音持续确认任务
+            bargeInConfirmRunnable?.let { mainHandler.removeCallbacks(it) }
+            bargeInConfirmRunnable = null
+            isSpeechOngoing = false
+            // 重置保护期时间戳
+            ttsStartTime = 0L
+            // 停止ASR会话
+            asrManager.stopBargeInSession()
+        } catch (e: Exception) {
+            // 忽略停止异常
+            Log.w(TAG, "Stop barge-in listen exception: ${e.message}")
+        }
+    }
+
+    /**
+     * 停止TTS播报（静默，不触发 speakFinishListener）
+     *
+     * 用于打断/错误恢复等场景：只停TTS，不自动启动下一轮ASR。
      */
     fun stopSpeaking() {
         stopBargeInListen()
+        suppressSpeakFinish = true
         ttsManager.stop()
     }
 
@@ -312,7 +527,8 @@ class AudioManager private constructor(private val context: Context) {
      * 释放音频资源
      */
     fun release() {
-        stopVolumeDetect()
+        mainHandler.removeCallbacksAndMessages(null)
+        scope.cancel()
         asrManager.release()
         ttsManager.release()
         Log.d(TAG, "AudioManager released")

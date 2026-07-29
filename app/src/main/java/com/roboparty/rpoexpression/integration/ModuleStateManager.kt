@@ -1,14 +1,13 @@
-/*
+﻿/*
  * SPDX-FileCopyrightText: 2026 Roboparty Camp
  * SPDX-License-Identifier: GPL-3.0-only
  */
-
 package com.roboparty.rpoexpression.integration
 
 import android.util.Log
 import com.roboparty.rpoexpression.expression.ExpressionManager
 import com.roboparty.rpoexpression.expression.ExpressionType
-import kotlinx.coroutines.launch
+
 /**
  * 多模块状态联动管理器
  * 对接ASR、TTS、人脸识别等模块的状态，自动切换对应表情
@@ -118,7 +117,6 @@ object ModuleStateManager {
      */
     fun onFaceDetectStart() {
         Log.d(TAG, "Face detect start (silent mode, no expression)")
-        // 静默人脸检测不显示识别中表情，避免频繁切换
     }
 
     /**
@@ -145,7 +143,6 @@ object ModuleStateManager {
      */
     fun onHeadActionStart(actionType: String) {
         Log.d(TAG, "Head action start: $actionType")
-        // TODO: 后续根据动作类型切换对应表情，比如摇头时眼睛跟着转
     }
 
     /**

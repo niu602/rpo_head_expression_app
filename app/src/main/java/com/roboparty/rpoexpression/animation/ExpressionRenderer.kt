@@ -1,4 +1,4 @@
-/*
+﻿/*
  * SPDX-FileCopyrightText: 2026 Roboparty Camp
  * SPDX-License-Identifier: GPL-3.0-only
  */
@@ -19,16 +19,21 @@ import androidx.compose.ui.graphics.drawscope.translate
 import androidx.compose.ui.graphics.drawscope.withTransform
 import com.roboparty.rpoexpression.animation.style.EyeMetrics
 import com.roboparty.rpoexpression.animation.style.EyeStyleFactory
-import com.roboparty.rpoexpression.expression.EyeEffectType
-import com.roboparty.rpoexpression.expression.ExpressionManager
 import com.roboparty.rpoexpression.expression.ExpressionState
 import com.roboparty.rpoexpression.expression.ExpressionType
+import com.roboparty.rpoexpression.expression.EyeEffectType
+import kotlin.math.PI
+import kotlin.math.abs
+import kotlin.math.sqrt
+import androidx.compose.ui.graphics.drawscope.Fill
 import com.roboparty.rpoexpression.sensor.AmbientLightManager
 import kotlin.math.min
 import kotlin.math.sin
 import kotlin.math.cos
 import androidx.compose.ui.geometry.toRect
 import androidx.compose.ui.graphics.StrokeCap
+import com.roboparty.rpoexpression.expression.ExpressionManager
+
 /**
  * 纯眼部表情渲染器
  * 严格限定在眼部区域绘制，通过参数化控制所有视觉效果
@@ -50,7 +55,7 @@ class ExpressionRenderer {
     /**
      * 主渲染方法：参数化绘制纯眼部表情
      */
-    fun DrawScope.render(state: ExpressionState, size: Size, lightConfig: AmbientLightManager.LightConfig) {
+    fun DrawScope.render(state: ExpressionState, size: Size, lightConfig: AmbientLightManager.LightConfig, effect: EyeEffectType) {
         // 绘制纯黑背景
         drawRect(color = Color.Black, size = size)
 
@@ -97,18 +102,58 @@ class ExpressionRenderer {
                     val rightPupil = with(styleRenderer) {
                         calculatePupilPosition(eyeMetrics.rightEyeCenter, eyeMetrics.eyeWidth, eyeMetrics.eyeHeight, eyeParams)
                     }
-                    val pupilRadius = eyeMetrics.eyeWidth * 0.18f // 瞳孔半径
+                    var adjustedPupilRadius = eyeMetrics.eyeWidth * 0.18f
+                    var adjustedLeftPupil = leftPupil
+                    var adjustedRightPupil = rightPupil
+
+                    // 表情过渡进度（弹性缓动），用于平滑切换
+                    val transitionProgress = state.transitionProgress.coerceIn(0f, 1f)
+                    val easedProgress = (1f - (1f - transitionProgress) * (1f - transitionProgress)).coerceIn(0f, 1f) // easeOutQuad
+
+                    // 根据表情调整瞳孔大小和位置，带平滑过渡
+                    when (state.type) {
+                        ExpressionType.HAPPY -> {
+                            // 开心：瞳孔放大30%，随过渡进度平滑变化
+                            adjustedPupilRadius *= 1f + 0.3f * easedProgress
+                        }
+                        ExpressionType.CONFUSED -> {
+                            // 思考：瞳孔向上偏移30%半径，随过渡进度平滑变化
+                            val offsetY = adjustedPupilRadius * 0.3f * easedProgress
+                            adjustedLeftPupil = Offset(leftPupil.x, leftPupil.y - offsetY)
+                            adjustedRightPupil = Offset(rightPupil.x, rightPupil.y - offsetY)
+                        }
+                        else -> {}
+                    }
 
                     // 绘制眼睛
                     with(styleRenderer) {
                         drawEyes(eyeParams, centerX, centerY, size, time)
                     }
 
-                    // 绘制眼内特效（严格限制在瞳孔/眼周区域）
-                    drawEyeEffects(leftPupil, rightPupil, pupilRadius, eyeMetrics.scale, time, lightConfig.highlight)
+                    // 如果瞳孔有调整，用黑色覆盖原瞳孔，画调整后的瞳孔（带过渡）
+                    if (easedProgress > 0.01f && (state.type == ExpressionType.HAPPY || state.type == ExpressionType.CONFUSED)) {
+                        drawCircle(
+                            color = Color.Black,
+                            radius = adjustedPupilRadius,
+                            center = adjustedLeftPupil
+                        )
+                        drawCircle(
+                            color = Color.Black,
+                            radius = adjustedPupilRadius,
+                            center = adjustedRightPupil
+                        )
+                    }
 
-                    // 绘制系统状态特殊叠加效果（复用 tempPath）
-                    drawSystemStateOverlays(state, eyeMetrics, centerX, centerY, size, time)
+                    // 绘制眼内特效（使用调整后的瞳孔位置和大小，带淡入淡出）
+                    drawEyeEffects(adjustedLeftPupil, adjustedRightPupil, adjustedPupilRadius, eyeMetrics.scale, time, lightConfig.highlight * easedProgress, effect)
+                    drawSystemStateOverlays(
+                        state = state,
+                        eyeMetrics = eyeMetrics,
+                        centerX = centerX,
+                        centerY = centerY,
+                        size = size,
+                        time = time
+                    )
                 }
             }
 
@@ -137,9 +182,7 @@ class ExpressionRenderer {
     }
 
     /**
-     * 绘制眼内特效（严格限制在瞳孔和眼周区域，不超出眼睛范围）
-     * 5类特效：思考加载、识别成功、开心星光、错误脉冲、无特效
-     * 所有特效均为瞳孔区域叠加，不破坏眼睛主体造型
+     * 绘制眼内特效
      */
     private fun DrawScope.drawEyeEffects(
         leftPupil: Offset,
@@ -147,293 +190,367 @@ class ExpressionRenderer {
         pupilRadius: Float,
         scale: Float,
         time: Float,
-        highlight: Float
+        highlight: Float,
+        effect: EyeEffectType
     ) {
-        val effect = ExpressionManager.getInstance().currentEffect.value
         if (effect == EyeEffectType.NONE) return
 
-        // 特效严格限制在瞳孔周围 1.6 倍半径范围内，不超出眼白区域
-        val maxEffectRadius = pupilRadius * 1.6f
-
-        // 对左右眼分别绘制特效
-        listOf(leftPupil, rightPupil).forEach { pupilCenter ->
+        listOf(leftPupil, rightPupil).forEach { center ->
             when (effect) {
-                // ==================== 思考特效：双层反向旋转圆弧 ====================
-                EyeEffectType.THINKING_LOADING -> {
-                    drawThinkingLoadingEffect(pupilCenter, pupilRadius, maxEffectRadius, scale, time, highlight)
-                }
-
-                // ==================== 识别成功：星芒高光一次性闪过 ====================
-                EyeEffectType.RECOGNIZE_SUCCESS -> {
-                    drawRecognizeSuccessEffect(pupilCenter, pupilRadius, maxEffectRadius, scale, time, highlight)
-                }
-
-                // ==================== 开心特效：细碎星光粒子动效 ====================
-                EyeEffectType.HAPPY_STARLIGHT -> {
-                    drawHappyStarlightEffect(pupilCenter, pupilRadius, maxEffectRadius, scale, time, highlight)
-                }
-
-                // ==================== 错误特效：红色脉冲波纹 ====================
-                EyeEffectType.ERROR_PULSE -> {
-                    drawErrorPulseEffect(pupilCenter, pupilRadius, maxEffectRadius, scale, time, highlight)
-                }
-
+                EyeEffectType.HAPPY -> drawHappyEffect(center, pupilRadius, scale, time, highlight)
+                EyeEffectType.CONFUSED -> drawConfusedEffect(center, pupilRadius, scale, time, highlight)
+                EyeEffectType.RECOGNIZING -> drawRecognizingEffect(center, pupilRadius, scale, time, highlight)
+                EyeEffectType.SHY -> drawShyEffect(center, pupilRadius, scale, time, highlight)
+                EyeEffectType.SYSTEM_ERROR -> drawSystemErrorEffect(center, pupilRadius, scale, time, highlight)
+                EyeEffectType.RESPONSE -> drawResponseEffect(center, pupilRadius, scale, time, highlight)
                 else -> {}
             }
         }
     }
 
     /**
-     * 思考加载特效：双层反向旋转圆弧
-     * 外层2段120°圆弧顺时针旋转，内层2段90°圆弧逆时针旋转
-     * 形成精致的加载动画感，严格控制在瞳孔周围
+     * 开心特效：四角星星，明亮闪烁
      */
-    private fun DrawScope.drawThinkingLoadingEffect(
+    private fun DrawScope.drawHappyEffect(
         center: Offset,
         pupilRadius: Float,
-        maxRadius: Float,
         scale: Float,
         time: Float,
         highlight: Float
     ) {
-        // 外层：大圆弧，顺时针
-        val outerRadius = pupilRadius * 1.35f
-        val outerAngle = time * 120f // 旋转速度（度/秒）
-        val outerStroke = 2.5f * scale
-
-        // 内层：小圆弧，逆时针
-        val innerRadius = pupilRadius * 1.05f
-        val innerAngle = -time * 180f // 反向旋转
-        val innerStroke = 1.8f * scale
-
-        // 外层两段圆弧（对称分布）
-        for (i in 0..1) {
-            val startAngle = outerAngle + i * 180f
-            drawArc(
-                color = Color.White.copy(alpha = 0.65f * highlight),
-                startAngle = startAngle,
-                sweepAngle = 100f,
-                useCenter = false,
-                topLeft = Offset(center.x - outerRadius, center.y - outerRadius),
-                size = Size(outerRadius * 2, outerRadius * 2),
-                style = Stroke(width = outerStroke)
-            )
-        }
-
-        // 内层两段圆弧（反向）
-        for (i in 0..1) {
-            val startAngle = innerAngle + i * 180f + 45f // 错开相位
-            drawArc(
-                color = Color.White.copy(alpha = 0.45f * highlight),
-                startAngle = startAngle,
-                sweepAngle = 80f,
-                useCenter = false,
-                topLeft = Offset(center.x - innerRadius, center.y - innerRadius),
-                size = Size(innerRadius * 2, innerRadius * 2),
-                style = Stroke(width = innerStroke)
-            )
-        }
-
-        // 中心微光点（加载中心）
+        // 中心暖光
         drawCircle(
-            color = Color.White.copy(alpha = 0.25f * highlight),
-            radius = pupilRadius * 0.15f,
-            center = center
-        )
-    }
-
-    /**
-     * 识别成功特效：星芒高光一次性闪过
-     * 8道放射光线 + 扩散光环 + 中心亮点
-     * 动画曲线：0~30% 快速亮起扩散，30%~100% 渐隐消失
-     * 使用表情已播放时长比例控制，确保只完整闪过一次
-     */
-    private fun DrawScope.drawRecognizeSuccessEffect(
-        center: Offset,
-        pupilRadius: Float,
-        maxRadius: Float,
-        scale: Float,
-        time: Float,
-        highlight: Float
-    ) {
-        // 使用表情已播放时长比例作为特效进度（0~1），确保一次完整闪过
-        val state = ExpressionManager.getInstance().expressionState.value
-        val elapsed = (System.currentTimeMillis() - state.startTime).toFloat()
-        val duration = state.duration.toFloat().coerceAtLeast(500f)
-        val rawProgress = (elapsed / duration).coerceIn(0f, 1f)
-
-        // 重映射动画曲线：前30%快速展开增强，后70%渐隐消失
-        val progress = if (rawProgress < 0.3f) {
-            rawProgress / 0.3f  // 0 → 1 快速达到峰值
-        } else {
-            1f - (rawProgress - 0.3f) / 0.7f  // 1 → 0 渐隐
-        }.coerceIn(0f, 1f)
-
-        if (progress <= 0.01f) return
-
-        val rayCount = 8
-        val maxRayLength = pupilRadius * (0.7f + rawProgress * 0.7f)
-        val rayStroke = (1.5f + progress * 1f) * scale
-        val rayAlpha = progress * 0.75f * highlight
-
-        // 8道星芒射线
-        for (i in 0 until rayCount) {
-            val angle = (i * 360f / rayCount) * Math.PI / 180f
-            val endX = center.x + cos(angle).toFloat() * maxRayLength
-            val endY = center.y + sin(angle).toFloat() * maxRayLength
-            drawLine(
-                color = Color.White.copy(alpha = rayAlpha),
-                start = center,
-                end = Offset(endX, endY),
-                strokeWidth = rayStroke
-            )
-        }
-
-        // 扩散光环（圆环）
-        val ringRadius = pupilRadius * (0.5f + rawProgress * 1.0f)
-        val ringAlpha = (1f - rawProgress) * 0.5f * highlight
-        val ringStroke = 2f * scale * (1f - rawProgress * 0.5f)
-        drawCircle(
-            color = Color.White.copy(alpha = ringAlpha),
-            radius = ringRadius,
+            color = Color(0xFFFFF9C4).copy(alpha = 0.5f * highlight),
+            radius = pupilRadius * 0.9f,
             center = center,
-            style = Stroke(width = ringStroke.coerceAtLeast(0.5f))
+            style = Fill
         )
 
-        // 中心亮点
-        val coreRadius = pupilRadius * 0.35f * progress
-        drawCircle(
-            color = Color.White.copy(alpha = progress * 0.6f * highlight),
-            radius = coreRadius,
-            center = center
-        )
-    }
-
-    /**
-     * 开心特效：瞳孔周边细碎星光粒子动效
-     * 12个粒子分布在瞳孔周围，大小不一，不同相位闪烁
-     * 整体有呼吸感，粒子位置缓慢漂移，灵动不生硬
-     */
-    private fun DrawScope.drawHappyStarlightEffect(
-        center: Offset,
-        pupilRadius: Float,
-        maxRadius: Float,
-        scale: Float,
-        time: Float,
-        highlight: Float
-    ) {
+        // 12颗四角星星
         val starCount = 12
-
-        // 整体呼吸亮度（慢节奏）
-        val breath = 0.7f + 0.3f * sin(time * 1.5f)
-
         repeat(starCount) { i ->
-            // 每个粒子有独立的角度、距离、相位（基于索引计算，避免每帧随机跳变）
-            val baseAngle = (i * 360f / starCount + 15f) * Math.PI / 180f
-            val angleDrift = sin(time * 0.5f + i * 0.7f) * 0.15f // 角度缓慢漂移
-            val angle = baseAngle + angleDrift
+            val angle = (i * 360f / starCount + time * 12f) * PI.toFloat() / 180f
+            val baseRadius = when {
+                i % 3 == 0 -> pupilRadius * 0.3f
+                i % 3 == 1 -> pupilRadius * 0.55f
+                else -> pupilRadius * 0.8f
+            }
+            val floatOffset = sin(time * 0.9f + i * 1.1f) * pupilRadius * 0.1f
+            val distance = baseRadius + floatOffset
+            val x = center.x + cos(angle) * distance
+            val y = center.y + sin(angle) * distance
 
-            // 距离：分布在 0.6 ~ 1.4 倍瞳孔半径
-            val baseDist = pupilRadius * (0.6f + (i % 4) * 0.27f)
-            val distDrift = sin(time * 0.8f + i * 1.1f) * pupilRadius * 0.12f
-            val distance = baseDist + distDrift
+            val twinkle = 0.7f + 0.3f * sin(time * 3f + i * 0.8f)
+            val starSize = (3.5f + (i % 3) * 1.5f) * scale * twinkle
+            val alpha = twinkle * highlight
 
-            val starX = center.x + cos(angle).toFloat() * distance
-            val starY = center.y + sin(angle).toFloat() * distance
-
-            // 闪烁：每个粒子相位不同，亮度 0.3 ~ 1.0
-            val blink = 0.35f + 0.65f * (sin(time * 2.5f + i * 0.9f) * 0.5f + 0.5f)
-
-            // 大小：大小粒子错落，1 ~ 2.5 像素
-            val baseSize = (1f + (i % 3) * 0.75f) * scale
-            val sizePulse = 0.3f * sin(time * 3f + i * 0.5f)
-            val starRadius = baseSize + sizePulse
-
-            val alpha = blink * breath * 0.75f * highlight
-
+            // 画四角星：横+竖两条线
+            drawLine(
+                color = Color(0xFFFFD54F).copy(alpha = alpha),
+                start = Offset(x - starSize, y),
+                end = Offset(x + starSize, y),
+                strokeWidth = 2f * scale,
+                cap = StrokeCap.Round
+            )
+            drawLine(
+                color = Color(0xFFFFD54F).copy(alpha = alpha),
+                start = Offset(x, y - starSize),
+                end = Offset(x, y + starSize),
+                strokeWidth = 2f * scale,
+                cap = StrokeCap.Round
+            )
+            // 星星中心亮点
             drawCircle(
                 color = Color.White.copy(alpha = alpha),
-                radius = starRadius.coerceAtLeast(0.5f),
-                center = Offset(starX, starY)
+                radius = starSize * 0.4f,
+                center = Offset(x, y)
             )
         }
-
-        // 中心微亮（开心时瞳孔微微发光）
-        drawCircle(
-            color = Color.White.copy(alpha = 0.12f * breath * highlight),
-            radius = pupilRadius * 0.5f,
-            center = center
-        )
     }
 
     /**
-     * 错误特效：眼周红色脉冲波纹
-     * 3层圆环依次向外扩散，形成递进的波纹脉冲感
-     * 每层圆环从实到虚扩散消失，中心红色脉动
+     * 疑惑特效：瞳孔内问号（瞳孔已自动上移）
      */
-    private fun DrawScope.drawErrorPulseEffect(
+    private fun DrawScope.drawConfusedEffect(
         center: Offset,
         pupilRadius: Float,
-        maxRadius: Float,
         scale: Float,
         time: Float,
         highlight: Float
     ) {
-        val pulsePeriod = 1.2f // 脉冲周期 1.2 秒
-        val ringCount = 3
-        val ringOffset = 0.25f // 每层波纹时间偏移
+        val floatOffset = sin(time * 2.5f) * 2f * scale
+        val questionX = center.x
+        val questionY = center.y - pupilRadius * 0.1f + floatOffset
 
-        val errorColor = Color(0xFFFF5252)
+        val questionSize = pupilRadius * 0.9f * scale
+        val strokeW = 3f * scale
+        val questionColor = Color(0xFFE0E0E0).copy(alpha = 0.75f * highlight)
 
-        // 3层递进波纹
-        for (i in 0 until ringCount) {
-            val localTime = (time + i * ringOffset) % pulsePeriod
-            val t = localTime / pulsePeriod // 0 ~ 1
+        val arcRect = androidx.compose.ui.geometry.Rect(
+            offset = Offset(
+                questionX - questionSize * 0.45f,
+                questionY - questionSize * 0.5f
+            ),
+            size = Size(questionSize * 0.9f, questionSize * 0.7f)
+        )
 
-            // 半径：从瞳孔大小扩散到 1.5 倍
-            val ringRadius = pupilRadius * (0.9f + t * 0.6f)
-            // 透明度：前20%快速显现，后80%渐隐
-            val alpha = if (t < 0.2f) {
-                t / 0.2f * 0.6f
-            } else {
-                (1f - (t - 0.2f) / 0.8f) * 0.6f
-            } * highlight
+        drawArc(
+            color = questionColor,
+            startAngle = 180f,
+            sweepAngle = 270f,
+            useCenter = false,
+            topLeft = arcRect.topLeft,
+            size = arcRect.size,
+            style = Stroke(width = strokeW, cap = StrokeCap.Round)
+        )
 
-            // 线宽：由粗变细
-            val strokeWidth = (3f - t * 2f) * scale
+        val endAngle = (180f + 270f) * PI.toFloat() / 180f
+        val radiusX = arcRect.width / 2f
+        val radiusY = arcRect.height / 2f
+        val arcCenterX = arcRect.center.x
+        val arcCenterY = arcRect.center.y
+        val arcEndX = arcCenterX + radiusX * cos(endAngle)
+        val arcEndY = arcCenterY + radiusY * sin(endAngle)
 
-            if (alpha > 0.01f && strokeWidth > 0.2f) {
-                drawCircle(
-                    color = errorColor.copy(alpha = alpha),
-                    radius = ringRadius,
-                    center = center,
-                    style = Stroke(width = strokeWidth.coerceAtLeast(0.5f))
+        drawLine(
+            color = questionColor,
+            start = Offset(arcEndX, arcEndY),
+            end = Offset(arcEndX, arcEndY + questionSize * 0.25f),
+            strokeWidth = strokeW,
+            cap = StrokeCap.Round
+        )
+
+        drawCircle(
+            color = questionColor,
+            radius = strokeW * 0.7f,
+            center = Offset(arcEndX, arcEndY + questionSize * 0.35f + strokeW * 0.7f)
+        )
+    }
+
+    /**
+     * 识别中特效：粗扫描线+亮圆环
+     */
+    private fun DrawScope.drawRecognizingEffect(
+        center: Offset,
+        pupilRadius: Float,
+        scale: Float,
+        time: Float,
+        highlight: Float
+    ) {
+        repeat(3) { i ->
+            val ringPhase = (time * 0.8f + i * 0.35f) % 1f
+            val ringRadius = pupilRadius * (0.25f + ringPhase * 0.8f)
+            val ringAlpha = (1f - ringPhase) * 0.8f * highlight
+
+            drawCircle(
+                color = Color(0xFF4FC3F7).copy(alpha = ringAlpha),
+                radius = ringRadius,
+                center = center,
+                style = Stroke(width = 3f * scale)
+            )
+        }
+
+        drawCircle(
+            color = Color(0xFF81D4FA).copy(alpha = 0.4f * highlight),
+            radius = pupilRadius * 0.4f,
+            center = center,
+            style = Fill
+        )
+
+        val scanY = center.y + sin(time * 3f) * pupilRadius * 0.75f
+        val lineWidth = pupilRadius * 1.6f
+        drawLine(
+            color = Color(0xFF00E5FF).copy(alpha = 0.9f * highlight),
+            start = Offset(center.x - lineWidth * 0.5f, scanY),
+            end = Offset(center.x + lineWidth * 0.5f, scanY),
+            strokeWidth = 4f * scale,
+            cap = StrokeCap.Round
+        )
+
+        drawCircle(
+            color = Color.White.copy(alpha = highlight),
+            radius = 4f * scale,
+            center = Offset(center.x - lineWidth * 0.5f, scanY)
+        )
+        drawCircle(
+            color = Color.White.copy(alpha = highlight),
+            radius = 4f * scale,
+            center = Offset(center.x + lineWidth * 0.5f, scanY)
+        )
+    }
+
+    /**
+     * 害羞特效：瞳孔边缘粉色描边
+     */
+    private fun DrawScope.drawShyEffect(
+        center: Offset,
+        pupilRadius: Float,
+        scale: Float,
+        time: Float,
+        highlight: Float
+    ) {
+        val breath = 0.9f + 0.1f * sin(time * 1.5f)
+        drawCircle(
+            color = Color(0xFFF48FB1).copy(alpha = 0.4f * breath * highlight),
+            radius = pupilRadius * 1.05f,
+            center = center,
+            style = Stroke(width = 5f * scale)
+        )
+    }
+
+    /**
+     * 系统故障/警告特效：超出瞳孔范围，大色块闪烁，不会被眼白遮住
+     */
+    private fun DrawScope.drawSystemErrorEffect(
+        center: Offset,
+        pupilRadius: Float,
+        scale: Float,
+        time: Float,
+        highlight: Float
+    ) {
+        val glitchColors = listOf(
+            Color(0xFFFF1744),
+            Color(0xFFFFEA00),
+            Color(0xFF00E5FF),
+            Color(0xFFFF9100),
+            Color(0xFFD500F9)
+        )
+
+        // 大色块，范围扩大到1.5倍瞳孔半径（到眼白区域）
+        repeat(25) { i ->
+            val glitchTime = (time * 25f).toInt() + i
+            val px = (sin(glitchTime * 12.9898f) * 43758.5453f % 1f + 1f) % 1f
+            val py = (sin(glitchTime * 78.233f) * 43758.5453f % 1f + 1f) % 1f
+            val pc = (sin(glitchTime * 43.231f) * 43758.5453f % 1f + 1f) % 1f
+
+            // 范围扩大到1.5倍半径，覆盖眼白
+            val x = center.x + (px - 0.5f) * pupilRadius * 2.8f
+            val y = center.y + (py - 0.5f) * pupilRadius * 2.8f
+            val colorIndex = (pc * glitchColors.size).toInt().coerceIn(0, glitchColors.size - 1)
+
+            val blockSize = (4f + (i % 4) * 2f) * scale
+            val flickerAlpha = if ((glitchTime + i) % 2 != 0) highlight else 0.15f * highlight
+
+            drawRect(
+                color = glitchColors[colorIndex].copy(alpha = flickerAlpha),
+                topLeft = Offset(x - blockSize / 2, y - blockSize / 2),
+                size = Size(blockSize, blockSize)
+            )
+        }
+
+        // 粗故障横线，跨整个眼睛
+        repeat(5) { lineIdx ->
+            if ((time * 12f + lineIdx * 2f).toInt() % 2 == 0) {
+                val lineY = center.y + (sin(time * 35f + lineIdx) * pupilRadius * 1.3f).toInt() * 1f
+                val lineOffset = sin(time * 45f + lineIdx) * pupilRadius * 0.4f
+                drawLine(
+                    color = Color.White.copy(alpha = 0.9f * highlight),
+                    start = Offset(center.x - pupilRadius * 1.5f + lineOffset, lineY),
+                    end = Offset(center.x + pupilRadius * 1.5f + lineOffset, lineY + 3f),
+                    strokeWidth = 3f * scale
                 )
             }
         }
 
-        // 中心红色脉动光点
-        val pulse = 0.6f + 0.4f * sin(time * 4f)
+        // 中心红色警告脉冲
+        val pulse = 0.5f + 0.5f * sin(time * 8f)
         drawCircle(
-            color = errorColor.copy(alpha = 0.25f * pulse * highlight),
-            radius = pupilRadius * 0.7f,
-            center = center
-        )
-
-        // 最内层微亮环
-        drawCircle(
-            color = errorColor.copy(alpha = 0.35f * highlight),
-            radius = pupilRadius * 0.95f,
+            color = Color(0xFFFF1744).copy(alpha = pulse * 0.6f * highlight),
+            radius = pupilRadius * (0.8f + pulse * 0.3f),
             center = center,
-            style = Stroke(width = 1.5f * scale)
+            style = Stroke(width = 4f * scale)
         )
     }
 
     /**
-     * 绘制系统状态特殊叠加效果
-     * 严格不涉及下半脸元素
-     * 性能优化：复用 tempPath，避免每帧 new Path
+     * 应答反馈特效：实心填充月牙+发光，非常明显
      */
+    private fun DrawScope.drawResponseEffect(
+        center: Offset,
+        pupilRadius: Float,
+        scale: Float,
+        time: Float,
+        highlight: Float
+    ) {
+        val silverColor = Color(0xFFF5F5F5).copy(alpha = 0.95f * highlight)
+        val silverGlow = Color(0xFFFFFFFF).copy(alpha = 0.4f * highlight)
+
+        val moonCenter = Offset(center.x, center.y + pupilRadius * 0.05f)
+        val moonRadius = pupilRadius * 0.55f * scale
+
+        // 外发光
+        drawCircle(
+            color = silverGlow,
+            radius = moonRadius * 1.8f,
+            center = moonCenter,
+            style = Fill
+        )
+
+        // 实心月牙：用路径画填充的弯月
+        // 先画外圆填充
+        drawArc(
+            color = silverColor,
+            startAngle = 20f,
+            sweepAngle = 30f,
+            useCenter = true,
+            topLeft = Offset(moonCenter.x - moonRadius, moonCenter.y - moonRadius),
+            size = Size(moonRadius * 2, moonRadius * 2),
+            style = Fill
+        )
+
+        // 用黑色圆遮挡出月牙形状
+        drawCircle(
+            color = Color.Black,
+            radius = moonRadius * 0.85f,
+            center = Offset(moonCenter.x + moonRadius * 0.35f, moonCenter.y - moonRadius * 0.1f)
+        )
+
+        // 月牙边缘高光
+        drawArc(
+            color = Color.White.copy(alpha = highlight),
+            startAngle = 30f,
+            sweepAngle = 80f,
+            useCenter = false,
+            topLeft = Offset(moonCenter.x - moonRadius, moonCenter.y - moonRadius),
+            size = Size(moonRadius * 2, moonRadius * 2),
+            style = Stroke(width = 3f * scale, cap = StrokeCap.Round)
+        )
+
+        // 12颗大星光
+        val starCount = 12
+        repeat(starCount) { i ->
+            val angle = (i * 360f / starCount + time * 10f) * PI.toFloat() / 180f
+            val orbitRadius = pupilRadius * (0.6f + 0.2f * sin(time * 0.9f + i * 0.6f))
+            val x = center.x + cos(angle) * orbitRadius
+            val y = center.y + sin(angle) * orbitRadius
+
+            val twinkle = 0.5f + 0.5f * sin(time * 3.5f + i * 1.1f)
+            val starSize = (2.5f + (i % 2) * 1.5f) * scale * twinkle
+            val starAlpha = twinkle * highlight
+
+            // 十字星光
+            drawLine(
+                color = Color.White.copy(alpha = starAlpha),
+                start = Offset(x - starSize * 1.5f, y),
+                end = Offset(x + starSize * 1.5f, y),
+                strokeWidth = 1.5f * scale,
+                cap = StrokeCap.Round
+            )
+            drawLine(
+                color = Color.White.copy(alpha = starAlpha),
+                start = Offset(x, y - starSize * 1.5f),
+                end = Offset(x, y + starSize * 1.5f),
+                strokeWidth = 1.5f * scale,
+                cap = StrokeCap.Round
+            )
+            drawCircle(
+                color = Color.White.copy(alpha = starAlpha),
+                radius = starSize * 0.5f,
+                center = Offset(x, y)
+            )
+        }
+    }
+
     private fun DrawScope.drawSystemStateOverlays(
         state: ExpressionState,
         eyeMetrics: EyeMetrics,
@@ -610,27 +727,35 @@ class ExpressionRenderer {
             }
 
             ExpressionType.ALERT -> {
-                // 告警状态：感叹号
-                val alertSize = 25f * scale
-                val alertY = centerY - size.height * 0.25f
-                val flashAlpha = if ((time * 5f).toInt() % 2 == 0) 0.9f else 0.3f
+                // 告警状态：加粗加大深红色感叹号，眉心位置，2Hz脉冲闪烁
+                val alertSize = 60f * scale  // 从25px加大到60px，和问号同级别大小
+                val alertX = centerX
+                val alertY = centerY - size.height * 0.22f  // 和问号位置对应
+                // 2Hz脉冲闪烁（慢闪更有警示感，不像故障）
+                val flashAlpha = if ((time * 2f).toInt() % 2 == 0) 1.0f else 0.4f
+                val alertColor = Color(0xFFD50000).copy(alpha = flashAlpha)  // 深红，和眼睛光效一致
 
-                drawCircle(
-                    color = Color(0xFFE53935).copy(alpha = flashAlpha),
-                    radius = alertSize,
-                    center = Offset(centerX, alertY),
-                    style = Stroke(width = 3f * scale)
-                )
+                // 感叹号上半部分：超粗竖线，圆角端点
+                val barWidth = 14f * scale  // 从4px加粗到14px
                 drawLine(
-                    color = Color(0xFFE53935).copy(alpha = flashAlpha),
-                    start = Offset(centerX, alertY - alertSize/2),
-                    end = Offset(centerX, alertY + alertSize/3),
-                    strokeWidth = 4f * scale
+                    color = alertColor,
+                    start = Offset(alertX, alertY - alertSize/2),
+                    end = Offset(alertX, alertY + alertSize * 0.2f),
+                    strokeWidth = barWidth,
+                    cap = StrokeCap.Round
                 )
+                // 感叹号底部圆点：加大加粗
                 drawCircle(
-                    color = Color(0xFFE53935).copy(alpha = flashAlpha),
-                    radius = 4f * scale,
-                    center = Offset(centerX, alertY + alertSize * 0.6f)
+                    color = alertColor,
+                    radius = 9f * scale,  // 从4px加大到9px
+                    center = Offset(alertX, alertY + alertSize * 0.55f)
+                )
+                // 外圈红色光晕圈，增强警示感
+                drawCircle(
+                    color = Color(0xFFFF5252).copy(alpha = flashAlpha * 0.3f),
+                    radius = alertSize * 1.2f,
+                    center = Offset(alertX, alertY),
+                    style = Stroke(width = 6f * scale)
                 )
             }
 
@@ -651,7 +776,7 @@ class ExpressionRenderer {
 
                 // 问号整体参数
                 val questionSize = 80f * scale
-                val strokeW = 4f * scale * scaleAnim
+                val strokeW = 5f * scale * scaleAnim
                 val questionColor = Color(0xFFFFC107).copy(alpha = scaleAnim * 0.95f)
 
                 // 计算弧线的外接矩形
@@ -666,7 +791,7 @@ class ExpressionRenderer {
                 // 1. 问号上半部分圆弧
                 drawArc(
                     color = questionColor,
-                    startAngle = 225f,      // 从右下往左上画弧
+                    startAngle = 180f,      // 从右下往左上画弧
                     sweepAngle = 270f,      // 扫过270度，形成标准问号上半弧
                     useCenter = false,
                     topLeft = arcRect.topLeft,
@@ -674,7 +799,7 @@ class ExpressionRenderer {
                     style = Stroke(width = strokeW, cap = StrokeCap.Round)
                 )
 
-                val endAngle = Math.toRadians((225f + 270f).toDouble())
+                val endAngle = Math.toRadians((180f + 270f).toDouble())
                 val arcCenterX = arcRect.center.x
                 val arcCenterY = arcRect.center.y
                 val radiusX = arcRect.width / 2
@@ -721,23 +846,6 @@ class ExpressionRenderer {
                 val mainHeartY = centerY - size.height * 0.25f + sin(progress * Math.PI.toFloat() * 4) * 5f * scale
                 drawHeart(centerX, mainHeartY, mainHeartSize, heartColor.copy(alpha = 0.95f * mainScale), scale)
 
-                // 两个小爱心（左右漂浮）
-                if (progress > 0.3f) {
-                    val sideProgress = ((progress - 0.3f) / 0.7f).coerceIn(0f, 1f)
-                    val sideScale = sideProgress * (1f - sideProgress * 0.2f)
-                    val floatY = -sideProgress * 55f * scale
-                    val alpha = (1f - sideProgress) * 0.85f
-
-                    // 左小爱心
-                    val leftHeartX = centerX - size.width * 0.18f + sin(sideProgress * Math.PI.toFloat() * 3) * 10f * scale
-                    val leftHeartY = centerY - size.height * 0.12f + floatY
-                    drawHeart(leftHeartX, leftHeartY, 28f * scale * sideScale, heartColor.copy(alpha = alpha), scale)
-
-                    // 右小爱心
-                    val rightHeartX = centerX + size.width * 0.18f - sin(sideProgress * Math.PI.toFloat() * 3) * 10f * scale
-                    val rightHeartY = centerY - size.height * 0.12f + floatY - 15f * scale
-                    drawHeart(rightHeartX, rightHeartY, 25f * scale * sideScale, heartColor.copy(alpha = alpha * 0.9f), scale)
-                }
             }
 
             ExpressionType.SHY -> {
@@ -769,15 +877,6 @@ class ExpressionRenderer {
                     ),
                     size = Size(blushRadiusX * 2, blushRadiusY * 2)
                 )
-
-                // 害羞时眼睛上方飘小爱心点缀（放大提高可见度）
-                if (progress > 0.4f) {
-                    val heartProgress = ((progress - 0.4f) / 0.6f).coerceIn(0f, 1f)
-                    val heartAlpha = heartProgress * 0.8f * (1f - heartProgress * 0.3f)
-                    val tinyHeartSize = 18f * scale * heartProgress
-                    val tinyColor = Color(0xFFFF6B81).copy(alpha = heartAlpha)
-                    drawHeart(centerX - 25f * scale, centerY - size.height * 0.2f - heartProgress * 20f * scale, tinyHeartSize, tinyColor, scale)
-                }
             }
 
             else -> {}

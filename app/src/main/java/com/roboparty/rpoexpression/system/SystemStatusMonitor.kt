@@ -1,4 +1,4 @@
-/*
+﻿/*
  * SPDX-FileCopyrightText: 2026 Roboparty Camp
  * SPDX-License-Identifier: GPL-3.0-only
  */
@@ -11,6 +11,11 @@ import android.content.Intent
 import android.content.IntentFilter
 import android.os.BatteryManager
 import android.util.Log
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.launch
 import com.roboparty.rpoexpression.expression.ExpressionManager
 import com.roboparty.rpoexpression.expression.ExpressionType
 import java.util.concurrent.atomic.AtomicBoolean
@@ -42,7 +47,9 @@ class SystemStatusMonitor private constructor() {
         // 电池高温告警阈值（摄氏度）
         private const val OVER_TEMPERATURE_THRESHOLD = 45f
         // 告警冷却时间（避免反复触发）
-        private const val ALERT_COOLDOWN_MS = 10000L
+        private const val ALERT_COOLDOWN_MS = 2000L // 开发测试阶段：告警冷却2秒
+        // 启动宽限期：启动后10秒内不触发告警，避免传感器初始化不稳定导致误报
+        private const val STARTUP_GRACE_PERIOD_MS = 10000L
 
         @Volatile
         private var instance: SystemStatusMonitor? = null
@@ -56,6 +63,7 @@ class SystemStatusMonitor private constructor() {
 
     private lateinit var context: Context
     private lateinit var expressionManager: ExpressionManager
+    private val scope = CoroutineScope(Dispatchers.Main + SupervisorJob())
     private var isMonitoring = false
 
     // 当前系统状态
@@ -68,6 +76,7 @@ class SystemStatusMonitor private constructor() {
     private val isAlertActive = AtomicBoolean(false)
     private var lastAlertTime = 0L
     private var currentAlertReason = ""
+    private var startTime = 0L
 
     // 电量变化广播接收器
     private val batteryReceiver = object : BroadcastReceiver() {
@@ -97,11 +106,16 @@ class SystemStatusMonitor private constructor() {
             return
         }
 
+        startTime = System.currentTimeMillis()
+        isAlertActive.set(false)
+        lastAlertTime = 0L
+        currentAlertReason = ""
+
         try {
             val filter = IntentFilter(Intent.ACTION_BATTERY_CHANGED)
             context.registerReceiver(batteryReceiver, filter)
             isMonitoring = true
-            Log.d(TAG, "System status monitoring started")
+            Log.d(TAG, "System status monitoring started (grace period: ${STARTUP_GRACE_PERIOD_MS}ms)")
 
             // 启动后立即获取一次当前状态
             val currentBatteryIntent = context.registerReceiver(null, IntentFilter(Intent.ACTION_BATTERY_CHANGED))
@@ -184,6 +198,8 @@ class SystemStatusMonitor private constructor() {
             // 需要触发告警
             needAlert && !isAlertActive.get() -> {
                 val now = System.currentTimeMillis()
+                // 启动宽限期内不触发告警，避免初始化阶段误报
+                if (now - startTime < STARTUP_GRACE_PERIOD_MS) return
                 if (now - lastAlertTime < ALERT_COOLDOWN_MS) return
 
                 isAlertActive.set(true)
@@ -251,6 +267,8 @@ class SystemStatusMonitor private constructor() {
     fun triggerCommunicationLostAlert() {
         if (isAlertActive.get()) return
         val now = System.currentTimeMillis()
+        // 启动宽限期内不触发告警
+        if (now - startTime < STARTUP_GRACE_PERIOD_MS) return
         if (now - lastAlertTime < ALERT_COOLDOWN_MS) return
 
         isAlertActive.set(true)
@@ -322,3 +340,6 @@ class SystemStatusMonitor private constructor() {
         checkAndTriggerAlert()
     }
 }
+
+
+

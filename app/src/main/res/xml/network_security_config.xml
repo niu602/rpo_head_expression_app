@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="utf-8"?>
+<network-security-config>
+    <!-- 开发阶段允许所有明文HTTP请求，解决CLEARTEXT communication not permitted错误 -->
+    <base-config cleartextTrafficPermitted="true">
+        <trust-anchors>
+            <certificates src="system" />
+        </trust-anchors>
+    </base-config>
+    <!-- 后续如果上HTTPS，可以单独配置域名，删除上面的base-config即可 -->
+</network-security-config>

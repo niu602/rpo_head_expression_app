@@ -7,12 +7,17 @@ package com.roboparty.rpoexpression
 import android.Manifest
 import android.content.pm.PackageManager
 import android.os.Bundle
+import android.content.BroadcastReceiver
+import android.content.Context
+import android.content.Intent
+import android.content.IntentFilter
+import android.util.Log
 import android.view.KeyEvent
 import android.view.WindowManager
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
-import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
+import androidx.core.app.ActivityCompat
 import androidx.core.view.WindowCompat
 import androidx.core.view.WindowInsetsCompat
 import androidx.core.view.WindowInsetsControllerCompat
@@ -25,56 +30,53 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.rememberScrollState
-import androidx.compose.material3.Divider
 import androidx.compose.material3.Text
 import androidx.compose.material3.Button
 import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Surface
 import androidx.compose.runtime.*
-import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.Alignment
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.lifecycle.lifecycleScope
 import com.roboparty.rpoexpression.animation.ExpressionCanvas
 import com.roboparty.rpoexpression.audio.AudioManager
 import com.roboparty.rpoexpression.audio.AsrManager
-import com.roboparty.rpoexpression.audio.TtsManager
 import com.roboparty.rpoexpression.communication.CommunicationManager
 import com.roboparty.rpoexpression.llm.LlmManager
-import com.roboparty.rpoexpression.vision.VisionManager
 import com.roboparty.rpoexpression.expression.DemoSequenceManager
 import com.roboparty.rpoexpression.expression.ExpressionManager
 import com.roboparty.rpoexpression.expression.ExpressionType
 import com.roboparty.rpoexpression.integration.ModuleStateManager
 import com.roboparty.rpoexpression.sensor.BrightnessManager
+import com.roboparty.rpoexpression.sensor.VolumeManager
+import com.roboparty.rpoexpression.ui.ConnectionStatusIndicator
 import com.roboparty.rpoexpression.ui.theme.RpoRobotExpressionTheme
-import com.roboparty.rpoexpression.util.Constants
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
-import androidx.compose.ui.platform.LocalContext
 import android.annotation.SuppressLint
 import androidx.compose.ui.Modifier
-import com.roboparty.rpoexpression.expression.ExpressionState
 import com.roboparty.rpoexpression.expression.ExpressionStyle
 import androidx.compose.material3.Slider
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.foundation.background
-import androidx.compose.ui.Alignment
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.ui.graphics.Color as ComposeColor
-import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.foundation.verticalScroll
+import com.roboparty.rpoexpression.vision.VisionManager
 /**
  * 主Activity
  * 实现全屏沉浸式表情显示，完成ASR→LLM→TTS全链路对话
  */
+private const val TAG = "MainActivity"
 class MainActivity : ComponentActivity() {
+
 
     private lateinit var app: RpoExpressionApp
     private lateinit var expressionManager: ExpressionManager
     private lateinit var communicationManager: CommunicationManager
     private lateinit var brightnessManager: BrightnessManager
+    private lateinit var volumeManager: VolumeManager
     private lateinit var demoSequenceManager: DemoSequenceManager
     private lateinit var audioManager: AudioManager
     private lateinit var llmManager: LlmManager
@@ -116,8 +118,10 @@ class MainActivity : ComponentActivity() {
      * 3. 自动过滤太短的识别结果（<3字直接忽略）
      */
     private fun isFuzzyMatch(input: String, wakeWord: String): Boolean {
-        // 太短直接不匹配，防误触
-        if (input.length < 3) return false
+        // 输入太短直接不匹配，防误触
+        // 中文唤醒词（如"萝卜"）至少2字，英文唤醒词至少3字母
+        val minInputLen = if (wakeWord.any { it.isChinese() }) 2 else 3
+        if (input.length < minInputLen) return false
 
         val minMatchLen = if (wakeWord.any { it.isChinese() }) 2 else 3
 
@@ -155,6 +159,13 @@ class MainActivity : ComponentActivity() {
             trimmed.contains(word, ignoreCase = true)
         }
     }
+    /**
+     * 是否是关机关键词
+     */
+    private fun isPowerOffWord(input: String): Boolean {
+        val trimmed = input.trim()
+        return trimmed == "关机" || trimmed.contains("关机")
+    }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -164,6 +175,7 @@ class MainActivity : ComponentActivity() {
         expressionManager = app.expressionManager
         communicationManager = app.communicationManager
         brightnessManager = app.brightnessManager
+        volumeManager = app.volumeManager
         demoSequenceManager = app.demoSequenceManager
         // 复用Application中已初始化的实例
         audioManager = app.audioManager
@@ -179,8 +191,19 @@ class MainActivity : ComponentActivity() {
                     modifier = Modifier.fillMaxSize(),
                     color = MaterialTheme.colorScheme.background
                 ) {
-                    // 全屏表情画布，无调试面板
-                    ExpressionCanvas(modifier = Modifier.fillMaxSize())
+                    Box(modifier = Modifier.fillMaxSize()) {
+                        // 全屏表情画布（底层）
+                        ExpressionCanvas(modifier = Modifier.fillMaxSize())
+
+                        // 右上角连接状态指示器（上层）
+                        ConnectionStatusIndicator(
+                            modifier = Modifier
+                                .align(Alignment.TopEnd)
+                                .padding(top = 12.dp, end = 12.dp),
+                            commManager = communicationManager,
+                            headControlManager = app.headControlManager
+                        )
+                    }
                 }
             }
         }
@@ -192,9 +215,35 @@ class MainActivity : ComponentActivity() {
         startManagers()
 
         initTtsFinishCallback()
+        initPowerStateCallback()
 
         // 启动自动申请权限，开启摄像头和麦克风
         autoStartPerception()
+        // 注册ADB广播接收器，支持命令行启动/停止Demo
+        val demoFilter = IntentFilter().apply {
+            addAction("com.roboparty.rpoexpression.START_DEMO")
+            addAction("com.roboparty.rpoexpression.STOP_DEMO")
+            addAction("com.roboparty.rpoexpression.SOFT_RESET")
+        }
+        ContextCompat.registerReceiver(this, object : BroadcastReceiver() {
+            override fun onReceive(context: Context?, intent: Intent?) {
+                when (intent?.action) {
+                    "com.roboparty.rpoexpression.START_DEMO" -> {
+                        Log.i(TAG, "Received START_DEMO broadcast")
+                        demoSequenceManager.triggerStandardDemo()
+                    }
+                    "com.roboparty.rpoexpression.STOP_DEMO" -> {
+                        Log.i(TAG, "Received STOP_DEMO broadcast")
+                        demoSequenceManager.stopDemo()
+                        expressionManager.requestExpression(ExpressionType.IDLE, force = true)
+                    }
+                    "com.roboparty.rpoexpression.SOFT_RESET" -> {
+                        Log.i(TAG, "Received SOFT_RESET broadcast, performing soft reset")
+                        performSoftReset()
+                    }
+                }
+            }
+        }, demoFilter, ContextCompat.RECEIVER_NOT_EXPORTED)
     }
 
     /**
@@ -302,16 +351,11 @@ class MainActivity : ComponentActivity() {
         // ========== [新增] 启动连续对话空闲超时计时 ==========
         resetContinuousConversationTimeout()
 
-        // 1. 瞳孔转向音源方向
-        val soundDir = audioManager.soundDirection.value
-        expressionManager.setPupilOffset(soundDir, 0f)
-        // 2. 触发应答表情
+        // 1. 触发应答表情
         expressionManager.requestExpression(ExpressionType.RESPONSE, 800)
-        // 3. 延迟后开始聆听对话
+        // 2. 延迟后开始聆听对话
         lifecycleScope.launch {
             delay(800)
-            // 重置瞳孔到中心，开始识别
-            expressionManager.setPupilOffset(0f, 0f)
             checkRecordPermissionAndStartAsr()
         }
     }
@@ -327,7 +371,6 @@ class MainActivity : ComponentActivity() {
         if (hasAudio && hasCamera) {
             // 权限都有，直接启动
             startFaceDetect()
-            audioManager.restartVolumeDetect()
             startWakeUpListening() // 启动语音唤醒
         } else {
             // 申请权限
@@ -355,7 +398,11 @@ class MainActivity : ComponentActivity() {
     private fun startManagers() {
         expressionManager.start()
         communicationManager.start()
+        brightnessManager.attachActivity(this@MainActivity)
         brightnessManager.start()
+        // 设置亮度/音量边界眨眼回调
+        brightnessManager.onBoundaryReached = { expressionManager.performBlink() }
+        volumeManager.onBoundaryReached = { expressionManager.performBlink() }
 
         // 监听亮度变化，更新屏幕亮度
         lifecycleScope.launch {
@@ -369,6 +416,61 @@ class MainActivity : ComponentActivity() {
      * TTS播报结束回调注册
      * 修复原来只在onCreate执行一次的问题
      */
+
+    /**
+     * 电源状态回调：关机时停止所有传感器，开机时启动
+     */
+    private fun initPowerStateCallback() {
+        expressionManager.addPowerStateCallback { isPowerOff ->
+            lifecycleScope.launch {
+                if (isPowerOff) {
+                    // 关机：停止所有外设
+                    Log.i(TAG, "Power off: stopping all sensors...")
+                    try {
+                        audioManager.stopListening()
+                        audioManager.stopSpeaking()
+                        isWakeUpListening = false
+                        isInContinuousConversation = false
+                        continuousConversationTimeoutJob?.cancel()
+                    } catch (e: Exception) {
+                        Log.e(TAG, "Stop audio failed", e)
+                    }
+                    try {
+                        visionManager.stopFaceDetect()
+                    } catch (e: Exception) {
+                        Log.e(TAG, "Stop vision failed", e)
+                    }
+                    try {
+                        communicationManager.stop()
+                    } catch (e: Exception) {
+                        Log.e(TAG, "Stop communication failed", e)
+                    }
+                    Log.i(TAG, "Power off complete")
+                } else {
+                    // 开机：启动所有外设
+                    Log.i(TAG, "Power on: starting all sensors...")
+                    try {
+                        communicationManager.start()
+                    } catch (e: Exception) {
+                        Log.e(TAG, "Start communication failed", e)
+                    }
+                    try {
+                        checkCameraPermissionAndStartFaceDetect()
+                    } catch (e: Exception) {
+                        Log.e(TAG, "Start vision failed", e)
+                    }
+                    delay(1000)
+                    try {
+                        isWakeUpListening = true
+                        startWakeUpListening()
+                    } catch (e: Exception) {
+                        Log.e(TAG, "Start wake up failed", e)
+                    }
+                    Log.i(TAG, "Power on complete")
+                }
+            }
+        }
+    }
     private fun initTtsFinishCallback() {
         ttsFinishListener = {
             ModuleStateManager.onTtsFinishSpeaking()
@@ -398,18 +500,22 @@ class MainActivity : ComponentActivity() {
         audioManager.setOnBargeInListener(object : AudioManager.OnBargeInListener {
             override fun onBargeIn(text: String) {
                 runOnUiThread {
-                    // 用户打断了当前播报
+                    Log.d(TAG, "Barge-in received, text=[$text]")
                     // 1. 取消正在进行的LLM请求
                     llmManager.cancelRequest()
-                    // 2. 标记为识别中状态
-                    ModuleStateManager.onAsrStartListening()
-                    ModuleStateManager.onAsrFinish()
-                    // 3. 进入连续对话模式（如果还没进入）
+                    // 2. 进入连续对话模式（如果还没进入）
                     if (!isInContinuousConversation) {
                         isInContinuousConversation = true
                     }
-                    // 4. 处理打断时的识别结果
-                    processAsrResult(text, asrOnly = false)
+                    resetContinuousConversationTimeout()
+
+                    // 3. 如果已有识别文本，直接处理；否则启动新的ASR识别让用户继续说
+                    if (text.isNotBlank()) {
+                        processAsrResult(text, asrOnly = false)
+                    } else {
+                        // speech_started触发的打断：用户刚开口，启动完整ASR识别接收后续内容
+                        startAsrRecognition()
+                    }
                 }
             }
         })
@@ -493,6 +599,10 @@ class MainActivity : ComponentActivity() {
             enableFullscreenMode()
         }
     }
+
+    // 手柄组合键状态
+    private var isSelectPressed = false
+    private var isStartPressed = false
 
     // 手柄切换表情用的索引
     private var currentExpressionIndex = 0
@@ -682,20 +792,19 @@ class MainActivity : ComponentActivity() {
 
         // 对话开始，暂停唤醒监听
         isWakeUpListening = false
-        // 切换到识别中表情
-        ModuleStateManager.onAsrStartListening()
+        // 表情切换由AsrManager内部统一触发（triggerExpression=true时自动切识别中），这里不重复调用
 
         audioManager.startListening(object : AsrManager.AsrResultCallback {
             override fun onResult(text: String) {
                 runOnUiThread {
-                    ModuleStateManager.onAsrFinish()
+                    // ASR结束表情由AsrManager内部统一触发，这里不重复调用
                     processAsrResult(text, asrOnly)
                 }
             }
 
             override fun onError(errorMsg: String) {
                 runOnUiThread {
-                    ModuleStateManager.onAsrFinish()
+                    // ASR错误表情由AsrManager内部统一触发，这里不重复调用
 
                     if (isInContinuousConversation) {
                         // 连续对话模式：出错后自动继续聆听
@@ -741,6 +850,14 @@ class MainActivity : ComponentActivity() {
                 return
             }
 
+
+            // 关机关键词检测
+            if (isPowerOffWord(raw)) {
+                expressionManager.powerOff()
+                exitContinuousConversation()
+                audioManager.stopSpeaking()
+                return
+            }
             sendTextToLlm(text)
         } else {
             // 未识别到内容
@@ -758,7 +875,10 @@ class MainActivity : ComponentActivity() {
     }
 
     /**
-     * 发送文本给LLM
+     * 发送文本给LLM（流式流水线：LLM SSE → 逐句 TTS）
+     *
+     * 优化前：用户说完 → 等LLM完整回复 → TTS开始播，首字延迟高
+     * 优化后：LLM 边生成边回调 → 收到第一句话立刻开始播 → 后续边播边收
      */
     private fun sendTextToLlm(text: String) {
         if (text.isBlank()) {
@@ -771,22 +891,29 @@ class MainActivity : ComponentActivity() {
         }
 
         // 切换到思考表情
-        //expressionManager.requestExpression(ExpressionType.THINKING)
         ModuleStateManager.onLlmStartThinking()
 
-        llmManager.sendQuery(text, object : LlmManager.LlmCallback {
-            override fun onSuccess(response: String) {
+        // 初始化流式播报会话（等第一个完整句子到达就开始播）
+        audioManager.startStreaming()
+
+        llmManager.sendQueryStream(text, object : LlmManager.StreamCallback {
+            override fun onDelta(delta: String) {
+                // LLM 增量文本：切到主线程喂给 TTS（TextToSpeech 必须主线程）
+                runOnUiThread {
+                    audioManager.feedStreamChunk(delta)
+                }
+            }
+
+            override fun onComplete(fullText: String) {
                 runOnUiThread {
                     ModuleStateManager.onLlmFinish()
 
-                    // ========== [修改] TTS开始前再次重置超时，确保回复过程中不退出 ==========
                     if (isInContinuousConversation) {
                         resetContinuousConversationTimeout()
                     }
 
-                    // 切换到说话表情，开始播报
-                    expressionManager.requestExpression(ExpressionType.SPEAKING)
-                    audioManager.startSpeaking(response)
+                    // 把 buffer 中剩余的碎片全部播出去
+                    audioManager.finishStreaming()
                 }
             }
 
@@ -794,11 +921,12 @@ class MainActivity : ComponentActivity() {
                 runOnUiThread {
                     ModuleStateManager.onLlmFinish()
 
-                    // ========== [修改] 请求失败也重置超时，避免连续对话异常退出 ==========
                     if (isInContinuousConversation) {
                         resetContinuousConversationTimeout()
                     }
 
+                    // 停掉可能已经入队的半截内容
+                    audioManager.stopSpeaking()
                     expressionManager.requestExpression(ExpressionType.SAD)
                     audioManager.startSpeaking("抱歉，我现在无法回答你的问题，请稍后再试")
                 }
@@ -806,7 +934,9 @@ class MainActivity : ComponentActivity() {
         })
     }
 
-    override fun onRequestPermissionsResult(requestCode: Int, permissions: Array<out String>, grantResults: IntArray) {
+    @Deprecated("Deprecated in Java")
+    @Suppress("DEPRECATION", "TYPE_MISMATCH")
+    override fun onRequestPermissionsResult(requestCode: Int, permissions: Array<String>, grantResults: IntArray) {
         super.onRequestPermissionsResult(requestCode, permissions, grantResults)
         when (requestCode) {
             REQUEST_RECORD_AUDIO_PERMISSION -> {
@@ -831,9 +961,8 @@ class MainActivity : ComponentActivity() {
                 if (cameraGranted) {
                     startFaceDetect()
                 }
-                // 录音权限通过就重启音量检测和唤醒监听
+                // 录音权限通过就启动唤醒监听
                 if (audioGranted) {
-                    audioManager.restartVolumeDetect()
                     startWakeUpListening()
                 }
             }
@@ -853,6 +982,7 @@ class MainActivity : ComponentActivity() {
 
     /**
      * 开始人脸检测
+     * 注意：TCP连接由 HeadControlManager 在 RpoExpressionApp 中统一管理，无需在此处连接
      */
     private fun startFaceDetect() {
         visionManager.startFaceDetect(this, object : VisionManager.VisionStateCallback {
@@ -879,21 +1009,42 @@ class MainActivity : ComponentActivity() {
                 expressionManager.setPupilOffset(0f, 0f)
             }
 
-            override fun onTimeout() {
-                super.onTimeout()
-                // 超时，重置瞳孔到中心
-                expressionManager.setPupilOffset(0f, 0f)
-                visionManager.stopFaceDetect()
-                expressionManager.requestExpression(ExpressionType.IDLE, force = true)
-                audioManager.startSpeaking("我看不到你哦，请面向镜头")
-            }
-
-            override fun onStop() {
-                super.onStop()
-                // 停止检测，重置瞳孔到中心
-                expressionManager.setPupilOffset(0f, 0f)
+            override fun onSpeakRequest(text: String) {
+                // 多人场景进入时的语音播报（如"哇，好多人呀！"）
+                // 不打断正在进行的对话，只有空闲时才说
+                if (!audioManager.isSpeaking() && !audioManager.isListening()) {
+                    audioManager.startSpeaking(text)
+                }
             }
         })
+    }
+
+    /**
+     * 执行软重置：重置所有模块，不重启APP，无黑屏
+     */
+    private fun performSoftReset() {
+        Log.i(TAG, "Performing full soft reset...")
+        lifecycleScope.launch {
+            // 停止Demo
+            demoSequenceManager.stopDemo()
+            // 停止音频和LLM
+            audioManager.stopListening()
+            audioManager.stopSpeaking()
+            llmManager.cancelRequest()
+            // 停止视觉
+            visionManager.stopFaceDetect()
+            // 重置表情状态
+            expressionManager.softReset()
+            // 退出连续对话
+            isInContinuousConversation = false
+            isWakeUpListening = false
+            continuousConversationTimeoutJob?.cancel()
+            delay(200)
+            // 重启视觉和唤醒
+            try { startFaceDetect() } catch (e: Exception) { Log.e(TAG, "Restart face detect failed", e) }
+            try { startWakeUpListening() } catch (e: Exception) { Log.e(TAG, "Restart wake up failed", e) }
+            Log.i(TAG, "Soft reset complete")
+        }
     }
 
     override fun onDestroy() {
@@ -906,6 +1057,7 @@ class MainActivity : ComponentActivity() {
         visionManager.stopFaceDetect()
         expressionManager.stop()
         communicationManager.stop()
+        brightnessManager.detachActivity()
         brightnessManager.stop()
     }
 
@@ -1172,3 +1324,14 @@ class MainActivity : ComponentActivity() {
         }
     }
 }
+
+
+
+
+
+
+
+
+
+
+

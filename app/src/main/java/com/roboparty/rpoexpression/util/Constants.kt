@@ -5,6 +5,8 @@
 
 package com.roboparty.rpoexpression.util
 
+import com.roboparty.rpoexpression.BuildConfig
+
 /**
  * 常量定义
  */
@@ -12,6 +14,7 @@ object Constants {
     // 通信配置
     const val DEFAULT_MASTER_IP = "10.43.2.69"
     const val DEFAULT_MASTER_PORT = 8899
+    const val HEAD_CONTROL_PORT = 8765 // 头部电机控制独立端口
     const val SOCKET_TIMEOUT = 5000
 
     // 性能配置
@@ -32,10 +35,9 @@ object Constants {
     const val ASSETS_EXPRESSION_PATH = "expressions/"
 
     // ==================== 通义千问API配置 ====================
-    // TODO: 请替换为你自己的ASR服务API Key（qwen3-asr-flash-realtime）
-    const val QWEN_ASR_API_KEY = "sk-ws-H.EMRPRRD.K53l.MEUCIQDViW_CUwu3JjtdnwobxlfRxTV1YZNdJL-9u-W6iMO5OAIgKFFA-FMiLbtB0d_KeP7ektyETvyQCX_vmMiIA-kgQbo"
-    // TODO: 请替换为你自己的LLM服务API Key（qwen3.6-plus），未配置时自动使用模拟回复测试
-    const val QWEN_LLM_API_KEY = "sk-SHWccSkDo5tMYWrrhcu_cQ"
+    // API Key 从 local.properties 注入 BuildConfig，不硬编码在源码中
+    val QWEN_ASR_API_KEY: String get() = BuildConfig.QWEN_ASR_API_KEY
+    val QWEN_LLM_API_KEY: String get() = BuildConfig.QWEN_LLM_API_KEY
     // LLM配置：ali-qwen3.6-plus
     const val QWEN_LLM_BASE_URL = "https://ai-gateway.roboparty.com/v1"
     const val QWEN_LLM_MODEL = "ali-qwen3.6-plus"
