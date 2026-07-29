@@ -389,22 +389,22 @@ object EyeParameterMapper {
     )
 
     /**
-     * 告警：眼睑张大，红光急闪
+     * 告警：眼睑张大，瞳孔收缩，深红强光脉冲
      */
     private fun alertParams(): EyeParameters = EyeParameters(
         eyelidOpenness = 1f,
-        upperEyelidCurve = 0.4f,
-        lowerEyelidCurve = 0.3f,
-        pupilSize = 0.35f,
+        upperEyelidCurve = 0.5f,  // 挑眉，紧张感
+        lowerEyelidCurve = 0.25f,
+        pupilSize = 0.25f,         // 瞳孔收缩，警觉
         pupilOffsetX = 0f,
         pupilOffsetY = 0f,
-        pupilScale = 0.9f,
+        pupilScale = 0.85f,        // 瞳孔进一步缩小
         eyeTailAngle = 0f,
-        eyeHeightRatio = 0.8f,
+        eyeHeightRatio = 0.85f,    // 眼睛睁得更大
         eyeWidthRatio = 1f,
-        glowColor = Color(0xFFE53935),
-        glowIntensity = 0.9f,
-        glowRadius = 0.8f,
+        glowColor = Color(0xFFD50000),  // 深红#D50000，比原来的#E53935更鲜艳更醒目
+        glowIntensity = 1.0f,      // 最大光强
+        glowRadius = 1.0f,         // 更大范围红光晕
         glowBlink = true,
         blinkProgress = 0f,
         unfocused = 0f

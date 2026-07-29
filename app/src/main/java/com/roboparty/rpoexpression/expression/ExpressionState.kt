@@ -1,4 +1,4 @@
-/*
+﻿/*
  * SPDX-FileCopyrightText: 2026 Roboparty Camp
  * SPDX-License-Identifier: GPL-3.0-only
  */
@@ -62,12 +62,11 @@ data class ExpressionState(
 
         val manager = ExpressionManager.getInstance()
 
-        // 计算目标瞳孔偏移（表情基础偏移 + 视线跟踪 + 微动作 + 临时晃动 + 声源 + 触摸）
+        // 计算目标瞳孔偏移（表情基础偏移 + 视线跟踪 + 微动作 + 临时晃动 + 触摸）
         val targetPupilX = finalParams.pupilOffsetX +
                 manager.pupilOffsetX * 0.8f +
                 manager.microPupilOffsetX +
                 manager.tempPupilShakeX +
-                manager.soundPupilOffsetX * 0.5f +
                 manager.touchPupilOffsetX
         val targetPupilY = finalParams.pupilOffsetY +
                 manager.pupilOffsetY * 0.8f +
@@ -79,24 +78,71 @@ data class ExpressionState(
         val smoothedPupilY = manager.updateSmoothedPupilY(targetPupilY)
 
         // 应用眨眼叠加、IMU临时偏移、视觉模仿
-        val blinkOverlay = manager.blinkOverlay
+        val blinkOverlay = manager.blinkProgress
         val tempEyelidOffset = manager.tempEyelidOffset
         val mimicEyelid = manager.mimicEyelidOpenness
         val finalEyelidOpenness = ((finalParams.eyelidOpenness * (1f - blinkOverlay) + tempEyelidOffset) * mimicEyelid)
             .coerceIn(0f, 1f)
 
-        // 叠加音频情绪效果 + 距离感知瞳孔缩放
-        val adjustedEyeTail = finalParams.eyeTailAngle + manager.audioEyeShape * 0.5f
+        // 距离感知瞳孔缩放
+        val adjustedEyeTail = finalParams.eyeTailAngle
         val adjustedPupilSize = finalParams.pupilSize * 
-                (1f - manager.audioEyeShape * 0.2f) * 
                 manager.distancePupilScale
 
+        // 应用性别切换动画overlay
+        val genderOverlay = manager.getGenderSwitchOverlay()
+        val finalEyelid = if (manager.isGenderSwitching()) {
+            finalEyelidOpenness * genderOverlay.eyelidOpenness
+        } else {
+            finalEyelidOpenness
+        }
+        val finalEyeHeight = if (manager.isGenderSwitching()) {
+            finalParams.eyeHeightRatio * genderOverlay.eyeHeightRatio / 0.7f
+        } else {
+            finalParams.eyeHeightRatio
+        }
+        val finalPupilSizeGender = if (manager.isGenderSwitching()) {
+            adjustedPupilSize * genderOverlay.pupilSize / 0.6f
+        } else {
+            adjustedPupilSize
+        }
+        val finalGlowIntensity = if (manager.isGenderSwitching()) {
+            finalParams.glowIntensity + genderOverlay.glowIntensity
+        } else {
+            finalParams.glowIntensity
+        }
+
+
+        // 应用长按进度overlay
+        val longPressOverlay = manager.getLongPressOverlay()
+        val finalEyelidLongPress = if (longPressOverlay.eyelidOpenness < 1f) {
+            finalEyelid * longPressOverlay.eyelidOpenness
+        } else {
+            finalEyelid
+        }
+        val finalGlowLongPress = finalGlowIntensity + longPressOverlay.glowIntensity
+
+                // 应用关机overlay（最高优先级）
+        val powerOffOverlay = manager.getPowerOffOverlay()
+        val finalEyelidPowerOff = finalEyelidLongPress * powerOffOverlay.eyelidOpenness
+        val finalEyeHeightPowerOff = finalEyeHeight * powerOffOverlay.eyeHeightRatio / 0.7f
+        val finalPupilPowerOff = finalPupilSizeGender * powerOffOverlay.pupilSize / 0.6f
+        val finalGlowPowerOff = finalGlowLongPress * powerOffOverlay.glowIntensity / 0.3f
         return finalParams.copy(
-            eyelidOpenness = finalEyelidOpenness,
-            pupilOffsetX = smoothedPupilX + manager.soundPupilOffsetX * 0.3f,
+            eyelidOpenness = finalEyelidPowerOff.coerceIn(0f, 1f),
+            pupilOffsetX = smoothedPupilX,
             pupilOffsetY = smoothedPupilY,
             eyeTailAngle = adjustedEyeTail.coerceIn(-1f, 1f),
-            pupilSize = adjustedPupilSize.coerceIn(0.5f, 1.2f)
+            pupilSize = finalPupilPowerOff.coerceIn(0f, 1.2f),
+            eyeHeightRatio = finalEyeHeightPowerOff.coerceIn(0f, 1f),
+            glowIntensity = finalGlowPowerOff.coerceIn(0f, 1f),
+            glowBlink = genderOverlay.glowBlink
         )
     }
 }
+
+
+
+
+
+

@@ -7,8 +7,6 @@ package com.roboparty.rpoexpression.communication
 
 import android.util.Log
 import java.io.ByteArrayOutputStream
-import java.nio.ByteBuffer
-import java.nio.ByteOrder
 
 /**
  * 轻量Protobuf编解码器
@@ -43,16 +41,18 @@ class ProtobufCodec {
         private val bos = ByteArrayOutputStream(256)
 
         private fun writeTag(fieldNumber: Int, wireType: Int) {
-            writeVarint((fieldNumber shl 3) or wireType)
+            writeVarint(((fieldNumber shl 3) or wireType).toLong())
         }
 
         fun writeVarint(value: Long) {
             var v = value
             while (true) {
-                if (v and 0x7FL.inv() == 0L) {
+                // 除了低7位之外没有其他位，直接写入结束
+                if (v ushr 7 == 0L) {
                     bos.write(v.toInt())
                     return
                 }
+                // 写入低7位 + 最高位1表示还有后续字节
                 bos.write((v.toInt() and 0x7F) or 0x80)
                 v = v ushr 7
             }
@@ -216,10 +216,10 @@ class ProtobufCodec {
             writeUint32(5, seq)
             // ExpressionSet payload (field 10)
             writeMessage(10) {
-                writeEnum(5, exprType) // eye_shape
-                writeUint32(8, durationMs.toInt()) // transition_ms
-                writeUint32(6, intensity) // glow_intensity 复用作为强度
-                writeBool(8, if (force) 1 else 0) // 复用transition_ms位置传force? 不对，单独处理
+                writeEnum(5, exprType) // eye_shape 眼型
+                writeUint32(6, intensity) // intensity 强度
+                writeUint64(7, durationMs) // duration_ms 持续时间
+                writeBool(8, force) // force 是否强制抢占
             }
         }.toByteArray()
     }

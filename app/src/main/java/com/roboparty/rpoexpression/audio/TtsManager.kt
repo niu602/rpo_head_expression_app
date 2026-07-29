@@ -41,7 +41,7 @@ class TtsManager private constructor(private val context: Context) {
         }
     }
 
-    private var textToSpeech: TextToSpeech? = null
+        private var textToSpeech: TextToSpeech? = null
     private var isInitSuccess = false
 
     // 当前音色配置（默认女款）
@@ -67,6 +67,18 @@ class TtsManager private constructor(private val context: Context) {
     }
 
     private var stateCallback: TtsStateCallback? = null
+
+    /**
+     * 设置状态回调（供 AudioManager 流式模式外部设置）
+     */
+    fun setStateCallback(callback: TtsStateCallback?) {
+        stateCallback = callback
+    }
+
+    // 流式播报：标记当前 chunk id 是否是本轮第一个（用于 onUtterance 回调判断）
+    @Volatile private var firstChunkId: String? = null
+    @Volatile private var lastChunkId: String? = null
+    @Volatile private var isStreamingMode = false
 
     /**
      * 初始化TTS引擎
@@ -273,20 +285,26 @@ class TtsManager private constructor(private val context: Context) {
     private fun setupUtteranceListener() {
         textToSpeech?.setOnUtteranceProgressListener(object : UtteranceProgressListener() {
             override fun onStart(utteranceId: String?) {
-                if (utteranceId == UTTERANCE_ID) {
-                    Log.d(TAG, "TTS start speaking")
-                    // 自动联动表情：切换到说话状态
+                // 整句模式：UTTERANCE_ID；流式模式：首个 chunk id
+                if (utteranceId == UTTERANCE_ID || utteranceId == firstChunkId) {
+                    Log.d(TAG, "TTS start speaking (utteranceId=$utteranceId)")
                     ModuleStateManager.onTtsStartSpeaking()
                     stateCallback?.onStart()
                 }
             }
 
             override fun onDone(utteranceId: String?) {
-                if (utteranceId == UTTERANCE_ID) {
-                    Log.d(TAG, "TTS finish speaking")
-                    // 自动联动表情：恢复之前表情
+                // 整句模式：UTTERANCE_ID；流式模式：最后一个 chunk id
+                if (utteranceId == UTTERANCE_ID || utteranceId == lastChunkId) {
+                    Log.d(TAG, "TTS finish speaking (utteranceId=$utteranceId)")
                     ModuleStateManager.onTtsFinishSpeaking()
                     stateCallback?.onDone()
+                    // 流式模式下最后一个chunk播完，清理标记
+                    if (utteranceId != UTTERANCE_ID) {
+                        isStreamingMode = false
+                        firstChunkId = null
+                        lastChunkId = null
+                    }
                 }
             }
 
@@ -296,11 +314,15 @@ class TtsManager private constructor(private val context: Context) {
             }
 
             override fun onError(utteranceId: String?, errorCode: Int) {
-                if (utteranceId == UTTERANCE_ID) {
-                    Log.e(TAG, "TTS error, code: $errorCode")
-                    // 自动联动表情：错误表情
+                if (utteranceId == UTTERANCE_ID || utteranceId == lastChunkId) {
+                    Log.e(TAG, "TTS error, code: $errorCode (utteranceId=$utteranceId)")
                     ModuleStateManager.onTtsError()
                     stateCallback?.onError(errorCode)
+                    if (utteranceId != UTTERANCE_ID) {
+                        isStreamingMode = false
+                        firstChunkId = null
+                        lastChunkId = null
+                    }
                 }
             }
         })
@@ -339,8 +361,10 @@ class TtsManager private constructor(private val context: Context) {
         doSpeak(text)
     }
 
+    private var chunkIdCounter = 0
+
     /**
-     * 执行播报
+     * 执行播报（整句模式）
      */
     private fun doSpeak(text: String) {
         textToSpeech?.stop()
@@ -350,11 +374,73 @@ class TtsManager private constructor(private val context: Context) {
     }
 
     /**
-     * 停止播报
+     * 流式播报：首次调用会立即开始播放，后续调用排队追加。
+     *
+     * 与 speak() 的区别：
+     * - speak() 用 QUEUE_FLUSH：每次清空队列重新播
+     * - speakChunk() 用 QUEUE_ADD：第一句用FLUSH清掉旧内容，后续ADD排队
+     *
+     * 用于 LLM 流式输出：收到第一句话立即播放，后面的句子边收边排队。
+     *
+     * @param text         一个句子或一段文本
+     * @param isFirst      是否是本轮第一句（true=清队列立即播，false=追加到队列尾）
+     */
+    fun speakChunk(text: String, isFirst: Boolean) {
+        if (!isInitSuccess) {
+            Log.w(TAG, "TTS not available, skip chunk: $text")
+            return
+        }
+        if (text.isBlank()) return
+
+        val utteranceId = "rpo_chunk_${chunkIdCounter++}"
+        isStreamingMode = true
+        lastChunkId = utteranceId // 每次更新，最终指向最后一个入队的 chunk
+
+        val params = Bundle()
+        params.putString(TextToSpeech.Engine.KEY_PARAM_UTTERANCE_ID, utteranceId)
+
+        if (isFirst) {
+            firstChunkId = utteranceId // 记录本轮首个 chunk
+            textToSpeech?.speak(text, TextToSpeech.QUEUE_FLUSH, params, utteranceId)
+            Log.d(TAG, "TTS chunk (first): $text")
+        } else {
+            textToSpeech?.speak(text, TextToSpeech.QUEUE_ADD, params, utteranceId)
+            Log.d(TAG, "TTS chunk (queued): $text")
+        }
+    }
+
+    /**
+     * 标记本轮流式播报的输入已结束（LLM 全部输出完毕后调用）
+     * 
+     * 注意：不清理 lastChunkId 和 isStreamingMode，
+     * 因为最后一个 chunk 可能还在 TTS 队列中等待播放。
+     * 等 onDone 回调触发后再在 UtteranceProgressListener 中清理。
+     */
+    fun endStream() {
+        // 仅标记输入结束，不清理播放状态
+    }
+
+    /**
+     * 停止播报并清空所有排队的句子
+     *
+     * 只在确实正在播报时才手动触发 onDone，避免在非播报状态下
+     * （如 startSpeaking 内部预停、doSpeak 内部 stop 等）误触发回调，
+     * 导致上层状态机错误推进。
      */
     fun stop() {
+        val wasSpeaking = isSpeaking()
         textToSpeech?.stop()
-        Log.d(TAG, "TTS stopped")
+        chunkIdCounter = 0
+        firstChunkId = null
+        lastChunkId = null
+        isStreamingMode = false
+        if (wasSpeaking) {
+            Log.d(TAG, "TTS stopped manually (was speaking), trigger onDone callback")
+            ModuleStateManager.onTtsFinishSpeaking()
+            stateCallback?.onDone()
+        } else {
+            Log.d(TAG, "TTS stop() called but not speaking, skip onDone")
+        }
     }
 
     /**

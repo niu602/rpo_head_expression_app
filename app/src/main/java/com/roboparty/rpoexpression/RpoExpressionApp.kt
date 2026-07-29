@@ -10,25 +10,25 @@ import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.content.IntentFilter
 import android.os.Build
-import kotlinx.coroutines.CoroutineScope
-import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.Job
-import kotlinx.coroutines.flow.collect
 import kotlinx.coroutines.launch
 import com.roboparty.rpoexpression.audio.AudioManager
 import com.roboparty.rpoexpression.communication.CommunicationManager
+import com.roboparty.rpoexpression.communication.HeadControlManager
+import com.roboparty.rpoexpression.communication.ReminderClient
 import com.roboparty.rpoexpression.expression.DemoSequenceManager
 import com.roboparty.rpoexpression.expression.ExpressionManager
+import com.roboparty.rpoexpression.expression.ExpressionType
 import com.roboparty.rpoexpression.integration.ExpressionControlReceiver
 import com.roboparty.rpoexpression.llm.LlmManager
 import com.roboparty.rpoexpression.sensor.AmbientLightManager
 import com.roboparty.rpoexpression.sensor.BrightnessManager
 import com.roboparty.rpoexpression.sensor.ImuManager
+import com.roboparty.rpoexpression.sensor.VolumeManager
 import com.roboparty.rpoexpression.system.SystemStatusMonitor
 import com.roboparty.rpoexpression.util.Constants
-import com.roboparty.rpoexpression.vision.VisionManager
 import android.content.Context
 import android.util.Log
+import com.roboparty.rpoexpression.vision.VisionManager
 /**
  * Application入口
  * 初始化各个管理器单例
@@ -40,6 +40,7 @@ class RpoExpressionApp : Application() {
     lateinit var communicationManager: CommunicationManager
         private set
     lateinit var brightnessManager: BrightnessManager
+    lateinit var volumeManager: VolumeManager
         private set
     lateinit var ambientLightManager: AmbientLightManager
         private set
@@ -55,10 +56,14 @@ class RpoExpressionApp : Application() {
         private set
     lateinit var systemStatusMonitor: SystemStatusMonitor
         private set
+    lateinit var reminderClient: ReminderClient
+        private set
+    lateinit var headControlManager: HeadControlManager
+        private set
     private lateinit var expressionControlReceiver: ExpressionControlReceiver
-    private val appScope = CoroutineScope(Dispatchers.Default + Job())
 
     override fun onCreate() {
+        instance = this
         super.onCreate()
 
         // 初始化配置管理器（最先初始化，其他模块读取配置）
@@ -67,14 +72,23 @@ class RpoExpressionApp : Application() {
         // 初始化核心管理器
         expressionManager = ExpressionManager.getInstance()
         communicationManager = CommunicationManager.getInstance()
+        reminderClient = ReminderClient.getInstance()
+        reminderClient.start()
         try {
             brightnessManager = BrightnessManager.getInstance(this)
         } catch (e: Exception) {
             Log.e("RpoExpressionApp", "BrightnessManager init failed", e)
         }
         try {
+            volumeManager = VolumeManager.getInstance(this)
+            volumeManager.start()
+        } catch (e: Exception) {
+            Log.e("RpoExpressionApp", "VolumeManager init failed", e)
+        }
+        try {
             ambientLightManager = AmbientLightManager.getInstance(this)
-            ambientLightManager.start()
+            // 禁用自动光感调节，改为手势滑动调节亮度/音量
+            // ambientLightManager.start()
         } catch (e: Exception) {
             Log.e("RpoExpressionApp", "AmbientLightManager init failed", e)
         }
@@ -85,12 +99,6 @@ class RpoExpressionApp : Application() {
             // 注册IMU头部动作监听
             imuManager.setPoseListener { pose ->
                 when (pose.currentAction) {
-                    ImuManager.HeadAction.NOD -> {
-                        // 点头：触发眨眼
-                        if (!expressionManager.isBlinking()) {
-                            expressionManager.performBlink()
-                        }
-                    }
                     ImuManager.HeadAction.BOW_DOWN -> {
                         // 低头：半闭眼1.5秒
                         expressionManager.setTempEyelidOffset(-0.4f)
@@ -134,30 +142,6 @@ class RpoExpressionApp : Application() {
         try {
             audioManager = AudioManager.getInstance(this)
             audioManager.init()
-            // 监听音频状态，实现情绪眼型和声源跟踪
-            appScope.launch {
-                try {
-                    audioManager.audioVolume.collect { db ->
-                        val eyeShape = when {
-                            db > 60f -> 1f // 大音量：锐利眼型
-                            db < 40f -> -1f // 小音量：柔和弯月
-                            else -> 0f // 正常
-                        }
-                        expressionManager.setAudioEyeShape(eyeShape)
-                    }
-                } catch (e: Exception) {
-                    Log.e("RpoExpressionApp", "Audio volume collect failed", e)
-                }
-            }
-            appScope.launch {
-                try {
-                    audioManager.soundDirection.collect { dir ->
-                        expressionManager.setSoundPupilOffset(dir)
-                    }
-                } catch (e: Exception) {
-                    Log.e("RpoExpressionApp", "Sound direction collect failed", e)
-                }
-            }
         } catch (e: Exception) {
             Log.e("RpoExpressionApp", "AudioManager init failed", e)
         }
@@ -194,6 +178,42 @@ class RpoExpressionApp : Application() {
             Log.d("RpoExpressionApp", "SystemStatusMonitor started")
         } catch (e: Exception) {
             Log.e("RpoExpressionApp", "SystemStatusMonitor init failed", e)
+        }
+
+        // 初始化机器人头部控制管理器（TCP + Protobuf）
+        try {
+            headControlManager = HeadControlManager.getInstance()
+            // 设置目标设备地址（RDK板子）
+            headControlManager.setTarget(
+                Constants.DEFAULT_MASTER_IP,
+                Constants.HEAD_CONTROL_PORT
+            )
+            // 注册表情变化回调：疑惑表情触发头部循环摆头，其他表情停止头部动作
+            expressionManager.addExpressionChangeCallback { type ->
+                when (type) {
+                    ExpressionType.CONFUSED -> {
+                        // 疑惑表情：摇头
+                        headControlManager.sendConfusionShake()
+                    }
+                    ExpressionType.HAPPY -> {
+                        // 开心表情：点头
+                        headControlManager.sendHappyNod()
+                    }
+                    ExpressionType.IDLE, ExpressionType.BLINK -> {
+                        // 待机/眨眼：停止头部动作
+                        headControlManager.sendStop()
+                    }
+                    else -> {
+                        // 其他表情：默认停止摆头，保持情绪标识
+                        headControlManager.sendStop()
+                    }
+                }
+            }
+            // 建立TCP长连接（异步，自动重连）
+            headControlManager.connect()
+            Log.d("RpoExpressionApp", "HeadControlManager initialized")
+        } catch (e: Exception) {
+            Log.e("RpoExpressionApp", "HeadControlManager init failed, skip head control", e)
         }
 
         // 动态注册表情控制广播接收器（解决高版本Android静态广播限制）
@@ -251,12 +271,19 @@ class RpoExpressionApp : Application() {
         unregisterReceiver(expressionControlReceiver)
         systemStatusMonitor.stop()
         brightnessManager.stop()
+        volumeManager.stop()
         ambientLightManager.stop()
         imuManager.stop()
         communicationManager.stop()
+        reminderClient.stop()
+        headControlManager.release()
     }
 
     companion object {
+        lateinit var instance: RpoExpressionApp
+            private set
         const val CHANNEL_ID = "rpo_expression_service"
     }
 }
+
+

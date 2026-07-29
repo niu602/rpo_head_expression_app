@@ -1,0 +1,36 @@
+syntax = "proto3";
+
+package robothead;
+
+// ============================================================
+// 机器人头部控制协议（简化版，由嵌入式提供）
+// 说明：电机运动细节已由嵌入式封装，APP只需下发情绪和运动模式
+// 本文件仅作协议参考，代码中使用手写Kotlin类实现同等编解码
+// ============================================================
+
+// 情绪状态枚举
+enum EmotionType {
+  EMOTION_NONE = 0;       // 无情绪/平静
+  EMOTION_CONFUSION = 1;  // 疑惑 → 触发摇头
+  EMOTION_HAPPY=2;        //开心 → 触发点头
+}
+
+// 头部运动模式
+enum HeadMoveMode {
+  MOVE_NONE = 0;   // 停止所有头部动作
+  MOVE_SHAKE = 1;  // 摇头（疑惑时触发）
+  MOVE_NOD = 2;
+}
+
+// APP 下发给设备：头部控制总指令
+message HeadControlCmd {
+  EmotionType emotion = 1;     // 情绪标识
+  HeadMoveMode move_mode = 2;  // 头部运动模式
+}
+
+// 设备上报给APP：传感器交互事件
+message DeviceFeedbackEvent {
+  int32 event_code = 1;     // 事件码 1=拍打头部 2=触摸脸部 3=机身晃动
+  float sensor_value = 2;   // 传感器采集数值
+  bool device_online = 3;   // 设备是否正常运行
+}

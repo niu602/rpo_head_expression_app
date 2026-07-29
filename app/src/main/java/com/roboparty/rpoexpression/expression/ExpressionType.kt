@@ -1,4 +1,4 @@
-/*
+﻿/*
  * SPDX-FileCopyrightText: 2026 Roboparty Camp
  * SPDX-License-Identifier: GPL-3.0-only
  */
@@ -227,6 +227,18 @@ enum class ExpressionType(
     ),
 
     /**
+     * 关机状态：长按额头4秒，完全停止摄像头/麦克风
+     * 只有再次长按额头4秒才能唤醒
+     */
+    POWER_OFF(
+        priority = 7,
+        defaultDuration = Long.MAX_VALUE,
+        isAutoFallback = false,
+        category = ExpressionCategory.SYSTEM,
+        description = "关机"
+    ),
+
+    /**
      * 固件升级状态：OTA升级时触发，进度条动画 + 蓝色光效
      * 持续状态直到升级完成
      */
@@ -261,6 +273,7 @@ enum class ExpressionType(
                 "charging", "充电中" -> CHARGING
                 "alert", "告警" -> ALERT
                 "sleeping", "休眠" -> SLEEPING
+                "power_off", "关机" -> POWER_OFF
                 "updating", "升级" -> UPDATING
                 else -> null
             }

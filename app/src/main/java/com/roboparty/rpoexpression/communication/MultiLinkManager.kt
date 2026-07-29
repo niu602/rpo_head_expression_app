@@ -1,4 +1,4 @@
-/*
+﻿/*
  * SPDX-FileCopyrightText: 2026 Roboparty Camp
  * SPDX-License-Identifier: GPL-3.0-only
  */
@@ -35,7 +35,8 @@ class MultiLinkManager private constructor() {
         private const val HEALTH_CHECK_INTERVAL = 500L  // 500ms检测一次
         private const val LINK_TIMEOUT_MS = 1000L       // 1秒无数据判定为故障
         private const val LINK_RECOVERY_CHECK = 3       // 连续3次检测正常判定为恢复
-        private const val ALL_LINK_LOST_ALERT_MS = 5000L // 所有链路断开5秒触发告警
+        private const val ALL_LINK_LOST_ALERT_MS = 500L // 开发测试阶段：所有链路断开500ms触发告警
+        private const val STARTUP_GRACE_PERIOD_MS = 1500L // 启动宽限期15秒，给链路连接留足时间（开发测试阶段减少时间）
 
         // 切换原因
         const val SWITCH_REASON_MAIN_RECOVER = 1
@@ -79,6 +80,8 @@ class MultiLinkManager private constructor() {
     // 全链路断开开始时间
     private var allLinkLostStartTime = 0L
     private var commAlertTriggered = false
+    // 启动时间（用于宽限期判断）
+    private var startTime = 0L
 
     // 数据接收回调
     private var dataCallback: ((ByteArray) -> Unit)? = null
@@ -131,7 +134,10 @@ class MultiLinkManager private constructor() {
      */
     fun start() {
         if (isRunning.compareAndSet(false, true)) {
-            Log.d(TAG, "Starting multi-link manager")
+            startTime = System.currentTimeMillis()
+            allLinkLostStartTime = 0L
+            commAlertTriggered = false
+            Log.d(TAG, "Starting multi-link manager (grace period: ${STARTUP_GRACE_PERIOD_MS}ms)")
             scope.launch {
                 // 先连接所有链路
                 connectAllLinks()
@@ -242,11 +248,14 @@ class MultiLinkManager private constructor() {
             _isConnected.value = false
             tryReconnectLinks()
 
-            // 全链路断连计时，超过5秒触发告警
+            // 全链路断连计时，超过5秒触发告警（启动宽限期内不触发，给链路连接留时间）
             val now = System.currentTimeMillis()
             if (allLinkLostStartTime == 0L) {
                 allLinkLostStartTime = now
-            } else if (!commAlertTriggered && now - allLinkLostStartTime > ALL_LINK_LOST_ALERT_MS) {
+            } else if (!commAlertTriggered
+                && now - startTime > STARTUP_GRACE_PERIOD_MS  // 过了启动宽限期
+                && now - allLinkLostStartTime > ALL_LINK_LOST_ALERT_MS
+            ) {
                 commAlertTriggered = true
                 Log.e(TAG, "All links lost for ${ALL_LINK_LOST_ALERT_MS}ms, triggering ALERT")
                 SystemStatusMonitor.getInstance().triggerCommunicationLostAlert()
@@ -329,3 +338,4 @@ class MultiLinkManager private constructor() {
         return _activeLink.value?.getType() ?: CommLink.LinkType.LINK_UNKNOWN
     }
 }
+

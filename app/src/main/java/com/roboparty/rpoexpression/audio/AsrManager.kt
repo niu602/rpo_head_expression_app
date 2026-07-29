@@ -30,6 +30,7 @@ import okhttp3.WebSocketListener
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import java.util.UUID
+import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
 
@@ -58,6 +59,25 @@ class AsrManager private constructor(private val context: Context) {
      */
     interface AsrResultCallback {
         /**
+         * 麦克风实际开始录音
+         * 用于打断场景：从这个时间点起算回声保护期最准确
+         */
+        fun onRecordingStarted() {}
+
+        /**
+         * 检测到用户开始说话（VAD语音起点）
+         * 用于打断场景：一检测到说话就立即触发，不用等完整识别结果
+         */
+        fun onSpeechStarted() {}
+
+        /**
+         * 检测到用户停止说话（VAD语音终点）
+         * 用于打断场景：配合onSpeechStarted做语音持续确认，
+         * 避免短促的回声/爆音被误判为用户说话。
+         */
+        fun onSpeechStopped() {}
+
+        /**
          * 识别完成，返回最终结果
          */
         fun onResult(text: String) {}
@@ -77,12 +97,14 @@ class AsrManager private constructor(private val context: Context) {
     private lateinit var okHttpClient: OkHttpClient
     private var webSocket: WebSocket? = null
     private var audioRecord: AudioRecord? = null
-    private var audioExecutor = Executors.newSingleThreadExecutor()
-    private var isRecording = false
+    private var audioExecutor: ExecutorService? = null
+    @Volatile private var isRecording = false
     private var isWsConnected = false
     private var isSessionConfigured = false // 会话是否配置完成，配置完成后才发送音频
     private var isInitialized = false
     private var shouldTriggerExpression = true // 当前会话是否应该触发表情（语音唤醒模式为false）
+    @Volatile private var isBargeInSession = false // 当前会话是否为打断监听（Barge-in）模式
+    @Volatile var recordingStartTime = 0L // 麦克风实际开始录音的时间戳
     private var resultCallback: AsrResultCallback? = null
     // 识别超时处理：15秒无结果自动超时
     private val mainHandler = Handler(Looper.getMainLooper())
@@ -118,7 +140,7 @@ class AsrManager private constructor(private val context: Context) {
      * @param callback 识别结果回调
      * @param triggerExpression 是否触发识别中表情（语音唤醒模式传false，避免常驻显示识别中）
      */
-    fun startListening(callback: AsrResultCallback, triggerExpression: Boolean = true) {
+    fun startListening(callback: AsrResultCallback, triggerExpression: Boolean = true, bargeIn: Boolean = false) {
         if (!isInitialized) {
             callback.onError("ASR未初始化")
             return
@@ -136,6 +158,7 @@ class AsrManager private constructor(private val context: Context) {
         resultCallback = callback
         isSessionConfigured = false
         shouldTriggerExpression = triggerExpression
+        isBargeInSession = bargeIn
         if (triggerExpression) {
             ModuleStateManager.onAsrStartListening()
         }
@@ -204,8 +227,12 @@ class AsrManager private constructor(private val context: Context) {
                 })
                 add("turn_detection", JsonObject().apply {
                     addProperty("type", "server_vad")
-                    addProperty("threshold", 0.15) // 提高灵敏度，更容易检测到语音结束
-                    addProperty("silence_duration_ms", 500) // 500ms静音判定为说话结束，响应更快
+                    // Barge-in 打断监听使用更高的VAD阈值（0.65），降低灵敏度，
+                    // 防止TTS回声被误判为用户说话而触发打断。
+                    // 正常识别会话保持 0.5 标准阈值，保证正常语音识别灵敏度。
+                    val vadThreshold = if (isBargeInSession) 0.65f else 0.5f
+                    addProperty("threshold", vadThreshold)
+                    addProperty("silence_duration_ms", 1200) // 1.2秒静音才判定说话结束，给用户足够思考停顿时间
                 })
             })
         }
@@ -243,12 +270,18 @@ class AsrManager private constructor(private val context: Context) {
                 }
                 "input_audio_buffer.speech_started" -> {
                     Log.d(TAG, "Speech started")
+                    // 触发语音开始回调，用于打断场景
+                    // 安全调用：捕获AbstractMethodError，兼容旧的实现类（增量编译未重新生成）
+                    safeCallCallback { resultCallback?.onSpeechStarted() }
                     if (shouldTriggerExpression) {
                         ModuleStateManager.onAsrProcessing()
                     }
                 }
                 "input_audio_buffer.speech_stopped" -> {
                     Log.d(TAG, "Speech stopped")
+                    // 触发语音结束回调，用于打断场景的语音持续确认
+                    // 安全调用：捕获AbstractMethodError，兼容旧的实现类
+                    safeCallCallback { resultCallback?.onSpeechStopped() }
                 }
                 "conversation.item.input_audio_transcription.completed" -> {
                     // 识别完成，返回最终结果：transcript直接是结果字符串
@@ -269,7 +302,8 @@ class AsrManager private constructor(private val context: Context) {
                     val stash = json.get("stash")?.asString ?: ""
                     val partialText = (confirmed + stash).trim()
                     if (partialText.isNotEmpty()) {
-                        resultCallback?.onPartialResult(partialText)
+                        // 安全调用：onPartialResult是可选方法，有默认实现
+                        safeCallCallback { resultCallback?.onPartialResult(partialText) }
                     }
                 }
                 "conversation.item.input_audio_transcription.failed" -> {
@@ -319,7 +353,20 @@ class AsrManager private constructor(private val context: Context) {
             }
             val bufferSize = minBufferSize * Constants.AUDIO_BUFFER_SIZE_MULTIPLIER
 
-            audioRecord = AudioRecord(
+            // 优先使用 VOICE_RECOGNITION（系统自动回声消除AEC、噪声抑制NS）
+            // 部分机型不支持时自动降级为 MIC，避免闪退
+            audioRecord = try {
+                AudioRecord(
+                    MediaRecorder.AudioSource.VOICE_RECOGNITION,
+                    Constants.AUDIO_SAMPLE_RATE,
+                    Constants.AUDIO_CHANNEL_CONFIG,
+                    Constants.AUDIO_FORMAT,
+                    bufferSize
+                ).takeIf { it.state == AudioRecord.STATE_INITIALIZED }
+            } catch (e: Exception) {
+                Log.w(TAG, "VOICE_RECOGNITION not supported, fallback to MIC: ${e.message}")
+                null
+            } ?: AudioRecord(
                 MediaRecorder.AudioSource.MIC,
                 Constants.AUDIO_SAMPLE_RATE,
                 Constants.AUDIO_CHANNEL_CONFIG,
@@ -339,13 +386,17 @@ class AsrManager private constructor(private val context: Context) {
 
             audioRecord?.startRecording()
             isRecording = true
+            recordingStartTime = System.currentTimeMillis()
             Log.d(TAG, "Audio recording started, bufferSize=$bufferSize")
+            // 通知回调：麦克风实际开始录音（用于打断回声保护期）
+            // 安全调用：捕获AbstractMethodError，兼容旧的实现类
+            safeCallCallback { resultCallback?.onRecordingStarted() }
             // 启动15秒识别超时
             mainHandler.removeCallbacks(timeoutRunnable)
             mainHandler.postDelayed(timeoutRunnable, 15000)
 
             // 后台线程读取音频数据并发送
-            audioExecutor.execute {
+            ensureAudioExecutor().execute {
                 val buffer = ShortArray(bufferSize / 2) // 16bit = 2bytes per sample
                 while (isRecording && audioRecord != null) {
                     val readCount = audioRecord?.read(buffer, 0, buffer.size) ?: 0
@@ -419,8 +470,13 @@ class AsrManager private constructor(private val context: Context) {
         webSocket = null
         isWsConnected = false
         isSessionConfigured = false
+        // 先保存原来的值，再重置状态
+        val wasTriggeringExpression = shouldTriggerExpression
+        // 重置会话状态，避免影响下次识别
+        isBargeInSession = false
+        shouldTriggerExpression = true
         resultCallback = null
-        if (shouldTriggerExpression) {
+        if (wasTriggeringExpression) {
             ModuleStateManager.onAsrFinish()
         }
     }
@@ -433,6 +489,22 @@ class AsrManager private constructor(private val context: Context) {
     }
 
     /**
+     * 是否正在以打断监听（Barge-in）模式识别
+     */
+    fun isBargeInListening(): Boolean {
+        return isBargeInSession && isListening()
+    }
+
+    /**
+     * 仅停止打断监听会话（不影响正在进行的正常识别）
+     */
+    fun stopBargeInSession() {
+        if (isBargeInSession) {
+            stopListening()
+        }
+    }
+
+    /**
      * 释放资源
      */
     fun release() {
@@ -441,8 +513,37 @@ class AsrManager private constructor(private val context: Context) {
             okHttpClient.dispatcher.executorService.shutdown()
             okHttpClient.connectionPool.evictAll()
         }
-        audioExecutor.shutdownNow()
+        audioExecutor?.shutdownNow()
+        audioExecutor = null
         isInitialized = false
         Log.d(TAG, "AsrManager released")
+    }
+
+    /**
+     * 安全调用回调方法
+     * 捕获 AbstractMethodError/NoSuchMethodError，兼容增量编译导致的旧类文件问题
+     * （接口新增默认方法后，旧的实现类字节码中没有该方法，运行时会抛AbstractMethodError）
+     */
+    private inline fun safeCallCallback(action: () -> Unit) {
+        try {
+            action()
+        } catch (e: AbstractMethodError) {
+            Log.w(TAG, "Callback method not implemented (AbstractMethodError), ignored: ${e.message}")
+        } catch (e: NoSuchMethodError) {
+            Log.w(TAG, "Callback method not found (NoSuchMethodError), ignored: ${e.message}")
+        } catch (e: Exception) {
+            Log.e(TAG, "Callback invocation failed", e)
+        }
+    }
+
+    /**
+     * 确保 audioExecutor 可用（release 后可重建）
+     */
+    private fun ensureAudioExecutor(): ExecutorService {
+        return audioExecutor?.takeIf { !it.isShutdown } ?: synchronized(this) {
+            audioExecutor?.takeIf { !it.isShutdown } ?: Executors.newSingleThreadExecutor().also {
+                audioExecutor = it
+            }
+        }
     }
 }
