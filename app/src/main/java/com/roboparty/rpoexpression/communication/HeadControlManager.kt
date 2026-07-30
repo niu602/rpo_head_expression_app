@@ -298,7 +298,7 @@ class HeadControlManager private constructor() {
                     ))
                 }
                 message.command != null -> {
-                    Log.d(TAG, "Sent command: emotion=${message.command.emotion}, moveMode=${message.command.moveMode}, size=${protoBytes.size}B")
+                    Log.d(TAG, "Sent command: emotion=${message.command.emotion}, size=${protoBytes.size}B")
                 }
             }
         } catch (e: Exception) {
@@ -361,49 +361,87 @@ class HeadControlManager private constructor() {
     }
 
     // ========== 业务指令构建函数 ==========
+    // 设计说明：新协议中板端根据 emotion 自动查动作库执行对应动作，
+    // APP无需再单独指定 moveMode，动作细节（点头/摇头/低头等）由嵌入式封装。
 
     /**
-     * 构建并发送【疑惑情绪 + 摇头】指令
-     * 触发疑惑表情时调用，头部自动摇头
-     * 电机运动细节（角度、速度等）已由嵌入式封装，APP只需下发模式
-     *
-     * @return 是否发送成功
+     * 发送【开心】情绪指令 → 板端执行点头动作
      */
-    fun sendConfusionShake(): Boolean {
-        val cmd = HeadControlCmd.newBuilder()
-            .setEmotion(EmotionType.EMOTION_CONFUSION)
-            .setMoveMode(HeadMoveMode.MOVE_SHAKE)
-            .build()
-        return sendCommand(cmd)
-    }
-
-    /**
-     * 构建并发送【开心情绪 + 点头】指令
-     * 触发开心表情时调用，头部自动点头
-     *
-     * @return 是否已提交发送
-     */
-    fun sendHappyNod(): Boolean {
+    fun sendHappy(): Boolean {
         val cmd = HeadControlCmd.newBuilder()
             .setEmotion(EmotionType.EMOTION_HAPPY)
-            .setMoveMode(HeadMoveMode.MOVE_NOD)
             .build()
         return sendCommand(cmd)
     }
 
     /**
-     * 构建并发送【停止所有头部动作】指令
+     * 发送【疑惑】情绪指令 → 板端执行摇头动作
+     */
+    fun sendConfusion(): Boolean {
+        val cmd = HeadControlCmd.newBuilder()
+            .setEmotion(EmotionType.EMOTION_CONFUSION)
+            .build()
+        return sendCommand(cmd)
+    }
+
+    /**
+     * 发送【难过】情绪指令 → 板端执行低头动作
+     */
+    fun sendSad(): Boolean {
+        val cmd = HeadControlCmd.newBuilder()
+            .setEmotion(EmotionType.EMOTION_SAD)
+            .build()
+        return sendCommand(cmd)
+    }
+
+    /**
+     * 发送【生气】情绪指令 → 板端执行快摇动作
+     */
+    fun sendAngry(): Boolean {
+        val cmd = HeadControlCmd.newBuilder()
+            .setEmotion(EmotionType.EMOTION_ANGRY)
+            .build()
+        return sendCommand(cmd)
+    }
+
+    /**
+     * 发送【惊讶】情绪指令 → 板端执行抬头动作
+     */
+    fun sendSurprised(): Boolean {
+        val cmd = HeadControlCmd.newBuilder()
+            .setEmotion(EmotionType.EMOTION_SURPRISED)
+            .build()
+        return sendCommand(cmd)
+    }
+
+    /**
+     * 发送【害羞】情绪指令 → 板端执行低头偏头动作
+     */
+    fun sendShy(): Boolean {
+        val cmd = HeadControlCmd.newBuilder()
+            .setEmotion(EmotionType.EMOTION_SHY)
+            .build()
+        return sendCommand(cmd)
+    }
+
+    /**
+     * 发送【停止/回中】指令 → 板端停止所有动作，电机回中
      * 表情回到待机/切换其他表情时调用
-     *
-     * @return 是否发送成功
      */
     fun sendStop(): Boolean {
         val cmd = HeadControlCmd.newBuilder()
             .setEmotion(EmotionType.EMOTION_NONE)
-            .setMoveMode(HeadMoveMode.MOVE_NONE)
             .build()
         return sendCommand(cmd)
     }
+
+    // ========== 兼容旧方法名（避免大面积修改调用方） ==========
+
+    /** @deprecated 用 sendHappy() 替代，新协议自动映射点头 */
+    fun sendHappyNod(): Boolean = sendHappy()
+
+    /** @deprecated 用 sendConfusion() 替代，新协议自动映射摇头 */
+    fun sendConfusionShake(): Boolean = sendConfusion()
 
     // ========== 后台数据接收循环 ==========
 

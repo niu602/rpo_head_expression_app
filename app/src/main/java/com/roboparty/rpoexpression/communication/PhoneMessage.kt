@@ -96,22 +96,22 @@ data class PhoneMessage(
 
         /**
          * 手动解析 HeadControlCmd（复用ProtobufCodec.Reader）
+         * 新协议只有 emotion 一个字段，板端根据 emotion 自动映射动作
          */
         private fun parseHeadControlCmd(data: ByteArray): HeadControlCmd {
             val reader = ProtobufCodec.Reader(data)
             var emotion = EmotionType.EMOTION_NONE
-            var moveMode = HeadMoveMode.MOVE_NONE
 
             while (!reader.isAtEnd()) {
                 val (field, wireType) = reader.readTag()
                 when (field) {
                     1 -> emotion = EmotionType.fromValue(reader.readEnum())
-                    2 -> moveMode = HeadMoveMode.fromValue(reader.readEnum())
+                    // field 2 (moveMode) 已在新协议中移除，忽略旧数据保持兼容
                     else -> reader.skipField(wireType)
                 }
             }
 
-            return HeadControlCmd(emotion = emotion, moveMode = moveMode)
+            return HeadControlCmd(emotion = emotion)
         }
     }
 }

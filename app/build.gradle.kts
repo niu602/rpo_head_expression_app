@@ -97,6 +97,13 @@ dependencies {
     // ML Kit 人脸检测
     implementation("com.google.mlkit:face-detection:16.1.6")
 
+    // TensorFlow Lite 人脸识别（MobileFaceNet INT8量化模型）
+    implementation("org.tensorflow:tensorflow-lite:2.16.1")
+    implementation("org.tensorflow:tensorflow-lite-support:0.4.4")
+    implementation("org.tensorflow:tensorflow-lite-gpu-delegate-plugin:0.4.4")
+    implementation("org.tensorflow:tensorflow-lite-gpu:2.16.1")
+    implementation("org.tensorflow:tensorflow-lite-gpu-api:2.16.1")  // GpuDelegateFactory.Options 所在包
+
     // OkHttp 大模型网络请求
     implementation("com.squareup.okhttp3:okhttp:4.12.0")
 

@@ -20,6 +20,10 @@ import com.roboparty.rpoexpression.expression.ExpressionManager
 import com.roboparty.rpoexpression.expression.ExpressionType
 import com.roboparty.rpoexpression.integration.ExpressionControlReceiver
 import com.roboparty.rpoexpression.llm.LlmManager
+import com.roboparty.rpoexpression.recognition.FaceIdentifier
+import com.roboparty.rpoexpression.recognition.FaceProfile
+import com.roboparty.rpoexpression.recognition.FaceRegisterManager
+import com.roboparty.rpoexpression.recognition.FaceRecognitionResult
 import com.roboparty.rpoexpression.sensor.AmbientLightManager
 import com.roboparty.rpoexpression.sensor.BrightnessManager
 import com.roboparty.rpoexpression.sensor.ImuManager
@@ -28,6 +32,7 @@ import com.roboparty.rpoexpression.system.SystemStatusMonitor
 import com.roboparty.rpoexpression.util.Constants
 import android.content.Context
 import android.util.Log
+import com.roboparty.rpoexpression.vision.DebugVisionState
 import com.roboparty.rpoexpression.vision.VisionManager
 /**
  * Application入口
@@ -59,6 +64,14 @@ class RpoExpressionApp : Application() {
     lateinit var reminderClient: ReminderClient
         private set
     lateinit var headControlManager: HeadControlManager
+        private set
+    lateinit var faceRegisterManager: FaceRegisterManager
+        private set
+    lateinit var faceIdentifier: FaceIdentifier
+        private set
+    /** 最近一次识别到的人脸名字（null表示陌生人/未识别），供唤醒时选择欢迎语 */
+    @Volatile
+    var lastRecognizedName: String? = null
         private set
     private lateinit var expressionControlReceiver: ExpressionControlReceiver
 
@@ -170,6 +183,90 @@ class RpoExpressionApp : Application() {
             Log.e("RpoExpressionApp", "LlmManager init failed", e)
         }
 
+        // 初始化人脸识别模块（TFLite MobileFaceNet 192维）
+        try {
+            Log.i("RpoExpressionApp", "========== Initializing face recognition module ==========")
+            faceRegisterManager = FaceRegisterManager.getInstance(this)
+            faceIdentifier = FaceIdentifier(this, faceRegisterManager)
+
+            // 初始化FaceIdentifier（同步加载TFLite模型，确保模型就绪后再共享）
+            Log.i("RpoExpressionApp", "Initializing FaceIdentifier (loads TFLite model)...")
+            faceIdentifier.initialize()
+            // FaceRegisterManager共享同一个特征提取器，避免重复加载模型
+            // 此时模型已同步加载完成，extractor处于可用状态
+            faceRegisterManager.setFeatureExtractor(faceIdentifier.getFeatureExtractor())
+            faceRegisterManager.initialize()
+            Log.i("RpoExpressionApp", "FaceRegisterManager initialized")
+
+            // 连接VisionManager回调：人脸帧 → 识别/注册
+            visionManager.setRecognitionFrameCallback { faceBitmap, face, fullBitmap, srcWidth, srcHeight, rotation ->
+                // 注册中：收集样本
+                if (faceRegisterManager.isRegistering()) {
+                    faceRegisterManager.addSample(fullBitmap, face, srcWidth, srcHeight, rotation)
+                } else {
+                    // 空闲：尝试识别
+                    faceIdentifier.identifyAsync(fullBitmap, face, srcWidth, srcHeight, rotation)
+                }
+            }
+
+            // 识别结果回调
+            faceIdentifier.setRecognitionListener(object : FaceIdentifier.RecognitionListener {
+                override fun onRecognized(profile: FaceProfile, similarity: Float) {
+                    Log.i("RpoExpressionApp", "✅ Recognized: ${profile.name}, sim=%.3f".format(similarity))
+                    // 记住最近识别到的熟人名字，唤醒后用于欢迎语
+                    lastRecognizedName = profile.name
+                    // 认出熟人：开心表情
+                    expressionManager.requestExpression(ExpressionType.HAPPY, 1500)
+                    // 注入用户名到LLM长期记忆（去重）
+                    val memoryText = "用户的名字是${profile.name}，请自然地用名字称呼用户"
+                    if (!llmManager.getLongTermMemories().contains(memoryText)) {
+                        llmManager.addLongTermMemory(memoryText)
+                    }
+                    // 不在此处TTS播报，等待唤醒词后再说欢迎语
+                }
+
+                override fun onTentativeRecognition(profile: FaceProfile, similarity: Float) {
+                    Log.d("RpoExpressionApp", "🤔 Tentative: ${profile.name}, sim=%.3f".format(similarity))
+                    // 低置信度：疑惑表情，不叫名字
+                    expressionManager.requestExpression(ExpressionType.CONFUSED, 800)
+                }
+
+                override fun onStrangerDetected(maxSimilarity: Float) {
+                    Log.d("RpoExpressionApp", "❓ Stranger, maxSim=%.3f".format(maxSimilarity))
+                    // 陌生人：清除已识别名字，唤醒后用通用欢迎语
+                    lastRecognizedName = null
+                    // 陌生人：不做特殊表情，保持IDLE
+                }
+
+                override fun onFrameResult(result: FaceRecognitionResult) {
+                    // 调试可视化：转发每帧识别结果到DebugVisionState
+                    if (DebugVisionState.visible.value) {
+                        val (text, sim) = when (result) {
+                            is FaceRecognitionResult.Recognized ->
+                                "✅ ${result.profile.name}" to result.similarity
+                            is FaceRecognitionResult.Uncertain ->
+                                "🤔 ${result.bestMatch?.name ?: "?"}" to result.similarity
+                            is FaceRecognitionResult.Stranger ->
+                                "❓ 陌生人" to result.maxSimilarity
+                            is FaceRecognitionResult.Failed ->
+                                "⚠ ${result.reason}" to 0f
+                        }
+                        val quality = when (result) {
+                            is FaceRecognitionResult.Recognized -> "sim=%.3f".format(result.similarity)
+                            is FaceRecognitionResult.Uncertain -> "sim=%.3f".format(result.similarity)
+                            is FaceRecognitionResult.Stranger -> "maxSim=%.3f".format(result.maxSimilarity)
+                            else -> ""
+                        }
+                        DebugVisionState.updateRecognition(text, sim, quality)
+                    }
+                }
+            })
+
+            Log.d("RpoExpressionApp", "Face recognition initialized, ${faceRegisterManager.getRegisteredCount()} users registered")
+        } catch (e: Exception) {
+            Log.e("RpoExpressionApp", "Face recognition init failed", e)
+        }
+
         // 初始化系统状态监控器（电量、充电状态自动同步表情）
         try {
             systemStatusMonitor = SystemStatusMonitor.getInstance()
@@ -188,23 +285,40 @@ class RpoExpressionApp : Application() {
                 Constants.DEFAULT_MASTER_IP,
                 Constants.HEAD_CONTROL_PORT
             )
-            // 注册表情变化回调：疑惑表情触发头部循环摆头，其他表情停止头部动作
+            // 注册表情变化回调：表情切换时自动发送对应情绪指令给板端
+            // 板端根据 emotion 自动查动作库执行对应动作（点头/摇头/低头等）
             expressionManager.addExpressionChangeCallback { type ->
                 when (type) {
-                    ExpressionType.CONFUSED -> {
-                        // 疑惑表情：摇头
-                        headControlManager.sendConfusionShake()
-                    }
                     ExpressionType.HAPPY -> {
-                        // 开心表情：点头
-                        headControlManager.sendHappyNod()
+                        // 开心 → 点头
+                        headControlManager.sendHappy()
+                    }
+                    ExpressionType.CONFUSED -> {
+                        // 疑惑 → 摇头
+                        headControlManager.sendConfusion()
+                    }
+                    ExpressionType.SAD -> {
+                        // 难过 → 低头
+                        headControlManager.sendSad()
+                    }
+                    ExpressionType.ANGRY -> {
+                        // 生气 → 快摇
+                        headControlManager.sendAngry()
+                    }
+                    ExpressionType.SURPRISED -> {
+                        // 惊讶 → 抬头
+                        headControlManager.sendSurprised()
+                    }
+                    ExpressionType.SHY -> {
+                        // 害羞 → 低头偏头
+                        headControlManager.sendShy()
                     }
                     ExpressionType.IDLE, ExpressionType.BLINK -> {
-                        // 待机/眨眼：停止头部动作
+                        // 待机/眨眼 → 停止动作，电机回中
                         headControlManager.sendStop()
                     }
                     else -> {
-                        // 其他表情：默认停止摆头，保持情绪标识
+                        // 其他表情（思考/识别/说话/系统状态等）→ 默认停止摆头
                         headControlManager.sendStop()
                     }
                 }
@@ -277,6 +391,8 @@ class RpoExpressionApp : Application() {
         communicationManager.stop()
         reminderClient.stop()
         headControlManager.release()
+        faceIdentifier.release()
+        faceRegisterManager.release()
     }
 
     companion object {

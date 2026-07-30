@@ -6,18 +6,18 @@
 package com.roboparty.rpoexpression.communication
 
 /**
- * APP 下发给设备：头部控制总指令
- * 与嵌入式提供的简化版 head_control.proto 定义一致
+ * APP 下发给设备：头部控制指令
+ * 与嵌入式 head_control.proto 定义严格一致
  *
  * 字段编号对应：
- *   1: emotion (enum) — 情绪
- *   2: move_mode (enum) — 运动模式
+ *   1: emotion (enum) — 情绪类型，板端自动查动作库执行对应动作
  *
- * 说明：电机运动细节（角度、速度等）已由嵌入式封装，APP只需下发情绪和模式
+ * 设计说明：
+ * 电机运动细节（角度、速度、幅度等）已由嵌入式动作库封装，
+ * APP只需发送情绪类型，板端自动映射到对应动作序列。
  */
 data class HeadControlCmd(
-    val emotion: EmotionType = EmotionType.EMOTION_NONE,
-    val moveMode: HeadMoveMode = HeadMoveMode.MOVE_NONE
+    val emotion: EmotionType = EmotionType.EMOTION_NONE
 ) {
     /**
      * 序列化为 Protobuf 二进制数据
@@ -25,10 +25,8 @@ data class HeadControlCmd(
      */
     fun toByteArray(): ByteArray {
         val writer = ProtobufCodec.Writer()
-        // field 1: emotion (enum)
+        // field 1: emotion (enum, varint编码)
         writer.writeEnum(1, emotion.value)
-        // field 2: move_mode (enum)
-        writer.writeEnum(2, moveMode.value)
         return writer.toByteArray()
     }
 
@@ -41,14 +39,9 @@ data class HeadControlCmd(
 
     class Builder {
         private var emotion: EmotionType = EmotionType.EMOTION_NONE
-        private var moveMode: HeadMoveMode = HeadMoveMode.MOVE_NONE
 
         fun setEmotion(value: EmotionType) = apply { emotion = value }
-        fun setMoveMode(value: HeadMoveMode) = apply { moveMode = value }
 
-        fun build(): HeadControlCmd = HeadControlCmd(
-            emotion = emotion,
-            moveMode = moveMode
-        )
+        fun build(): HeadControlCmd = HeadControlCmd(emotion = emotion)
     }
 }

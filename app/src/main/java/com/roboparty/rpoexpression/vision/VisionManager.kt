@@ -17,7 +17,10 @@ import androidx.camera.core.Preview
 import androidx.camera.lifecycle.ProcessCameraProvider
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.LifecycleOwner
+import android.graphics.Bitmap
+import android.media.Image
 import com.google.mlkit.vision.common.InputImage
+import java.nio.ByteBuffer
 import com.google.mlkit.vision.face.Face
 import com.google.mlkit.vision.face.FaceDetection
 import com.google.mlkit.vision.face.FaceDetectorOptions
@@ -117,6 +120,9 @@ class VisionManager private constructor(private val context: Context) {
         private const val DISTANCE_REFERENCE_SIZE = 0.25f
         private const val DISTANCE_SMOOTH_FACTOR = 0.1f
 
+        // ========== 人脸识别降频 ==========
+        private const val RECOGNITION_FRAME_INTERVAL_MS = 500L  // 识别帧间隔500ms（约2fps），降低CPU
+
         // ========== 多人场景语音回复集 ==========
         private val MULTI_FACE_GREETINGS = arrayOf(
             "哇，好多人呀！",
@@ -188,6 +194,10 @@ class VisionManager private constructor(private val context: Context) {
     private var faceCountStableSince = 0L                   // 人脸数量稳定的起始时间
     private var lastSpokenMultiFaceTime = 0L                // 上次多人语音播报时间（避免重复播报）
 
+    // 人脸识别帧控制
+    private var lastRecognitionFrameTime = 0L               // 上次发送识别帧的时间
+    private var lastDebugFrameTime = 0L                     // 上次更新调试画面的时间
+
     // 模式过渡状态
     private var isTransitioning = false                     // 是否正在模式过渡中
     private var transitionStartTime = 0L                    // 过渡开始时间
@@ -239,9 +249,30 @@ class VisionManager private constructor(private val context: Context) {
          * 由上层（MainActivity）调用AudioManager播放，避免VisionManager直接依赖音频模块
          */
         fun onSpeakRequest(text: String) {}
+
+        /**
+         * 人脸识别帧回调（单人模式下，降频触发，约2fps）
+         * 传递裁剪好的人脸Bitmap和ML Kit Face对象，供上层人脸识别模块使用
+         *
+         * @param faceBitmap 裁剪后的人脸Bitmap（带20%margin）
+         * @param face ML Kit检测到的Face对象（含关键点）
+         * @param fullBitmap 完整帧Bitmap（供注册时多帧采样使用）
+         */
+        fun onFaceFrameForRecognition(faceBitmap: Bitmap, face: Face, fullBitmap: Bitmap) {}
     }
 
     private var stateCallback: VisionStateCallback? = null
+
+    // 人脸识别帧回调（独立于stateCallback，避免覆盖）
+    private var recognitionFrameCallback: ((faceBitmap: Bitmap, face: Face, fullBitmap: Bitmap, srcWidth: Int, srcHeight: Int, rotation: Int) -> Unit)? = null
+
+    /**
+     * 设置人脸识别帧回调
+     * 单人模式下约2fps触发，传递裁剪好的人脸Bitmap供识别模块使用
+     */
+    fun setRecognitionFrameCallback(callback: ((faceBitmap: Bitmap, face: Face, fullBitmap: Bitmap, srcWidth: Int, srcHeight: Int, rotation: Int) -> Unit)?) {
+        this.recognitionFrameCallback = callback
+    }
 
     // ML Kit人脸检测器：高精度模式
     private val faceDetector by lazy {
@@ -325,7 +356,8 @@ class VisionManager private constructor(private val context: Context) {
                 cameraProvider = provider
                 provider.unbindAll()
 
-                val preview = Preview.Builder().build()
+                // 注意：不需要Preview用例！我们自己从ImageAnalysis拿帧转Bitmap
+                // 如果绑定了Preview但不设置SurfaceProvider，会导致预览乱渲染到其他View上（比如眼睛里显示摄像头画面）
                 val imageAnalysis = ImageAnalysis.Builder()
                     .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
                     .build()
@@ -335,7 +367,7 @@ class VisionManager private constructor(private val context: Context) {
                         }
                     }
                 val cameraSelector = CameraSelector.DEFAULT_FRONT_CAMERA
-                provider.bindToLifecycle(lifecycleOwner, cameraSelector, preview, imageAnalysis)
+                provider.bindToLifecycle(lifecycleOwner, cameraSelector, imageAnalysis)
                 resetSleepTimer()
                 Log.d(TAG, "相机绑定成功")
             } catch (e: Exception) {
@@ -376,13 +408,119 @@ class VisionManager private constructor(private val context: Context) {
             .addOnSuccessListener { faces ->
                 // 第一步：过滤有效人脸（置信度+大小）
                 val validFaces = filterValidFaces(faces, imgW)
+                val now = System.currentTimeMillis()
+
+                // 判断这一帧是否需要转Bitmap（调试需要 或 识别需要）
+                val needDebugFrame = DebugVisionState.visible.value && (now - lastDebugFrameTime >= 100) // 调试10fps
+                val needRecognitionFrame = validFaces.size == 1 && (now - lastRecognitionFrameTime >= RECOGNITION_FRAME_INTERVAL_MS)
+                val needBitmap = needDebugFrame || needRecognitionFrame
+
+                // 如果需要转Bitmap，先在当前线程（Image还没close）快速拷贝NV21数据
+                // 这样即使后面imageProxy.close()了，我们还有数据，不会崩溃
+                var nv21Data: ByteArray? = null
+                var imgWidth = 0
+                var imgHeight = 0
+                if (needBitmap) {
+                    try {
+                        val yBuffer = mediaImage.planes[0].buffer
+                        val uBuffer = mediaImage.planes[1].buffer
+                        val vBuffer = mediaImage.planes[2].buffer
+                        val ySize = yBuffer.remaining()
+                        val uSize = uBuffer.remaining()
+                        val vSize = vBuffer.remaining()
+                        nv21Data = ByteArray(ySize + uSize + vSize)
+                        yBuffer.get(nv21Data, 0, ySize)
+                        vBuffer.get(nv21Data, ySize, vSize)
+                        uBuffer.get(nv21Data, ySize + vSize, uSize)
+                        imgWidth = mediaImage.width
+                        imgHeight = mediaImage.height
+                    } catch (e: Exception) {
+                        Log.e(TAG, "Copy NV21 data failed", e)
+                        nv21Data = null
+                    }
+                }
 
                 if (validFaces.isNotEmpty()) {
                     cancelFaceLostStayJob()
                     processFaces(validFaces, imgW, imgH)
+
+                    // 调试：更新人脸信息（不依赖Bitmap，直接更新）
+                    if (DebugVisionState.visible.value) {
+                        DebugVisionState.updateFaceInfo(validFaces, imgW, imgH)
+                    }
+
+                    // 如果需要转Bitmap，异步转（复用同一份NV21数据，只转一次）
+                    if (needBitmap && nv21Data != null) {
+                        if (needDebugFrame) lastDebugFrameTime = now
+                        if (needRecognitionFrame) lastRecognitionFrameTime = now
+                        val primaryFace = validFaces[0]
+                        val isSingleFace = validFaces.size == 1
+                        val wantRecognition = needRecognitionFrame && isSingleFace
+
+                        scope.launch {
+                            var fullBitmap: Bitmap? = null
+                            try {
+                                // 只转一次Bitmap，调试和识别复用
+                                fullBitmap = nv21ToBitmap(nv21Data, imgWidth, imgHeight, rotation)
+                            } catch (e: Exception) {
+                                Log.e(TAG, "NV21 to Bitmap failed", e)
+                            }
+
+                            if (fullBitmap != null && !fullBitmap.isRecycled) {
+                                // ========== Bitmap 所有权管理（修复竞态崩溃） ==========
+                                // 调试窗口和识别管线各自独立管理 Bitmap 生命周期，
+                                // 避免异步识别协程使用已被回收的 Bitmap 导致 Native 崩溃。
+                                val bitmapForRecognition: Bitmap? = if (wantRecognition) {
+                                    if (needDebugFrame) {
+                                        // 两者都需要：为识别创建独立副本，避免生命周期冲突
+                                        try {
+                                            fullBitmap.copy(Bitmap.Config.ARGB_8888, false)
+                                        } catch (e: Exception) {
+                                            Log.e(TAG, "Copy bitmap for recognition failed", e)
+                                            null
+                                        }
+                                    } else {
+                                        // 仅识别需要：直接移交所有权
+                                        fullBitmap
+                                    }
+                                } else null
+
+                                mainHandler.post {
+                                    // 1. 调试窗口（拥有 fullBitmap，自动管理回收）
+                                    if (needDebugFrame) {
+                                        DebugVisionState.updateFrame(
+                                            fullBitmap, validFaces.size,
+                                            srcWidth = imgWidth,
+                                            srcHeight = imgHeight,
+                                            rotationDegrees = rotation,
+                                            mirrorX = true
+                                        )
+                                    }
+
+                                    // 2. 识别回调（拥有 bitmapForRecognition，异步处理完成后回收）
+                                    if (bitmapForRecognition != null) {
+                                        recognitionFrameCallback?.invoke(bitmapForRecognition, primaryFace, bitmapForRecognition, imgWidth, imgHeight, rotation)
+                                    }
+
+                                    // 3. 不需要调试时回收fullBitmap
+                                    if (!needDebugFrame && bitmapForRecognition == null && !fullBitmap.isRecycled) {
+                                        fullBitmap.recycle()
+                                    }
+                                }
+                            }
+
+                            // 更新节流时间（必须在处理完帧后更新，否则节流失效）
+                            if (needDebugFrame) lastDebugFrameTime = now
+                            if (needRecognitionFrame) lastRecognitionFrameTime = now
+                        }
+                    }
                 } else {
                     handleFaceAbsent()
                     sendMotorCommand(0f, 0f, 0f)
+                    // 调试：无人脸时只更新人脸信息，不清空画面（避免闪烁"无画面"）
+                    if (DebugVisionState.visible.value) {
+                        DebugVisionState.updateFaceInfo(emptyList(), imgW, imgH)
+                    }
                 }
             }
             .addOnFailureListener {
@@ -1027,4 +1165,165 @@ class VisionManager private constructor(private val context: Context) {
         faceDetector.close()
         stateCallback = null
     }
+
+    // ========== 人脸识别辅助方法 ==========
+
+    /**
+     * 将Camera2 YUV_420_888 Image转换为Bitmap（处理旋转+前置镜像）
+     * 使用YuvImage转JPEG再decode，兼容性最好
+     */
+    /**
+     * 裁剪人脸区域Bitmap（带20%margin）
+     * 自动处理坐标旋转+镜像转换
+     */
+    private fun cropFaceBitmap(
+        fullImage: Bitmap,
+        face: Face,
+        srcWidth: Int,
+        srcHeight: Int,
+        rotationDegrees: Int,
+        mirrorX: Boolean
+    ): Bitmap? {
+        return try {
+            if (fullImage.isRecycled || fullImage.width == 0 || fullImage.height == 0) {
+                return null
+            }
+
+            // 坐标转换：原始帧坐标 → 旋转+镜像后Bitmap坐标
+            fun transformPoint(x: Float, y: Float): Pair<Float, Float> {
+                var px = x
+                var py = y
+                when (rotationDegrees) {
+                    90 -> {
+                        val newX = py
+                        val newY = srcWidth - px
+                        px = newX
+                        py = newY
+                    }
+                    180 -> {
+                        px = srcWidth - px
+                        py = srcHeight - py
+                    }
+                    270 -> {
+                        val newX = srcHeight - py
+                        val newY = px
+                        px = newX
+                        py = newY
+                    }
+                }
+                if (mirrorX) {
+                    val dstW = if (rotationDegrees == 90 || rotationDegrees == 270) srcHeight else srcWidth
+                    px = dstW - px
+                }
+                return Pair(px, py)
+            }
+
+            val box = face.boundingBox
+            // 转换四个角的坐标
+            val (l, t) = transformPoint(box.left.toFloat(), box.top.toFloat())
+            val (r, b) = transformPoint(box.right.toFloat(), box.bottom.toFloat())
+            val left = minOf(l, r)
+            val top = minOf(t, b)
+            val right = maxOf(l, r)
+            val bottom = maxOf(t, b)
+
+            val marginX = ((right - left) * 0.2f)
+            val marginY = ((bottom - top) * 0.2f)
+
+            val cropLeft = (left - marginX).toInt().coerceAtLeast(0)
+            val cropTop = (top - marginY).toInt().coerceAtLeast(0)
+            val cropRight = (right + marginX).toInt().coerceAtMost(fullImage.width)
+            val cropBottom = (bottom + marginY).toInt().coerceAtMost(fullImage.height)
+
+            val width = cropRight - cropLeft
+            val height = cropBottom - cropTop
+            if (width <= 0 || height <= 0) null
+            else Bitmap.createBitmap(fullImage, cropLeft, cropTop, width, height)
+        } catch (e: Exception) {
+            Log.e(TAG, "Crop face bitmap failed", e)
+            null
+        }
+    }
+
+    /**
+     * 从NV21字节数组转Bitmap（带旋转+前置镜像）
+     * 不依赖Image对象生命周期，可以在imageProxy.close()之后安全调用
+     */
+    private fun nv21ToBitmap(nv21: ByteArray, width: Int, height: Int, rotationDegrees: Int): Bitmap? {
+        return try {
+            // NV21 -> JPEG -> Bitmap
+            val yuvImage = android.graphics.YuvImage(
+                nv21,
+                android.graphics.ImageFormat.NV21,
+                width,
+                height,
+                null
+            )
+            val out = java.io.ByteArrayOutputStream()
+            yuvImage.compressToJpeg(android.graphics.Rect(0, 0, width, height), 85, out)
+            val jpegBytes = out.toByteArray()
+            var bitmap = android.graphics.BitmapFactory.decodeByteArray(jpegBytes, 0, jpegBytes.size)
+
+            // 处理旋转+前置镜像
+            val matrix = android.graphics.Matrix()
+            matrix.postRotate(rotationDegrees.toFloat())
+            matrix.postScale(-1f, 1f, bitmap.width / 2f, bitmap.height / 2f)
+
+            val rotatedBitmap = Bitmap.createBitmap(bitmap, 0, 0, bitmap.width, bitmap.height, matrix, true)
+            if (rotatedBitmap != bitmap) {
+                bitmap.recycle()
+            }
+            rotatedBitmap
+        } catch (e: Exception) {
+            Log.e(TAG, "NV21 to Bitmap failed", e)
+            null
+        }
+    }
+
+    private fun Image.toBitmap(rotationDegrees: Int): Bitmap? {
+        return try {
+            // YUV_420_888 -> NV21 byte array
+            val yBuffer = planes[0].buffer
+            val uBuffer = planes[1].buffer
+            val vBuffer = planes[2].buffer
+
+            val ySize = yBuffer.remaining()
+            val uSize = uBuffer.remaining()
+            val vSize = vBuffer.remaining()
+
+            val nv21 = ByteArray(ySize + uSize + vSize)
+            yBuffer.get(nv21, 0, ySize)
+            // NV21: V在前U在后
+            vBuffer.get(nv21, ySize, vSize)
+            uBuffer.get(nv21, ySize + vSize, uSize)
+
+            // YUV -> JPEG -> Bitmap
+            val yuvImage = android.graphics.YuvImage(
+                nv21,
+                android.graphics.ImageFormat.NV21,
+                width,
+                height,
+                null
+            )
+            val out = java.io.ByteArrayOutputStream()
+            yuvImage.compressToJpeg(android.graphics.Rect(0, 0, width, height), 90, out)
+            val jpegBytes = out.toByteArray()
+            var bitmap = android.graphics.BitmapFactory.decodeByteArray(jpegBytes, 0, jpegBytes.size)
+
+            // 处理旋转+前置镜像
+            val matrix = android.graphics.Matrix()
+            matrix.postRotate(rotationDegrees.toFloat())
+            matrix.postScale(-1f, 1f, bitmap.width / 2f, bitmap.height / 2f)
+
+            val rotatedBitmap = Bitmap.createBitmap(bitmap, 0, 0, bitmap.width, bitmap.height, matrix, true)
+            if (rotatedBitmap != bitmap) {
+                bitmap.recycle()
+            }
+            rotatedBitmap
+        } catch (e: Exception) {
+            Log.e(TAG, "Image to Bitmap failed", e)
+            null
+        }
+    }
+
 }

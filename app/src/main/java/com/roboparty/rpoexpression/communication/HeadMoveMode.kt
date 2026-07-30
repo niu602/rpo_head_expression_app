@@ -7,8 +7,11 @@ package com.roboparty.rpoexpression.communication
 
 /**
  * 头部运动模式枚举
- * 与嵌入式提供的简化版 head_control.proto 定义一致
+ *
+ * @deprecated 新协议（v2）已移除 move_mode 字段，板端根据 emotion 自动映射动作。
+ * 保留此文件仅为兼容旧代码引用，新代码请直接使用 EmotionType。
  */
+@Deprecated("新协议已移除move_mode，板端根据emotion自动映射动作", ReplaceWith("EmotionType"))
 enum class HeadMoveMode(val value: Int) {
     MOVE_NONE(0),   // 停止所有头部动作
     MOVE_SHAKE(1),  // 摇头（疑惑时触发）
