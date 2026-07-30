@@ -36,6 +36,7 @@ class AudioManager private constructor(private val context: Context) {
 
     private val asrManager: AsrManager by lazy { AsrManager.getInstance(context) }
     private val ttsManager: TtsManager by lazy { TtsManager.getInstance(context) }
+    private val kwsManager: KwsManager by lazy { KwsManager.getInstance(context) }
 
     // ========== 打断（Barge-in）功能 ==========
     var bargeInEnabled = true          // 是否启用语音打断：TTS播报时用户说话自动停止播报
@@ -71,12 +72,10 @@ class AudioManager private constructor(private val context: Context) {
     }
 
     /**
-     * 初始化音频模块（ASR + TTS 并行启动）
+     * 初始化音频模块（ASR + TTS + KWS 并行启动）
      *
-     * ASR和TTS互不依赖，使用协程async同时初始化，
-     * 耗时从 t_asr + t_tts 降低到 max(t_asr, t_tts)。
-     * - ASR：OkHttpClient构建，跑在IO线程
-     * - TTS：TextToSpeech绑定，本身已post到主线程
+     * ASR/TTS/KWS互不依赖，使用协程async同时初始化，
+     * 耗时从串行初始化降低到 max(t_asr, t_tts, t_kws)。
      */
     fun init() {
         scope.launch {
@@ -94,11 +93,66 @@ class AudioManager private constructor(private val context: Context) {
                     Log.e(TAG, "TTS init failed", e)
                 }
             }
+            val kwsDeferred = async(Dispatchers.IO) {
+                try {
+                    kwsManager.init()
+                } catch (e: Exception) {
+                    Log.e(TAG, "KWS init failed", e)
+                }
+            }
             asrDeferred.await()
             ttsDeferred.await()
-            Log.d(TAG, "AudioManager initialized (ASR + TTS parallel)")
+            kwsDeferred.await()
+            Log.d(TAG, "AudioManager initialized (ASR + TTS + KWS parallel)")
         }
     }
+
+    // ========== KWS 关键词唤醒 ==========
+
+    /**
+     * 开始KWS关键词唤醒监听（DORMANT状态）
+     *
+     * 互斥规则：
+     * 1. 先停止ASR（如果正在运行）
+     * 2. 等200ms确保AudioRecord完全释放
+     * 3. 启动KWS独立录音通道
+     *
+     * @param callback KWS检测回调
+     */
+    fun startKwsListening(callback: KwsManager.KwsCallback) {
+        scope.launch {
+            try {
+                // 停止ASR，释放录音通道
+                if (asrManager.isListening()) {
+                    asrManager.stopListening()
+                }
+                // 200ms安全间隔，确保AudioRecord完全释放
+                // （部分机型AudioRecord释放有延迟，不等待会导致KWS初始化失败）
+                delay(200)
+                @Suppress("MissingPermission")
+                kwsManager.start(callback)
+                Log.d(TAG, "KWS listening started")
+            } catch (e: Exception) {
+                Log.e(TAG, "Start KWS listening failed", e)
+                mainHandler.post { callback.onError("KWS启动失败: ${e.message}") }
+            }
+        }
+    }
+
+    /**
+     * 停止KWS关键词唤醒监听
+     *
+     * 停止后等200ms再启动ASR，确保录音通道完全释放
+     */
+    fun stopKwsListening() {
+        kwsManager.stop()
+        Log.d(TAG, "KWS listening stopped")
+    }
+
+    /**
+     * KWS是否正在监听
+     */
+    fun isKwsListening(): Boolean = kwsManager.isRunning()
 
     /**
      * 开始ASR语音识别
@@ -112,6 +166,10 @@ class AudioManager private constructor(private val context: Context) {
         // 如果正在播报，先停止
         if (ttsManager.isSpeaking()) {
             ttsManager.stop()
+        }
+        // 启动ASR前先停止KWS，释放录音通道
+        if (kwsManager.isRunning()) {
+            kwsManager.stop()
         }
         asrManager.startListening(callback, triggerExpression)
     }
@@ -144,10 +202,11 @@ class AudioManager private constructor(private val context: Context) {
             asrManager.stopListening()
         }
 
-        // 包装回调：TTS结束时同时触发全局 speakFinishListener
+        // 包装回调：TTS开始时mute KWS防止回声，结束时unmute
         val wrappedCallback = object : TtsManager.TtsStateCallback {
             override fun onStart() {
                 Log.d(TAG, "TTS actual start, barge-in guard will begin when mic starts")
+                kwsManager.setMuted(true)  // TTS开始，KWS静音防回声
                 callback?.onStart()
                 // 打断模式：TTS开始后启动后台静默ASR监听，用于检测用户打断
                 if (bargeInEnabled && !asrManager.isListening()) {
@@ -155,6 +214,7 @@ class AudioManager private constructor(private val context: Context) {
                 }
             }
             override fun onDone() {
+                kwsManager.setMuted(false)  // TTS结束，KWS解除静音
                 stopBargeInListen()
                 callback?.onDone()
                 // 打断/取消导致的stop不走speakFinish，避免双重启动ASR
@@ -165,6 +225,7 @@ class AudioManager private constructor(private val context: Context) {
                 }
             }
             override fun onError(errorCode: Int) {
+                kwsManager.setMuted(false)  // TTS出错也解除静音
                 stopBargeInListen()
                 callback?.onError(errorCode)
                 if (!suppressSpeakFinish) {
@@ -205,12 +266,14 @@ class AudioManager private constructor(private val context: Context) {
         val wrappedCallback = object : TtsManager.TtsStateCallback {
             override fun onStart() {
                 Log.d(TAG, "TTS stream start, barge-in guard will begin when mic starts")
+                kwsManager.setMuted(true)  // TTS开始，KWS静音防回声
                 callback?.onStart()
                 if (bargeInEnabled && !asrManager.isListening()) {
                     startBargeInListen()
                 }
             }
             override fun onDone() {
+                kwsManager.setMuted(false)  // TTS结束，KWS解除静音
                 stopBargeInListen()
                 callback?.onDone()
                 if (!suppressSpeakFinish) {
@@ -220,6 +283,7 @@ class AudioManager private constructor(private val context: Context) {
                 }
             }
             override fun onError(errorCode: Int) {
+                kwsManager.setMuted(false)  // TTS出错也解除静音
                 stopBargeInListen()
                 callback?.onError(errorCode)
                 if (!suppressSpeakFinish) {
@@ -499,6 +563,7 @@ class AudioManager private constructor(private val context: Context) {
     fun stopSpeaking() {
         stopBargeInListen()
         suppressSpeakFinish = true
+        kwsManager.setMuted(false)  // 停止TTS时解除KWS静音
         ttsManager.stop()
     }
 
@@ -531,6 +596,7 @@ class AudioManager private constructor(private val context: Context) {
         scope.cancel()
         asrManager.release()
         ttsManager.release()
+        kwsManager.release()
         Log.d(TAG, "AudioManager released")
     }
 

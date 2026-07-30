@@ -159,9 +159,8 @@ class AsrManager private constructor(private val context: Context) {
         isSessionConfigured = false
         shouldTriggerExpression = triggerExpression
         isBargeInSession = bargeIn
-        if (triggerExpression) {
-            ModuleStateManager.onAsrStartListening()
-        }
+        // 注意：识别中表情不在这触发，而是在真正开始录音时（startAudioRecording）触发
+        // 避免WebSocket连接还没建立就显示表情，用户以为可以说话了但麦克风还没准备好
         Log.d(TAG, "Start ASR listening, triggerExpression=$triggerExpression, connecting WebSocket...")
 
         // 建立WebSocket连接
@@ -388,6 +387,13 @@ class AsrManager private constructor(private val context: Context) {
             isRecording = true
             recordingStartTime = System.currentTimeMillis()
             Log.d(TAG, "Audio recording started, bufferSize=$bufferSize")
+
+            // 真正开始录音了，才显示"正在听"表情（瞳孔放大）
+            // 之前在startListening()里就显示会导致：WebSocket还在连接中，用户看到表情就说话，但麦克风还没准备好
+            if (shouldTriggerExpression) {
+                ModuleStateManager.onAsrStartListening()
+            }
+
             // 通知回调：麦克风实际开始录音（用于打断回声保护期）
             // 安全调用：捕获AbstractMethodError，兼容旧的实现类
             safeCallCallback { resultCallback?.onRecordingStarted() }

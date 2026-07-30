@@ -40,7 +40,7 @@ object Constants {
     val QWEN_LLM_API_KEY: String get() = BuildConfig.QWEN_LLM_API_KEY
     // LLM配置：ali-qwen3.6-plus
     const val QWEN_LLM_BASE_URL = "https://ai-gateway.roboparty.com/v1"
-    const val QWEN_LLM_MODEL = "ali-qwen3.6-plus"
+    const val QWEN_LLM_MODEL = "ali-qwen3.6-flash"
     const val QWEN_LLM_CHAT_ENDPOINT = "/chat/completions"
     // ASR配置：qwen3-asr-flash-realtime 实时语音识别（阿里云官方地址）
     const val QWEN_ASR_MODEL = "qwen3-asr-flash-realtime"
