@@ -147,8 +147,6 @@ private fun mapMainStateText(
             when (linkType) {
                 CommLink.LinkType.LINK_TCP -> "TCP已连"
                 CommLink.LinkType.LINK_UDP -> "UDP已连"
-                CommLink.LinkType.LINK_USB_SERIAL -> "USB已连"
-                CommLink.LinkType.LINK_BLE -> "蓝牙已连"
                 CommLink.LinkType.LINK_UNKNOWN -> "已连接"
             }
         }

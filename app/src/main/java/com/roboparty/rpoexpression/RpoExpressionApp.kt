@@ -14,7 +14,6 @@ import kotlinx.coroutines.launch
 import com.roboparty.rpoexpression.audio.AudioManager
 import com.roboparty.rpoexpression.communication.CommunicationManager
 import com.roboparty.rpoexpression.communication.HeadControlManager
-import com.roboparty.rpoexpression.communication.ReminderClient
 import com.roboparty.rpoexpression.expression.DemoSequenceManager
 import com.roboparty.rpoexpression.expression.ExpressionManager
 import com.roboparty.rpoexpression.expression.ExpressionType
@@ -61,8 +60,6 @@ class RpoExpressionApp : Application() {
         private set
     lateinit var systemStatusMonitor: SystemStatusMonitor
         private set
-    lateinit var reminderClient: ReminderClient
-        private set
     lateinit var headControlManager: HeadControlManager
         private set
     lateinit var faceRegisterManager: FaceRegisterManager
@@ -85,8 +82,6 @@ class RpoExpressionApp : Application() {
         // 初始化核心管理器
         expressionManager = ExpressionManager.getInstance()
         communicationManager = CommunicationManager.getInstance()
-        reminderClient = ReminderClient.getInstance()
-        reminderClient.start()
         try {
             brightnessManager = BrightnessManager.getInstance(this)
         } catch (e: Exception) {
@@ -215,8 +210,8 @@ class RpoExpressionApp : Application() {
                     Log.i("RpoExpressionApp", "✅ Recognized: ${profile.name}, sim=%.3f".format(similarity))
                     // 记住最近识别到的熟人名字，唤醒后用于欢迎语
                     lastRecognizedName = profile.name
-                    // 认出熟人：开心表情
-                    expressionManager.requestExpression(ExpressionType.HAPPY, 1500)
+//                    // 认出熟人：开心表情
+//                    expressionManager.requestExpression(ExpressionType.HAPPY, 1500)
                     // 注入用户名到LLM长期记忆（去重）
                     val memoryText = "用户的名字是${profile.name}，请自然地用名字称呼用户"
                     if (!llmManager.getLongTermMemories().contains(memoryText)) {
@@ -389,7 +384,6 @@ class RpoExpressionApp : Application() {
         ambientLightManager.stop()
         imuManager.stop()
         communicationManager.stop()
-        reminderClient.stop()
         headControlManager.release()
         faceIdentifier.release()
         faceRegisterManager.release()

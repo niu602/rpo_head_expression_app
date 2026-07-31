@@ -35,8 +35,8 @@ data class ExpressionConfig(
  */
 data class FaceDetectionConfig(
     // 微笑检测
-    val smileThreshold: Float = 0.85f,
-    val smileFrameCount: Int = 5,
+    val smileThreshold: Float = 0.95f,
+    val smileFrameCount: Int = 8,
     val smileCooldownMs: Long = 2500L,
     // 眨眼检测
     val eyeClosedThreshold: Float = 0.4f,

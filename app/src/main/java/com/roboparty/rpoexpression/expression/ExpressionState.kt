@@ -77,11 +77,10 @@ data class ExpressionState(
         val smoothedPupilX = manager.updateSmoothedPupilX(targetPupilX)
         val smoothedPupilY = manager.updateSmoothedPupilY(targetPupilY)
 
-        // 应用眨眼叠加、IMU临时偏移、视觉模仿
+        // 应用眨眼叠加、IMU临时偏移
         val blinkOverlay = manager.blinkProgress
         val tempEyelidOffset = manager.tempEyelidOffset
-        val mimicEyelid = manager.mimicEyelidOpenness
-        val finalEyelidOpenness = ((finalParams.eyelidOpenness * (1f - blinkOverlay) + tempEyelidOffset) * mimicEyelid)
+        val finalEyelidOpenness = (finalParams.eyelidOpenness * (1f - blinkOverlay) + tempEyelidOffset)
             .coerceIn(0f, 1f)
 
         // 距离感知瞳孔缩放
@@ -138,6 +137,58 @@ data class ExpressionState(
             glowIntensity = finalGlowPowerOff.coerceIn(0f, 1f),
             glowBlink = genderOverlay.glowBlink
         )
+    }
+
+    /**
+     * 获取应用了强度、过渡的能量场参数（能量面部模式）
+     *
+     * 逻辑与 [getEyeParameters] 完全对称：
+     * 1. 从 EnergyFieldParameterMapper 取 base params（IDLE）和 target params（当前表情）
+     * 2. 应用弹性缓动过渡插值
+     * 3. 应用 intensity 强度缩放
+     * 4. 应用视线跟踪/微动作到焦点位置
+     * 5. 应用关机/长按 overlay
+     */
+    fun getEnergyFieldParameters(): EnergyFieldParameters {
+        val baseParams = EnergyFieldParameterMapper.map(ExpressionType.IDLE)
+        val targetParams = EnergyFieldParameterMapper.map(type)
+
+        // 表情切换使用弹性缓动（复用 EyeParameters 的缓动函数）
+        val easedProgress = EyeParameters.elasticEasing(transitionProgress)
+        val transitionedParams = baseParams.lerp(targetParams, easedProgress)
+
+        // 应用 intensity 强度缩放
+        val intensityT = (intensity / 100f).coerceIn(0f, 1f)
+        var finalParams = baseParams.lerp(transitionedParams, intensityT)
+
+        val manager = ExpressionManager.getInstance()
+
+        // 视线跟踪 / 微动作 / 触摸 → 映射到能量焦点位置
+        // 系数提升到0.5，让焦点跟随更明显
+        val gazeX = finalParams.corePositionX +
+                manager.pupilOffsetX * 0.5f +
+                manager.microPupilOffsetX * 0.5f +
+                manager.tempPupilShakeX * 0.5f +
+                manager.touchPupilOffsetX
+        val gazeY = finalParams.corePositionY +
+                manager.pupilOffsetY * 0.5f +
+                manager.microPupilOffsetY * 0.5f +
+                manager.touchPupilOffsetY
+
+        // 关机/长按 overlay：缩放焦点亮度和大小
+        val powerOffOverlay = manager.getPowerOffOverlay()
+        val longPressOverlay = manager.getLongPressOverlay()
+        val powerScale = powerOffOverlay.eyelidOpenness *
+                (1f - longPressOverlay.eyelidOpenness.coerceIn(0f, 1f) * 0.3f)
+
+        finalParams = finalParams.copy(
+            corePositionX = gazeX.coerceIn(-1f, 1f),
+            corePositionY = gazeY.coerceIn(-1f, 1f),
+            coreBrightness = (finalParams.coreBrightness * powerScale).coerceIn(0f, 1f),
+            coreSize = (finalParams.coreSize * powerScale).coerceIn(0f, 1f)
+        )
+
+        return finalParams
     }
 }
 

@@ -65,7 +65,6 @@ class ExpressionManager private constructor() {
     internal var tempPupilOffsetY = 0f
     internal var smoothedPupilX = 0f
     internal var smoothedPupilY = 0f
-    var mimicEyelidOpenness = 1f
     internal var distancePupilScale = 1f
 
     // ==================== 眼内特效状态 ====================
@@ -91,6 +90,10 @@ class ExpressionManager private constructor() {
     )
     val expressionState: StateFlow<ExpressionState> = _expressionState.asStateFlow()
 
+    // ==================== 表情渲染模式 ====================
+    private val _currentMode = MutableStateFlow(ExpressionMode.TRADITIONAL)
+    val currentMode: StateFlow<ExpressionMode> = _currentMode.asStateFlow()
+
     // 眼内特效状态
 
     enum class IdleBatteryState {
@@ -106,9 +109,12 @@ class ExpressionManager private constructor() {
     private var managerJob: Job? = null
     internal val scope = CoroutineScope(Dispatchers.Default + SupervisorJob())
 
-    // 瞳孔偏移
-    var pupilOffsetX = 0f
-    var pupilOffsetY = 0f
+    // 瞳孔偏移（低通滤波后的最终值，每帧渲染读取）
+    @Volatile var pupilOffsetX = 0f
+    @Volatile var pupilOffsetY = 0f
+    // 瞳孔目标值（原始输入，低通滤波源）
+    private var pupilTargetX = 0f
+    private var pupilTargetY = 0f
     
     internal var tempPupilShakeX = 0f
     internal var tempEyelidOffset = 0f
@@ -147,6 +153,33 @@ class ExpressionManager private constructor() {
     fun getCurrentStyle(): ExpressionStyle = currentStyle
     fun isPoweredOff(): Boolean = isPoweredOff
     fun isGenderSwitching(): Boolean = isGenderSwitching
+
+    /**
+     * 获取当前渲染模式
+     */
+    fun getCurrentMode(): ExpressionMode = _currentMode.value
+
+    /**
+     * 切换渲染模式（传统眼部 / 能量面部）
+     * 线程安全：通过 StateFlow 原子更新，UI 层通过 collectAsState 自动响应
+     */
+    fun setMode(mode: ExpressionMode) {
+        if (_currentMode.value == mode) return
+        _currentMode.value = mode
+        Log.i(TAG, "Expression mode switched to: $mode")
+    }
+
+    /**
+     * 快捷切换：传统 ↔ 能量
+     */
+    fun toggleMode() {
+        val newMode = if (_currentMode.value == ExpressionMode.TRADITIONAL) {
+            ExpressionMode.ENERGY
+        } else {
+            ExpressionMode.TRADITIONAL
+        }
+        setMode(newMode)
+    }
 
     fun getBlinkOverlay(): EyeParameters = EyeParameters(eyelidOpenness = 1f - blinkProgress, blinkProgress = blinkProgress)
     fun getGenderSwitchOverlay(): EyeParameters = genderSwitchOverlay
@@ -199,8 +232,19 @@ class ExpressionManager private constructor() {
         longPressOverlay = EyeParameters()
     }
     fun setPupilOffset(x: Float, y: Float) {
-        pupilOffsetX = x.coerceIn(-1f, 1f)
-        pupilOffsetY = y.coerceIn(-1f, 1f)
+        // 仅设置目标值，实际低通滤波在 updatePupilSmoothing() 中每帧执行一次
+        // 避免同一帧多次调用导致滤波系数叠加（VisionManager + MainActivity 回调重复调用）
+        pupilTargetX = x.coerceIn(-1f, 1f)
+        pupilTargetY = y.coerceIn(-1f, 1f)
+    }
+
+    /**
+     * 每帧调用一次的低通滤波，将 pupilOffset 平滑逼近 pupilTarget
+     * 由状态更新循环统一调用，确保每帧只滤波一次
+     */
+    internal fun updatePupilSmoothing() {
+        pupilOffsetX += (pupilTargetX - pupilOffsetX) * 0.3f
+        pupilOffsetY += (pupilTargetY - pupilOffsetY) * 0.3f
     }
     fun setPupilScale(scale: Float) {
         distancePupilScale = scale.coerceIn(0.5f, 1.2f)
@@ -541,6 +585,8 @@ class ExpressionManager private constructor() {
                 _expressionState.value = _expressionState.value.updateProgress(200L)
                 val currentFrame = _expressionState.value.animFrame + 1
                 _expressionState.value = _expressionState.value.copy(animFrame = currentFrame)
+                // 每帧执行一次瞳孔低通滤波（统一入口，避免同一帧多次滤波）
+                updatePupilSmoothing()
             }
         }
         // 启动微动画层（呼吸缩放、说话晃动）
@@ -556,14 +602,14 @@ class ExpressionManager private constructor() {
                 val targetX = Random.nextFloat() * 0.3f - 0.15f
                 val targetY = Random.nextFloat() * 0.2f - 0.1f
                 val duration = 500L
-                val startX = pupilOffsetX
-                val startY = pupilOffsetY
+                val startX = pupilTargetX
+                val startY = pupilTargetY
                 val start = System.currentTimeMillis()
                 var elapsed = 0L
                 while (elapsed < duration && isActive && _expressionState.value.type == ExpressionType.IDLE) {
                     val t = (elapsed.toFloat() / duration).coerceIn(0f, 1f)
-                    pupilOffsetX = startX + (targetX - startX) * t
-                    pupilOffsetY = startY + (targetY - startY) * t
+                    pupilTargetX = startX + (targetX - startX) * t
+                    pupilTargetY = startY + (targetY - startY) * t
                     delay(16L)
                     elapsed = System.currentTimeMillis() - start
                 }
@@ -573,19 +619,16 @@ class ExpressionManager private constructor() {
                 elapsed = 0L
                 while (elapsed < duration && isActive && _expressionState.value.type == ExpressionType.IDLE) {
                     val t = (elapsed.toFloat() / duration).coerceIn(0f, 1f)
-                    pupilOffsetX = targetX + (0f - targetX) * t
-                    pupilOffsetY = targetY + (0f - targetY) * t
+                    pupilTargetX = targetX + (0f - targetX) * t
+                    pupilTargetY = targetY + (0f - targetY) * t
                     delay(16L)
                     elapsed = System.currentTimeMillis() - backStart
                 }
-                pupilOffsetX = 0f
-                pupilOffsetY = 0f
+                pupilTargetX = 0f
+                pupilTargetY = 0f
             }
         }
     }
-    /**
-     * 启动Demo演示模式：自动循环展示所有表情、特效、风格
-     */
     /**
      * 启动Demo演示模式：自动循环展示所有表情、特效、风格
      */

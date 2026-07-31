@@ -57,9 +57,7 @@ class MultiLinkManager private constructor() {
     // 所有链路（按优先级排序）
     private val links = listOf(
         TcpLink(),
-        UdpLink(),
-        UsbSerialLink(),
-        BleLink()
+        UdpLink()
     )
 
     // 当前活跃链路

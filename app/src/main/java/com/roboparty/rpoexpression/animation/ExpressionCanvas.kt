@@ -70,6 +70,8 @@ fun ExpressionCanvas(
     val volumeManager = remember { app.volumeManager }
     val highlightIntensity by brightnessManager.highlightIntensity.collectAsState()
     val currentEyeEffect by expressionManager.currentEffect.collectAsState()
+    // 订阅渲染模式 StateFlow：模式变化时自动触发重组重绘
+    val currentMode by expressionManager.currentMode.collectAsState()
 
     // 渲染器实例：remember缓存，避免每次重组新建
     val renderer = remember { ExpressionRenderer() }
@@ -116,11 +118,23 @@ fun ExpressionCanvas(
                         val w = size.width
                         val h = size.height
 
+                        // 检测模式切换按钮点击（左下角）
+                        val modeBtnSize = 50f * density
+                        if (offset.x < modeBtnSize * 1.5f && offset.y > h - modeBtnSize * 1.5f) {
+                            expressionManager.toggleMode()
+                            return@detectTapGestures
+                        }
+
                         // 区域边界配置
                         val edgeWidth = w * 0.15f
-                        // 检测刷新按钮点击（下方中间区域）
-                        val refreshAreaTop = h * 0.80f
-                        val inRefreshArea = offset.y > refreshAreaTop && offset.x in edgeWidth..(w - edgeWidth)
+                        // 检测刷新按钮点击（右下角）
+                        val refreshBtnSize = 60f * density
+                        val refreshBtnX = w - refreshBtnSize * 0.75f
+                        val refreshBtnY = h - refreshBtnSize * 0.75f
+                        val inRefreshArea = offset.y > refreshBtnY - refreshBtnSize &&
+                                offset.x > refreshBtnX - refreshBtnSize &&
+                                offset.y < refreshBtnY + refreshBtnSize &&
+                                offset.x < refreshBtnX + refreshBtnSize
                         if (inRefreshArea) {
                             if (isRefreshCd) {
                                 // CD中，点击无效
@@ -495,11 +509,11 @@ fun ExpressionCanvas(
             }
         }
         }
-        // ========== 绘制刷新按钮（下方，和电源按钮对称） ==========
+        // ========== 绘制刷新按钮（右下角） ==========
         run {
             val btnSize = 60f * density
-            val btnX = size.width / 2f
-            val btnY = size.height * 0.88f
+            val btnX = size.width - btnSize * 0.75f
+            val btnY = size.height - btnSize * 0.75f
             val btnRadius = 16f * density
             val breath = 0.85f + 0.15f * kotlin.math.sin(System.currentTimeMillis() / 500f)
 
@@ -560,6 +574,76 @@ fun ExpressionCanvas(
                     topLeft = Offset(btnX - btnSize*0.75f, btnY - btnSize*0.75f),
                     size = Size(btnSize*1.5f, btnSize*1.5f),
                     style = Stroke(width = 5f * density, cap = StrokeCap.Round)
+                )
+            }
+        }
+
+        // ========== 绘制模式切换按钮（左下角） ==========
+        run {
+            val btnSize = 50f * density
+            val btnX = btnSize * 0.75f
+            val btnY = size.height - btnSize * 0.75f
+            val btnRadius = 14f * density
+            val breath = 0.85f + 0.15f * kotlin.math.sin(System.currentTimeMillis() / 600f)
+            val alpha = 0.35f * breath
+
+            // 按钮背景：圆角方形
+            drawRoundRect(
+                color = Color(0xFF1A1A2E).copy(alpha = alpha + 0.15f),
+                topLeft = Offset(btnX - btnSize / 2f, btnY - btnSize / 2f),
+                size = Size(btnSize, btnSize),
+                cornerRadius = CornerRadius(btnRadius, btnRadius),
+                style = Fill
+            )
+            // 边框
+            drawRoundRect(
+                color = if (currentMode == com.roboparty.rpoexpression.expression.ExpressionMode.ENERGY) {
+                    Color(0xFF4FC3F7).copy(alpha = alpha + 0.25f)
+                } else {
+                    Color(0xFF9E9E9E).copy(alpha = alpha)
+                },
+                topLeft = Offset(btnX - btnSize / 2f, btnY - btnSize / 2f),
+                size = Size(btnSize, btnSize),
+                cornerRadius = CornerRadius(btnRadius, btnRadius),
+                style = Stroke(width = 2f * density)
+            )
+
+            // 图标：传统模式=眼睛简化（两个小圆），能量模式=能量球（大圆+光晕）
+            val iconColor = if (currentMode == com.roboparty.rpoexpression.expression.ExpressionMode.ENERGY) {
+                Color(0xFF4FC3F7).copy(alpha = alpha + 0.35f)
+            } else {
+                Color(0xFFE0E0E0).copy(alpha = alpha + 0.2f)
+            }
+            if (currentMode == com.roboparty.rpoexpression.expression.ExpressionMode.ENERGY) {
+                // 能量模式图标：中心发光圆 + 光晕
+                drawCircle(
+                    color = iconColor.copy(alpha = iconColor.alpha * 0.3f),
+                    radius = btnSize * 0.28f,
+                    center = Offset(btnX, btnY)
+                )
+                drawCircle(
+                    color = iconColor,
+                    radius = btnSize * 0.14f,
+                    center = Offset(btnX, btnY)
+                )
+                drawCircle(
+                    color = Color.White.copy(alpha = iconColor.alpha * 0.8f),
+                    radius = btnSize * 0.05f,
+                    center = Offset(btnX, btnY)
+                )
+            } else {
+                // 传统模式图标：左右两个小圆（眼睛）
+                val eyeR = btnSize * 0.1f
+                val eyeSep = btnSize * 0.15f
+                drawCircle(
+                    color = iconColor,
+                    radius = eyeR,
+                    center = Offset(btnX - eyeSep, btnY)
+                )
+                drawCircle(
+                    color = iconColor,
+                    radius = eyeR,
+                    center = Offset(btnX + eyeSep, btnY)
                 )
             }
         }
