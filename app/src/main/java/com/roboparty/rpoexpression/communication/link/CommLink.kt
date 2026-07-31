@@ -64,9 +64,7 @@ interface CommLink {
     enum class LinkType(val value: Int) {
         LINK_UNKNOWN(0),
         LINK_TCP(1),
-        LINK_UDP(2),
-        LINK_USB_SERIAL(3),
-        LINK_BLE(4);
+        LINK_UDP(2);
 
         companion object {
             fun fromValue(v: Int): LinkType = values().find { it.value == v } ?: LINK_UNKNOWN

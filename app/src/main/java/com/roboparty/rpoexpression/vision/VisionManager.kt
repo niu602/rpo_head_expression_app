@@ -105,9 +105,9 @@ class VisionManager private constructor(private val context: Context) {
         private const val MULTI_FACE_CONFIDENCE = 0.6f      // 多人跟踪置信度（较低，写意）
 
         // ========== 表情分类检测阈值 ==========
-        private const val SMILE_THRESHOLD = 0.85f
-        private const val SMILE_FRAME_COUNT = 5
-        private const val SMILE_COOLDOWN_MS = 2500L
+        private const val SMILE_THRESHOLD = 0.95f   // 大幅提高阈值，ML Kit smilingProbability 容易误判
+        private const val SMILE_FRAME_COUNT = 8     // 连续8帧才确认（约270ms），过滤瞬态表情
+        private const val SMILE_COOLDOWN_MS = 5000L // 冷却5秒，减少频繁触发
         private const val EYE_CLOSED_THRESHOLD = 0.4f
         private const val BLINK_MIN_DURATION_MS = 80L
         private const val BLINK_MAX_DURATION_MS = 500L

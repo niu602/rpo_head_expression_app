@@ -10,6 +10,7 @@ import android.content.Context
 import android.content.Intent
 import android.util.Log
 import com.roboparty.rpoexpression.expression.ExpressionManager
+import com.roboparty.rpoexpression.expression.ExpressionMode
 import com.roboparty.rpoexpression.expression.ExpressionStyle
 import com.roboparty.rpoexpression.expression.ExpressionType
 import com.roboparty.rpoexpression.system.SystemStatusMonitor
@@ -45,6 +46,25 @@ class ExpressionControlReceiver : BroadcastReceiver() {
                 val typeStr = intent.getStringExtra("type") ?: return
                 val duration = intent.getLongExtra("duration", -1L)
                 val force = intent.getBooleanExtra("force", false)
+
+                // ===== 模式切换指令解析（优先处理，不进入表情类型查找） =====
+                when (typeStr.lowercase().trim()) {
+                    "mode:energy", "能量模式" -> {
+                        Log.d(TAG, "Switch to ENERGY mode")
+                        expressionManager.setMode(ExpressionMode.ENERGY)
+                        return
+                    }
+                    "mode:traditional", "传统模式" -> {
+                        Log.d(TAG, "Switch to TRADITIONAL mode")
+                        expressionManager.setMode(ExpressionMode.TRADITIONAL)
+                        return
+                    }
+                    "mode:toggle", "切换模式" -> {
+                        Log.d(TAG, "Toggle expression mode")
+                        expressionManager.toggleMode()
+                        return
+                    }
+                }
 
                 val type = ExpressionType.fromCommand(typeStr)
                 if (type == null) {
