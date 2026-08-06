@@ -17,6 +17,7 @@ import com.roboparty.rpoexpression.expression.EyeParameters
 import kotlin.math.sin
 import androidx.compose.ui.graphics.drawscope.DrawStyle
 import androidx.compose.ui.graphics.drawscope.Fill
+import com.roboparty.rpoexpression.expression.ExpressionManager
 /**
  * 男款·丹凤眼风格渲染器
  *
@@ -49,14 +50,16 @@ class MaleEyeRenderer : EyeStyleRenderer {
     private fun DrawScope.drawGlow(params: EyeParameters, metrics: EyeMetrics, time: Float) {
         if (params.glowIntensity <= 0f) return
 
-        // 冰蓝色呼吸光晕，节奏偏慢，沉稳感
+        // 呼吸光晕，节奏偏慢，沉稳感
         val glowAlpha = if (params.glowBlink) {
             params.glowIntensity * (0.5f + 0.5f * sin(time * 6f))
         } else {
             params.glowIntensity * (0.85f + 0.15f * sin(time * 1.5f))
         }
 
-        val glowColor = Color(0xFF4FC3F7) // 冰蓝色
+        // 使用全局光晕颜色，支持热更新配置
+        // Config -> State -> Shader 架构：ConfigManager 更新后，下一帧自动应用
+        val glowColor = ExpressionManager.getInstance().getGlowColor()
 
         // 左眼光晕（横向椭圆，贴合丹凤眼形状）
         drawOval(
@@ -213,9 +216,9 @@ class MaleEyeRenderer : EyeStyleRenderer {
                 size = Size(pupilSize * 2, pupilSize * 2)
             )
 
-            // 冰蓝色瞳孔光晕
+            // 瞳孔光晕
             drawOval(
-                color = Color(0xFF4FC3F7).copy(alpha = params.glowIntensity * 0.35f),
+                color = ExpressionManager.getInstance().getGlowColor().copy(alpha = params.glowIntensity * 0.35f),
                 topLeft = Offset(
                     pupilCenter.x - pupilSize * 1.4f,
                     pupilCenter.y - pupilSize * 1.4f

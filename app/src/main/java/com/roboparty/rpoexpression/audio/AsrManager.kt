@@ -91,6 +91,14 @@ class AsrManager private constructor(private val context: Context) {
          * 识别出错
          */
         fun onError(errorMsg: String) {}
+
+        /**
+         * 实时音频音量回调
+         * 用于自适应回声保护期：根据麦克风输入音量动态调整保护期长度
+         *
+         * @param rms 当前音频帧的 RMS（均方根）音量值，范围 0~32767（16bit PCM）
+         */
+        fun onAudioVolume(rms: Int) {}
     }
 
     private val gson = Gson()
@@ -226,12 +234,12 @@ class AsrManager private constructor(private val context: Context) {
                 })
                 add("turn_detection", JsonObject().apply {
                     addProperty("type", "server_vad")
-                    // Barge-in 打断监听使用更高的VAD阈值（0.65），降低灵敏度，
+                    // Barge-in 打断监听使用较高的VAD阈值，降低灵敏度，
                     // 防止TTS回声被误判为用户说话而触发打断。
-                    // 正常识别会话保持 0.5 标准阈值，保证正常语音识别灵敏度。
-                    val vadThreshold = if (isBargeInSession) 0.65f else 0.5f
+                    // 正常识别会话保持较低阈值，保证正常语音识别灵敏度。
+                    val vadThreshold = if (isBargeInSession) 0.60f else 0.45f
                     addProperty("threshold", vadThreshold)
-                    addProperty("silence_duration_ms", 1200) // 1.2秒静音才判定说话结束，给用户足够思考停顿时间
+                    addProperty("silence_duration_ms", 800) // 0.8秒静音判定说话结束，加快对话节奏
                 })
             })
         }
@@ -406,22 +414,33 @@ class AsrManager private constructor(private val context: Context) {
                 val buffer = ShortArray(bufferSize / 2) // 16bit = 2bytes per sample
                 while (isRecording && audioRecord != null) {
                     val readCount = audioRecord?.read(buffer, 0, buffer.size) ?: 0
-                    if (readCount > 0 && isWsConnected && isSessionConfigured) {
-                        // 转成字节数组，Base64编码发送
-                        val byteBuffer = ByteBuffer.allocate(readCount * 2)
-                        byteBuffer.order(ByteOrder.LITTLE_ENDIAN)
+                    if (readCount > 0) {
+                        // ===== 计算 RMS 音量，用于自适应回声保护期 =====
+                        var sum = 0L
                         for (i in 0 until readCount) {
-                            byteBuffer.putShort(buffer[i])
+                            sum += buffer[i] * buffer[i]
                         }
-                        val audioBytes = byteBuffer.array()
-                        val base64Audio = Base64.encodeToString(audioBytes, Base64.NO_WRAP)
+                        val rms = Math.sqrt(sum.toDouble() / readCount).toInt()
+                        // 回调音量（安全调用，兼容旧实现类）
+                        safeCallCallback { resultCallback?.onAudioVolume(rms) }
 
-                        val appendEvent = JsonObject().apply {
-                            addProperty("event_id", UUID.randomUUID().toString())
-                            addProperty("type", "input_audio_buffer.append")
-                            addProperty("audio", base64Audio)
+                        if (isWsConnected && isSessionConfigured) {
+                            // 转成字节数组，Base64编码发送
+                            val byteBuffer = ByteBuffer.allocate(readCount * 2)
+                            byteBuffer.order(ByteOrder.LITTLE_ENDIAN)
+                            for (i in 0 until readCount) {
+                                byteBuffer.putShort(buffer[i])
+                            }
+                            val audioBytes = byteBuffer.array()
+                            val base64Audio = Base64.encodeToString(audioBytes, Base64.NO_WRAP)
+
+                            val appendEvent = JsonObject().apply {
+                                addProperty("event_id", UUID.randomUUID().toString())
+                                addProperty("type", "input_audio_buffer.append")
+                                addProperty("audio", base64Audio)
+                            }
+                            webSocket?.send(gson.toJson(appendEvent))
                         }
-                        webSocket?.send(gson.toJson(appendEvent))
                     }
                 }
             }

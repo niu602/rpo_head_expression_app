@@ -13,7 +13,7 @@ import androidx.compose.ui.graphics.drawscope.DrawScope
 import androidx.compose.ui.graphics.drawscope.Stroke
 import com.roboparty.rpoexpression.expression.EyeParameters
 import kotlin.math.sin
-
+import com.roboparty.rpoexpression.expression.ExpressionManager
 /**
  * 女款·杏眼风格渲染器
  *
@@ -46,14 +46,16 @@ class FemaleEyeRenderer : EyeStyleRenderer {
     private fun DrawScope.drawGlow(params: EyeParameters, metrics: EyeMetrics, time: Float) {
         if (params.glowIntensity <= 0f) return
 
-        // 粉紫色呼吸光晕，节奏轻柔，温柔感
+        // 呼吸光晕，节奏轻柔，温柔感
         val glowAlpha = if (params.glowBlink) {
             params.glowIntensity * (0.5f + 0.5f * sin(time * 7f))
         } else {
             params.glowIntensity * (0.9f + 0.1f * sin(time * 2f))
         }
 
-        val glowColor = Color(0xFFCE93D8) // 粉紫色
+        // 使用全局光晕颜色，支持热更新配置
+        // Config -> State -> Shader 架构：ConfigManager 更新后，下一帧自动应用
+        val glowColor = ExpressionManager.getInstance().getGlowColor()
 
         // 左眼光晕（大而柔和的椭圆）
         drawOval(
@@ -120,9 +122,9 @@ class FemaleEyeRenderer : EyeStyleRenderer {
                 center = pupilCenter
             )
 
-            // 粉紫色瞳孔光晕（柔和梦幻）
+            // 瞳孔光晕（柔和梦幻）
             drawCircle(
-                color = Color(0xFFCE93D8).copy(alpha = params.glowIntensity * 0.5f),
+                color = ExpressionManager.getInstance().getGlowColor().copy(alpha = params.glowIntensity * 0.5f),
                 radius = pupilRadius * 1.25f,
                 center = pupilCenter
             )
@@ -170,7 +172,7 @@ class FemaleEyeRenderer : EyeStyleRenderer {
         val underEyeY = eyeCenter.y + eyeHeight * 0.45f
         val underEyeAlpha = 0.15f + 0.05f * sin(time * 1.8f)
         drawOval(
-            color = Color(0xFFCE93D8).copy(alpha = underEyeAlpha),
+            color = ExpressionManager.getInstance().getGlowColor().copy(alpha = underEyeAlpha),
             topLeft = Offset(
                 eyeCenter.x - eyeWidth * 0.35f,
                 underEyeY

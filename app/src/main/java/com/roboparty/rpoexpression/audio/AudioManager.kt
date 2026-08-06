@@ -40,12 +40,21 @@ class AudioManager private constructor(private val context: Context) {
 
     // ========== 打断（Barge-in）功能 ==========
     var bargeInEnabled = true          // 是否启用语音打断：TTS播报时用户说话自动停止播报
-    var bargeInGuardMs = 2500L         // TTS开头保护时间，防回声误触（毫秒），从麦克风实际开始录音算起
-    var ttsStartTime = 0L              // 当前TTS播报实际开始时间戳（在onRecordingStarted回调中设置）
+
+    // ========== 自适应回声保护期 ==========
+    // 保护期不是固定的，根据麦克风实时音量动态伸缩：
+    // - 回声强（音量大）→ 保护期自动延长
+    // - 回声弱（音量小）→ 保护期很快结束，用户可以立刻打断
+    var bargeInGuardMinMs = 300L       // 最小保护期（无论回声多弱，至少等这么久，防开头爆音）
+    var bargeInGuardMaxMs = 2000L      // 最大保护期（无论回声多强，最多等这么久，兜底）
+    @Volatile private var bargeInGuardEndTime = 0L  // 当前保护期结束时间戳（动态调整）
+    var bargeInEchoThreshold = 1000    // 回声音量阈值（RMS值），高于此值认为回声强，需要延长保护期
+    private val bargeInGuardExtendMs = 100L // 每次检测到强回声时延长的保护期时长
+    @Volatile var ttsStartTime = 0L              // 当前TTS播报实际开始时间戳（在onRecordingStarted回调中设置）
 
     // 语音持续确认：检测到speech_started后，再确认语音持续了这么久才真正触发打断
     // 避免短促的回声/爆音/点击声被误判为用户说话
-    private val bargeInConfirmMs = 200L
+    private val bargeInConfirmMs = 150L
     private var bargeInConfirmRunnable: Runnable? = null
     @Volatile private var isSpeechOngoing = false  // 当前VAD是否检测到语音正在进行
     @Volatile private var isBargeInTriggering = false  // 防止triggerBargeIn重入
@@ -189,6 +198,21 @@ class AudioManager private constructor(private val context: Context) {
     }
 
     /**
+     * 预合成并缓存TTS文本（不播放）
+     * 用于提前合成问候语等常用文本，播放时秒开
+     */
+    fun preloadTts(text: String) {
+        ttsManager.preload(text)
+    }
+
+    /**
+     * 检查TTS文本是否已预加载完成
+     */
+    fun isTtsPreloaded(text: String): Boolean {
+        return ttsManager.isPreloaded(text)
+    }
+
+    /**
      * 开始TTS播报文本
      * @param text 要播报的文本
      * @param callback 播报状态回调
@@ -253,19 +277,22 @@ class AudioManager private constructor(private val context: Context) {
      * 之后每次收到 LLM delta 调 [feedStreamChunk]。
      */
     fun startStreaming(callback: TtsManager.TtsStateCallback? = null) {
+        Log.i(TAG, "[DIAG] startStreaming called, bargeInEnabled=$bargeInEnabled, asrListening=${asrManager.isListening()}")
         // 重置 suppress 标记，新的一轮流式播报正常走 speakFinish
         suppressSpeakFinish = false
         // TTS播报前先停止所有ASR会话
         if (asrManager.isListening()) {
+            Log.d(TAG, "startStreaming: stopping ASR first")
             asrManager.stopListening()
         }
         streamBuffer.setLength(0)
         streamFirstSent = false
+        Log.d(TAG, "[DIAG] startStreaming: state reset, buffer cleared")
 
         // 包装回调
         val wrappedCallback = object : TtsManager.TtsStateCallback {
             override fun onStart() {
-                Log.d(TAG, "TTS stream start, barge-in guard will begin when mic starts")
+                Log.i(TAG, "[DIAG] Stream TTS onStart callback triggered")
                 kwsManager.setMuted(true)  // TTS开始，KWS静音防回声
                 callback?.onStart()
                 if (bargeInEnabled && !asrManager.isListening()) {
@@ -273,16 +300,19 @@ class AudioManager private constructor(private val context: Context) {
                 }
             }
             override fun onDone() {
+                Log.i(TAG, "[DIAG] Stream TTS onDone callback triggered, suppressSpeakFinish=$suppressSpeakFinish")
                 kwsManager.setMuted(false)  // TTS结束，KWS解除静音
                 stopBargeInListen()
                 callback?.onDone()
                 if (!suppressSpeakFinish) {
+                    Log.d(TAG, "[DIAG] Calling speakFinishListener after stream onDone")
                     speakFinishListener?.onSpeakFinsh()
                 } else {
                     Log.d(TAG, "speakFinish suppressed (barge-in/cancel)")
                 }
             }
             override fun onError(errorCode: Int) {
+                Log.e(TAG, "[DIAG] Stream TTS onError callback triggered, code=$errorCode")
                 kwsManager.setMuted(false)  // TTS出错也解除静音
                 stopBargeInListen()
                 callback?.onError(errorCode)
@@ -294,6 +324,7 @@ class AudioManager private constructor(private val context: Context) {
 
         // 告诉 TTSManager 用流式模式的回调
         ttsManager.setStateCallback(wrappedCallback)
+        Log.d(TAG, "[DIAG] startStreaming: wrappedCallback set to ttsManager")
         // 注意：不在这里立即 speak，等第一个 chunk 到来才 speakChunk
     }
 
@@ -379,9 +410,12 @@ class AudioManager private constructor(private val context: Context) {
      * 不触发表情变化，只在后台识别用户语音
      *
      * 防误触三重保障：
-     * 1. 保护期（bargeInGuardMs）：麦克风开始录音后的前 N 毫秒内完全忽略语音，防TTS开头强回声
+     * 1. 自适应保护期：根据麦克风实时音量动态调整保护期长度
+     *    - 回声强（音量大）→ 保护期自动延长
+     *    - 回声弱（音量小）→ 保护期很快结束
+     *    - 范围：bargeInGuardMinMs ~ bargeInGuardMaxMs
      * 2. VAD高阈值：barge-in会话使用 0.65 的高VAD阈值，降低对回声的灵敏度
-     * 3. 语音持续确认（bargeInConfirmMs）：检测到speech_started后再确认200ms，
+     * 3. 语音持续确认（bargeInConfirmMs）：检测到speech_started后再确认150ms，
      *    语音仍在持续才真正打断，避免短促爆音/点击声/瞬时回声误触发
      */
     private fun startBargeInListen() {
@@ -389,20 +423,49 @@ class AudioManager private constructor(private val context: Context) {
             // 重置状态
             isSpeechOngoing = false
             isBargeInTriggering = false
+            bargeInGuardEndTime = 0L
             // 只移除 barge-in 确认任务，不影响 mainHandler 上的其他回调
             bargeInConfirmRunnable?.let { mainHandler.removeCallbacks(it) }
             bargeInConfirmRunnable = null
 
             asrManager.startListening(object : AsrManager.AsrResultCallback {
                 /**
-                 * 麦克风开始录音 → 记录准确的保护期起点
-                 * WebSocket连接+session配置可能耗时数百毫秒，
-                 * 从TTS onStart算起会导致保护期提前过期
+                 * 麦克风开始录音 → 初始化自适应保护期
+                 * 保护期从麦克风开始录音算起，初始值 = 最小保护期
+                 * 之后根据回声强度动态延长
                  */
                 override fun onRecordingStarted() {
                     ttsStartTime = asrManager.recordingStartTime
-                    Log.d(TAG, "Barge-in mic started, guard period = ${bargeInGuardMs}ms, " +
+                    // 初始化自适应保护期：从最小保护期开始
+                    bargeInGuardEndTime = ttsStartTime + bargeInGuardMinMs
+                    Log.d(TAG, "Barge-in mic started, adaptive guard: " +
+                            "min=${bargeInGuardMinMs}ms, max=${bargeInGuardMaxMs}ms, " +
+                            "threshold=$bargeInEchoThreshold, " +
                             "VAD threshold = 0.65 (barge-in mode)")
+                }
+
+                /**
+                 * 实时音量回调 → 动态调整保护期
+                 * 回声强（音量超过阈值）→ 延长保护期
+                 * 回声弱 → 不延长，保护期到了就结束
+                 */
+                override fun onAudioVolume(rms: Int) {
+                    // 保护期已经结束了就不用调整了
+                    val now = System.currentTimeMillis()
+                    if (now >= bargeInGuardEndTime) return
+                    if (bargeInGuardEndTime == 0L) return  // 还没初始化
+
+                    if (rms > bargeInEchoThreshold) {
+                        // 回声强，延长保护期
+                        val maxEndTime = ttsStartTime + bargeInGuardMaxMs
+                        val newEndTime = (bargeInGuardEndTime + bargeInGuardExtendMs).coerceAtMost(maxEndTime)
+                        if (newEndTime > bargeInGuardEndTime) {
+                            bargeInGuardEndTime = newEndTime
+                            Log.v(TAG, "Barge-in guard extended: rms=$rms > $bargeInEchoThreshold, " +
+                                    "guard now ${bargeInGuardEndTime - ttsStartTime}ms " +
+                                    "(max ${bargeInGuardMaxMs}ms)")
+                        }
+                    }
                 }
 
                 /**
@@ -418,15 +481,19 @@ class AudioManager private constructor(private val context: Context) {
                         return
                     }
 
-                    val elapsed = System.currentTimeMillis() - ttsStartTime
-                    // 第一重保障：保护期内完全忽略，防TTS开头强回声
-                    if (elapsed < bargeInGuardMs) {
-                        Log.d(TAG, "Barge-in: speech_started within guard period " +
-                                "(${elapsed}ms < ${bargeInGuardMs}ms), ignored")
+                    val now = System.currentTimeMillis()
+                    val elapsed = now - ttsStartTime
+                    val remaining = bargeInGuardEndTime - now
+
+                    // 第一重保障：自适应保护期内完全忽略，防TTS回声
+                    if (now < bargeInGuardEndTime) {
+                        Log.d(TAG, "Barge-in: speech_started within adaptive guard period " +
+                                "(elapsed=${elapsed}ms, remaining=${remaining}ms), ignored")
                         return
                     }
 
-                    Log.d(TAG, "Barge-in: speech detected at ${elapsed}ms, entering confirm phase (${bargeInConfirmMs}ms)")
+                    Log.d(TAG, "Barge-in: speech detected at ${elapsed}ms (guard ended ${-remaining}ms ago), " +
+                            "entering confirm phase (${bargeInConfirmMs}ms)")
                     isSpeechOngoing = true
 
                     // 第三重保障：语音持续确认
@@ -465,10 +532,11 @@ class AudioManager private constructor(private val context: Context) {
                     if (ttsStartTime == 0L) return
 
                     // 完整识别结果作为备用：如果onSpeechStarted没触发到（极端情况），这里兜底
-                    val elapsed = System.currentTimeMillis() - ttsStartTime
-                    if (elapsed < bargeInGuardMs) return
+                    val now = System.currentTimeMillis()
+                    if (now < bargeInGuardEndTime) return
 
                     if (text.isNotBlank() && text.length >= 2) {
+                        val elapsed = now - ttsStartTime
                         Log.d(TAG, "Barge-in fallback: got full result (${elapsed}ms): $text")
                         triggerBargeIn(text)
                     }
@@ -547,6 +615,7 @@ class AudioManager private constructor(private val context: Context) {
             isSpeechOngoing = false
             // 重置保护期时间戳
             ttsStartTime = 0L
+            bargeInGuardEndTime = 0L
             // 停止ASR会话
             asrManager.stopBargeInSession()
         } catch (e: Exception) {
@@ -575,6 +644,33 @@ class AudioManager private constructor(private val context: Context) {
     }
 
     /**
+     * 切换云端TTS音色
+     * 仅对云端TTS（CosyVoice）生效，系统TTS不受影响
+     *
+     * @param voiceId 音色ID
+     */
+    fun setTtsVoice(voiceId: String) {
+        try {
+            ttsManager.setVoice(voiceId)
+            Log.d(TAG, "TTS voice set to: $voiceId")
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to set TTS voice", e)
+        }
+    }
+
+    /**
+     * 获取当前 TTS 音色 ID
+     */
+    fun getCurrentVoiceId(): String {
+        return try {
+            ttsManager.getCurrentVoiceId()
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to get current voice", e)
+            ""
+        }
+    }
+
+    /**
      * 根据渲染风格切换 TTS 音色
      * 男款 → 低沉稳重，女款 → 清亮灵动
      * 与表情风格联动，保持视觉听觉统一
@@ -585,6 +681,32 @@ class AudioManager private constructor(private val context: Context) {
             Log.d(TAG, "Voice style synced to: $style")
         } catch (e: Exception) {
             Log.e(TAG, "Failed to apply voice style", e)
+        }
+    }
+
+    /**
+     * 切换到歌声模式音色（高音调 + 慢语速）
+     * 后续接入云端情感TTS后，此方法将调用云端歌声合成接口
+     */
+    fun applySingingVoice() {
+        try {
+            ttsManager.applySingingVoice()
+            Log.d(TAG, "Singing voice activated")
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to apply singing voice", e)
+        }
+    }
+
+    /**
+     * 恢复默认音色（唱歌结束后调用）
+     * @param style 当前渲染风格，默认女款
+     */
+    fun restoreDefaultVoice(style: ExpressionStyle = ExpressionStyle.FEMALE) {
+        try {
+            ttsManager.restoreDefaultVoice(style)
+            Log.d(TAG, "Voice restored to: $style")
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to restore voice", e)
         }
     }
 

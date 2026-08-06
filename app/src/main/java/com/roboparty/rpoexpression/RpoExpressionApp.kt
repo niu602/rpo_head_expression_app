@@ -10,6 +10,8 @@ import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.content.IntentFilter
 import android.os.Build
+import android.os.Handler
+import android.os.Looper
 import kotlinx.coroutines.launch
 import com.roboparty.rpoexpression.audio.AudioManager
 import com.roboparty.rpoexpression.communication.CommunicationManager
@@ -29,10 +31,14 @@ import com.roboparty.rpoexpression.sensor.ImuManager
 import com.roboparty.rpoexpression.sensor.VolumeManager
 import com.roboparty.rpoexpression.system.SystemStatusMonitor
 import com.roboparty.rpoexpression.util.Constants
+import com.roboparty.rpoexpression.util.PersonaRegistry
+import com.roboparty.rpoexpression.util.PersonaSwitchManager
+import com.roboparty.rpoexpression.util.VoicePreferenceStore
 import android.content.Context
 import android.util.Log
 import com.roboparty.rpoexpression.vision.DebugVisionState
 import com.roboparty.rpoexpression.vision.VisionManager
+import android.content.ContentValues.TAG
 /**
  * Application入口
  * 初始化各个管理器单例
@@ -66,10 +72,15 @@ class RpoExpressionApp : Application() {
         private set
     lateinit var faceIdentifier: FaceIdentifier
         private set
+    lateinit var voicePreferenceStore: VoicePreferenceStore
+        private set
     /** 最近一次识别到的人脸名字（null表示陌生人/未识别），供唤醒时选择欢迎语 */
     @Volatile
     var lastRecognizedName: String? = null
         private set
+
+    /** 已经预缓存过问候语的人名集合，避免重复预缓存 */
+    private val preloadedNames = mutableSetOf<String>()
     private lateinit var expressionControlReceiver: ExpressionControlReceiver
 
     override fun onCreate() {
@@ -150,17 +161,76 @@ class RpoExpressionApp : Application() {
         try {
             audioManager = AudioManager.getInstance(this)
             audioManager.init()
+
+            // 初始化用户音色偏好存储
+            voicePreferenceStore = VoicePreferenceStore.getInstance(this)
+            Log.i(TAG, "VoicePreferenceStore initialized")
+
+            // TTS初始化完成后，预合成常用问候语（陌生人场景）
+            // 延迟2秒，确保TTS引擎初始化完成
+            Handler(Looper.getMainLooper()).postDelayed({
+                try {
+                    // 记录预缓存前的当前音色，预缓存完成后恢复
+                    val originalVoice = audioManager.getCurrentVoiceId()
+
+                    // 遍历 PersonaRegistry 中所有人格，预缓存问候语和常用短语
+                    // 新增人格时自动包含，无需修改此处代码
+                    PersonaRegistry.getAllConfigs().forEach { config ->
+                        // 切换到对应音色
+                        audioManager.setTtsVoice(config.cloudVoiceId)
+                        // 预缓存陌生人问候语
+                        audioManager.preloadTts(config.greetingWithoutName)
+                        // 预缓存常用短语
+                        config.preloadPhrases.forEach { phrase ->
+                            audioManager.preloadTts(phrase)
+                        }
+                        Log.d("RpoExpressionApp", "Preloaded ${config.name} greetings (voice=${config.cloudVoiceId})")
+                    }
+
+                    // 恢复到预缓存前的音色（而不是强制切回默认女声）
+                    // 确保启动恢复的音色不会被预缓存任务覆盖
+                    audioManager.setTtsVoice(originalVoice)
+                    Log.d("RpoExpressionApp", "Preload complete, restored voice = $originalVoice")
+                } catch (e: Exception) {
+                    Log.w("RpoExpressionApp", "Preload TTS failed", e)
+                }
+            }, 2000)
         } catch (e: Exception) {
             Log.e("RpoExpressionApp", "AudioManager init failed", e)
         }
 
         // 风格-音色联动：切换渲染风格时同步切换 TTS 音色，保持视觉听觉统一
+        // 同时切换系统TTS参数和云端TTS音色
+        // 统一从 PersonaRegistry 获取配置，消除散落的 when 分支
         try {
             expressionManager.addStyleChangeCallback { style ->
-                audioManager.applyVoiceStyle(style)
+                // 根据风格从 PersonaRegistry 反向查找人格配置
+                val config = PersonaRegistry.getByStyle(style)
+                if (config != null) {
+                    // 1. 切换 LLM 人格（之前在 syncPersonaAndVoice 中，现在统一到这里）
+                    llmManager.setPersona(config.persona)
+
+                    // 2. 系统TTS音色调整（pitch / speechRate）
+                    audioManager.applyVoiceStyle(style)
+
+                    // 3. 云端TTS音色切换（voiceId）
+                    // 先读用户为该人格选过的音色，读不到或非法才用默认
+                    val voiceOption = voicePreferenceStore.resolveVoiceForPersona(config.persona)
+                    audioManager.setTtsVoice(voiceOption.voiceId)
+
+                    Log.d("RpoExpressionApp", "Style sync complete: style=$style, " +
+                            "persona=${config.persona}, voice=${voiceOption.voiceId} (${voiceOption.displayName})")
+
+                    // 4. 持久化：保存当前人格，下次启动时恢复
+                    savePersona(config.persona)
+                } else {
+                    Log.w("RpoExpressionApp", "No persona config found for style: $style")
+                }
             }
             // 初始化时应用一次默认风格（女款）对应的音色
+            val defaultConfig = PersonaRegistry.getDefaultConfig()
             audioManager.applyVoiceStyle(expressionManager.getCurrentStyle())
+            audioManager.setTtsVoice(defaultConfig.cloudVoiceId)
             Log.d("RpoExpressionApp", "Style-voice sync registered")
         } catch (e: Exception) {
             Log.e("RpoExpressionApp", "Style-voice sync init failed", e)
@@ -176,6 +246,30 @@ class RpoExpressionApp : Application() {
             llmManager.init()
         } catch (e: Exception) {
             Log.e("RpoExpressionApp", "LlmManager init failed", e)
+        }
+
+        // ========== 恢复上次使用的人格 ==========
+        // 所有模块初始化完成后，读取 SharedPreferences 中的上次人格并应用
+        // 使用全量同步接口，确保三端状态（表情/LLM/TTS）一致性
+        try {
+            val lastPersona = loadLastPersona()
+
+            // 申请切换锁（启动恢复也是一种切换）
+            if (PersonaSwitchManager.tryStartSwitch("startupRestore")) {
+                try {
+                    // 使用全量同步接口，摒弃 if/else 分支，统一走 restoreInitialState
+                    restoreInitialState(lastPersona)
+                } finally {
+                    // 释放锁
+                    PersonaSwitchManager.finishSwitch("startupRestore")
+                }
+            } else {
+                Log.w(TAG, "startupRestore: switch in progress, skip restore")
+            }
+        } catch (e: Exception) {
+            Log.e("RpoExpressionApp", "Failed to restore last persona", e)
+            // 出错时强制释放锁，防止死锁
+            PersonaSwitchManager.forceRelease("startupRestore error")
         }
 
         // 初始化人脸识别模块（TFLite MobileFaceNet 192维）
@@ -216,6 +310,25 @@ class RpoExpressionApp : Application() {
                     val memoryText = "用户的名字是${profile.name}，请自然地用名字称呼用户"
                     if (!llmManager.getLongTermMemories().contains(memoryText)) {
                         llmManager.addLongTermMemory(memoryText)
+                    }
+                    // 预合成两个人格的问候语（去重，避免重复预缓存）
+                    val name = profile.name
+                    if (!preloadedNames.contains(name)) {
+                        preloadedNames.add(name)
+                        // 记录预缓存前的当前音色，预缓存完成后恢复
+                        val originalVoice = audioManager.getCurrentVoiceId()
+
+                        // 遍历 PersonaRegistry 中所有人格，预缓存带名字的问候语
+                        // 新增人格时自动包含，无需修改此处代码
+                        PersonaRegistry.getAllConfigs().forEach { config ->
+                            audioManager.setTtsVoice(config.cloudVoiceId)
+                            val greeting = config.greetingWithName(name)
+                            audioManager.preloadTts(greeting)
+                        }
+
+                        // 恢复到预缓存前的音色（而不是强制切回默认女声）
+                        audioManager.setTtsVoice(originalVoice)
+                        Log.d("RpoExpressionApp", "Preloaded greetings for: $name, restored voice = $originalVoice")
                     }
                     // 不在此处TTS播报，等待唤醒词后再说欢迎语
                 }
@@ -393,6 +506,82 @@ class RpoExpressionApp : Application() {
         lateinit var instance: RpoExpressionApp
             private set
         const val CHANNEL_ID = "rpo_expression_service"
+
+        // ========== SharedPreferences 配置 ==========
+        private const val PREFS_NAME = "rpo_expression_prefs"
+        private const val KEY_LAST_PERSONA = "last_persona"
+    }
+
+    // ==================== 人格持久化 ====================
+
+    /**
+     * 读取上次使用的人格
+     * 首次安装默认返回 LUOBO（女款·萝卜）
+     */
+    private fun loadLastPersona(): LlmManager.Persona {
+        val prefs = getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+        val personaName = prefs.getString(KEY_LAST_PERSONA, LlmManager.Persona.LUOBO.name)
+        return try {
+            LlmManager.Persona.valueOf(personaName ?: LlmManager.Persona.LUOBO.name)
+        } catch (e: IllegalArgumentException) {
+            Log.w(TAG, "Invalid persona name in SP: $personaName, fallback to LUOBO")
+            LlmManager.Persona.LUOBO
+        }
+    }
+
+    /**
+     * 保存当前人格到 SharedPreferences
+     * 在人格切换时调用，APP 启动时读取恢复
+     */
+    fun savePersona(persona: LlmManager.Persona) {
+        try {
+            val prefs = getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+            prefs.edit().putString(KEY_LAST_PERSONA, persona.name).apply()
+            Log.d(TAG, "Persona saved: $persona")
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to save persona", e)
+        }
+    }
+
+    /**
+     * 冷启动全量状态恢复
+     * 确保三端状态（表情 / LLM / TTS）完全一致，摒弃依赖回调的被动同步方式
+     *
+     * 与普通切换的区别：
+     * - 跳过幂等检查，强制覆盖
+     * 无动画效果，直接瞬切
+     * 不触发不必要的回调（减少启动时的副作用）
+     * 三端独立设置，确保一致性
+     *
+     * @param persona 要恢复的目标人格
+     */
+    private fun restoreInitialState(persona: LlmManager.Persona) {
+        val config = PersonaRegistry.getConfig(persona)
+
+        Log.i(TAG, "========== Restoring initial state ==========")
+        Log.i(TAG, "Target persona: $persona")
+        Log.i(TAG, "Target style: ${config.expressionStyle}")
+        Log.i(TAG, "Target voice: ${config.cloudVoiceId}")
+
+        // 1. 强制同步 LLM (不带清空历史，仅切 Prompt)
+        // 使用 setPersonaSilently，跳过幂等检查，不清空历史
+        llmManager.setPersonaSilently(persona)
+        Log.d(TAG, "LLM persona restored: $persona")
+
+        // 2. 强制同步表情 (无动画，直接瞬切)
+        // 使用 setStyleDirectly，不触发回调，直接设置状态
+        expressionManager.setStyleDirectly(config.expressionStyle)
+        Log.d(TAG, "Expression style restored: ${config.expressionStyle}")
+
+        // 3. 强制同步 TTS (无视当前音色，直接设置)
+        // 主动设置，不依赖回调，确保音色正确
+        // 先读用户为该人格选过的音色，读不到或非法才用默认
+        val voiceOption = voicePreferenceStore.resolveVoiceForPersona(persona)
+        audioManager.setTtsVoice(voiceOption.voiceId)
+        Log.d(TAG, "TTS voice restored: ${voiceOption.voiceId} (${voiceOption.displayName})")
+
+        Log.i(TAG, "========== Initial state fully restored ==========")
+        Log.i(TAG, "All three modules (Expression/LLM/TTS) are now in sync")
     }
 }
 

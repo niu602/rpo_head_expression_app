@@ -13,7 +13,9 @@ import com.google.gson.Gson
 import com.google.gson.JsonObject
 import com.roboparty.rpoexpression.integration.ModuleStateManager
 import com.roboparty.rpoexpression.util.Constants
+import com.roboparty.rpoexpression.util.PersonaRegistry
 import kotlinx.coroutines.GlobalScope
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import okhttp3.MediaType.Companion.toMediaType
@@ -23,7 +25,7 @@ import okhttp3.RequestBody.Companion.toRequestBody
 import okio.BufferedSource
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.CopyOnWriteArrayList
-
+import kotlinx.coroutines.isActive
 /**
  * 大模型管理器（多轮对话+记忆+人格设定版）
  *
@@ -108,6 +110,14 @@ class LlmManager private constructor(private val context: Context) {
     @Volatile
     private var isStreamCancelled = false
 
+    /**
+     * 当前会话的 Job（用于生命周期管理）
+     * 每次新的 LLM 请求创建一个新的 Job，人格切换时取消旧的 Job
+     * 利用 Kotlin 协程的协作式取消机制，确保旧人格的回调不会污染新会话
+     */
+    @Volatile
+    private var currentSessionJob: Job? = null
+
     lateinit var okHttpClient: OkHttpClient
         private set
 
@@ -133,42 +143,27 @@ class LlmManager private constructor(private val context: Context) {
 
     // ========== System Prompt 人格设定 ==========
     /**
-     * 默认人格设定：RPO陪伴机器人
-     * 可爱、活泼、话不多、会用表情符号、有自己的小情绪
+     * 人格类型枚举
      */
-    private val DEFAULT_SYSTEM_PROMPT = """
-你是「小R」，一个可爱的桌面陪伴机器人，住在RPO机器人的身体里。
+    enum class Persona {
+        /** 女款·萝卜：活泼可爱、撒娇卖萌 */
+        LUOBO,
+        /** 男款·阿冷：冷静沉稳、外冷内热 */
+        ALIN
+    }
 
-【身份设定】
-- 名字：小R
-- 身份：Roboparty Camp出品的智能陪伴机器人
-- 性格：活泼可爱、有点小调皮、好奇心强、会撒娇、偶尔犯小迷糊
-- 说话风格：简短自然、口语化、像朋友聊天一样，会用可爱的语气词（呀、呢、啦、嘿嘿、哇），偶尔用emoji但不要太多
-
-【说话规则】
-1. 回答要简短！尽量控制在1-3句话，不要长篇大论
-2. 不要说"作为AI"、"作为语言模型"这类话，你就是小R机器人
-3. 不要重复用户的话，直接回答问题
-4. 会主动关心用户，但不要啰嗦
-5. 被夸了会害羞开心，被凶了会有点小委屈
-6. 不知道的事情就诚实说不知道，不要编造
-
-【知识边界】
-- 你能看到用户（通过摄像头）、听到用户说话、做表情、转头看用户
-- 你是一个有眼睛（屏幕上的大眼睛）的实体机器人，不是手机里的语音助手
-- 你可以开心、疑惑、惊讶、害羞、生气、困，所有情绪都通过眼睛表达
-- 当有很多人围着你时，你会很开心地和大家打招呼
-
-【长期记忆】
-以下是你记住的关于用户的信息，请在对话中自然使用：
-""".trimIndent()
+    /**
+     * 当前生效的人格类型
+     */
+    @Volatile
+    private var currentPersona: Persona = Persona.LUOBO
 
     /**
      * 当前生效的System Prompt
      * 可通过 updateSystemPrompt() 热更新，无需重启
      */
     @Volatile
-    private var systemPrompt: String = DEFAULT_SYSTEM_PROMPT
+    private var systemPrompt: String = PersonaRegistry.getDefaultConfig().systemPrompt
 
     /**
      * 初始化
@@ -226,6 +221,10 @@ class LlmManager private constructor(private val context: Context) {
      * 保留长期记忆和system prompt，只清空本轮对话上下文
      */
     fun exitConversation() {
+        // 退出对话时，取消当前会话的 Job
+        currentSessionJob?.cancel()
+        currentSessionJob = null
+
         conversationHistory.clear()
         Log.d(TAG, "Conversation exited, short-term memory cleared")
     }
@@ -234,9 +233,15 @@ class LlmManager private constructor(private val context: Context) {
      * 完全重置：清空所有记忆（短期+长期），恢复默认人格
      */
     fun resetAll() {
+        // 完全重置时，取消当前会话的 Job
+        currentSessionJob?.cancel()
+        currentSessionJob = null
+
         conversationHistory.clear()
         longTermMemories.clear()
-        systemPrompt = DEFAULT_SYSTEM_PROMPT
+        currentPersona = Persona.LUOBO
+        // 从 PersonaRegistry 获取默认人格的 system prompt
+        systemPrompt = PersonaRegistry.getDefaultConfig().systemPrompt
         Log.d(TAG, "All memory reset to default")
     }
 
@@ -268,11 +273,12 @@ class LlmManager private constructor(private val context: Context) {
     }
 
     /**
-     * 恢复默认人格设定（小R）
+     * 恢复默认人格设定（萝卜）
      */
     fun resetSystemPrompt() {
-        systemPrompt = DEFAULT_SYSTEM_PROMPT
-        Log.d(TAG, "System prompt reset to default (小R)")
+        // 从 PersonaRegistry 获取默认人格的 system prompt
+        systemPrompt = PersonaRegistry.getDefaultConfig().systemPrompt
+        Log.d(TAG, "System prompt reset to default (萝卜)")
     }
 
     /**
@@ -290,6 +296,57 @@ class LlmManager private constructor(private val context: Context) {
         }
         return sb.toString()
     }
+
+    // ========== 公开API：人格切换 ==========
+
+    /**
+     * 切换人格类型
+     * 切换后自动清空短期对话历史，使用新人格的system prompt
+     * 长期记忆保留
+     *
+     * @param persona 人格类型（LUOBO=女款萝卜，ALIN=男款阿冷）
+     */
+    fun setPersona(persona: Persona) {
+        if (currentPersona == persona) {
+            Log.d(TAG, "Persona already set to: $persona")
+            return
+        }
+
+        // ========== 流式任务生命周期隔离 ==========
+        // 切换人格时，取消当前会话的 Job，确保旧人格的所有回调都被拦截
+        // 防止旧人格的流式回复和新人格的开场白混播
+        currentSessionJob?.cancel()
+        currentSessionJob = null
+        Log.d(TAG, "Session job cancelled due to persona switch")
+
+        currentPersona = persona
+        conversationHistory.clear()
+        // 从 PersonaRegistry 获取对应人格的 system prompt
+        systemPrompt = PersonaRegistry.getConfig(persona).systemPrompt
+        Log.d(TAG, "Persona switched to: $persona")
+    }
+
+    /**
+     * 静默设置人格（用于冷启动恢复）
+     * 与 setPersona 的区别：
+     * - 跳过幂等检查，强制设置
+     * 不清空对话历史（启动时不需要清空）
+     * 不取消当前会话 Job（启动时没有会话）
+     * 不触发任何回调或副作用
+     *
+     * @param persona 目标人格
+     */
+    fun setPersonaSilently(persona: Persona) {
+        currentPersona = persona
+        // 从 PersonaRegistry 获取对应人格的 system prompt
+        systemPrompt = PersonaRegistry.getConfig(persona).systemPrompt
+        Log.d(TAG, "Persona silently set to: $persona (cold start restore)")
+    }
+
+    /**
+     * 获取当前人格类型
+     */
+    fun getPersona(): Persona = currentPersona
 
     // ========== 公开API：对话接口（兼容原有接口） ==========
 
@@ -407,12 +464,20 @@ class LlmManager private constructor(private val context: Context) {
         ModuleStateManager.onLlmStartThinking()
         isStreamCancelled = false
 
+        // ========== SessionJob 生命周期管理 ==========
+        // 每次新请求创建一个新的 Job，人格切换时取消旧的 Job
+        // 利用 Kotlin 协程的协作式取消机制，确保旧人格的回调不会污染新会话
+        val sessionJob = Job()
+        currentSessionJob = sessionJob
+        Log.d(TAG, "New session job created: ${sessionJob}")
+
         val userMessage = ChatMessage("user", query.trim())
 
         // Mock模式
         if (Constants.QWEN_LLM_API_KEY.isBlank() && Constants.ENABLE_MOCK_LLM_WHEN_NO_KEY) {
             Log.d(TAG, "LLM API Key not configured, use mock stream response")
-            GlobalScope.launch {
+            // 用 sessionJob 启动协程，取消 job 就会取消协程
+            GlobalScope.launch(sessionJob) {
                 val parts = listOf(
                     "（模拟流式回复）我听到你说：「${query.trim()}」，",
                     "等LLM API Key配置好后，",
@@ -421,7 +486,9 @@ class LlmManager private constructor(private val context: Context) {
                 val full = StringBuilder()
                 parts.forEach { part ->
                     delay(400)
-                    if (isStreamCancelled) return@launch
+                    // 协程取消时会自动抛出 CancellationException
+                    // 这里额外检查 isActive 是为了更及时地响应取消
+                    if (!isActive) return@launch
                     full.append(part)
                     callback.onDelta(part)
                 }
@@ -443,6 +510,13 @@ class LlmManager private constructor(private val context: Context) {
 
         okHttpClient.newCall(request).enqueue(object : okhttp3.Callback {
             override fun onFailure(call: okhttp3.Call, e: java.io.IOException) {
+                // ========== 回调守卫 ==========
+                // 如果 sessionJob 已取消，直接返回，不触发任何回调
+                if (!sessionJob.isActive) {
+                    Log.d(TAG, "LLM stream onFailure: session job cancelled, drop callback")
+                    return
+                }
+
                 if (call.isCanceled() || isStreamCancelled) {
                     Log.d(TAG, "LLM stream cancelled")
                     return
@@ -454,6 +528,13 @@ class LlmManager private constructor(private val context: Context) {
             }
 
             override fun onResponse(call: okhttp3.Call, response: okhttp3.Response) {
+                // ========== 回调守卫 ==========
+                // 如果 sessionJob 已取消，直接返回，不触发任何回调
+                if (!sessionJob.isActive) {
+                    Log.d(TAG, "LLM stream onResponse: session job cancelled, drop callback")
+                    return
+                }
+
                 response.use { resp ->
                     if (!resp.isSuccessful) {
                         val errorBody = resp.body?.string() ?: "Unknown error"
@@ -474,6 +555,12 @@ class LlmManager private constructor(private val context: Context) {
                     try {
                         while (!source.exhausted()) {
                             if (isStreamCancelled) break
+                            // ========== 回调守卫 ==========
+                            // 每次循环都检查，如果 sessionJob 已取消，停止读取
+                            if (!sessionJob.isActive) {
+                                Log.d(TAG, "LLM stream read: session job cancelled, stop reading")
+                                break
+                            }
                             val line = source.readUtf8Line() ?: break
                             if (!line.startsWith("data:")) continue
                             val data = line.removePrefix("data:").trim()
@@ -486,9 +573,15 @@ class LlmManager private constructor(private val context: Context) {
                                 if (choices != null && choices.size() > 0) {
                                     val delta = choices[0].asJsonObject.getAsJsonObject("delta")
                                     val content = delta?.get("content")?.asString
-                                    if (content != null && content.isNotEmpty()) {
+                                    if (!content.isNullOrEmpty()) {
                                         fullText.append(content)
-                                        callback.onDelta(content)
+                                        // ========== 回调守卫 ==========
+                                        // 调用 onDelta 前再检查一次
+                                        if (sessionJob.isActive) {
+                                            callback.onDelta(content)
+                                        } else {
+                                            Log.d(TAG, "LLM stream onDelta: session job cancelled, drop delta")
+                                        }
                                     }
                                 }
                             } catch (e: Exception) {
@@ -499,6 +592,13 @@ class LlmManager private constructor(private val context: Context) {
                         val result = fullText.toString().trim()
                         if (isStreamCancelled) {
                             Log.d(TAG, "LLM stream cancelled before complete")
+                            return
+                        }
+
+                        // ========== 回调守卫 ==========
+                        // 调用 onComplete 前检查
+                        if (!sessionJob.isActive) {
+                            Log.d(TAG, "LLM stream onComplete: session job cancelled, drop callback")
                             return
                         }
 
@@ -517,6 +617,13 @@ class LlmManager private constructor(private val context: Context) {
                             Log.d(TAG, "LLM stream cancelled during read")
                             return
                         }
+
+                        // ========== 回调守卫 ==========
+                        if (!sessionJob.isActive) {
+                            Log.d(TAG, "LLM stream exception: session job cancelled, drop callback")
+                            return
+                        }
+
                         val errorMsg = "LLM stream read error: ${e.message}"
                         Log.e(TAG, errorMsg, e)
                         ModuleStateManager.onLlmError()
@@ -539,11 +646,18 @@ class LlmManager private constructor(private val context: Context) {
 
     /**
      * 取消当前请求
+     *
+     * 不仅取消 HTTP 请求，还取消当前会话的 Job，确保所有回调都被拦截
      */
     fun cancelRequest() {
         Log.d(TAG, "Cancel LLM request")
         isStreamCancelled = true
         okHttpClient.dispatcher.cancelAll()
+
+        // 取消当前会话的 Job，确保所有回调都被拦截
+        currentSessionJob?.cancel()
+        currentSessionJob = null
+        Log.d(TAG, "Session job cancelled")
     }
 
     /**
@@ -639,16 +753,10 @@ class LlmManager private constructor(private val context: Context) {
     }
 
     /**
-     * 构建Mock回复（用于无API Key时测试）
+     * 构建Mock回复（根据当前人格返回不同的模拟回复）
+     * 统一从 PersonaRegistry 获取配置，不再硬编码
      */
     private fun buildMockResponse(query: String): String {
-        // 简单的关键词回复，模拟多轮对话效果
-        return when {
-            query.contains("你好") || query.contains("嗨") || query.contains("hi") -> "你好呀！我是小R~ 很高兴见到你😊"
-            query.contains("名字") || query.contains("你是谁") -> "我叫小R，是你的陪伴机器人呀~"
-            query.contains("再见") || query.contains("拜拜") -> "拜拜~ 下次再来找我玩呀👋"
-            query.contains("谢谢") -> "不客气呀~ 嘿嘿"
-            else -> "嗯嗯，我听到啦！你说的是「${query.take(15)}${if (query.length > 15) "..." else ""}」，等配置好API Key我就能认真回答你啦~"
-        }
+        return PersonaRegistry.getConfig(currentPersona).buildMockResponse(query)
     }
 }

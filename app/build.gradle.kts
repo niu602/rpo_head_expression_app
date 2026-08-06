@@ -34,6 +34,8 @@ android {
 
         buildConfigField("String", "QWEN_ASR_API_KEY", "\"${localProps.getProperty("qwen.asr.api.key", "")}\"")
         buildConfigField("String", "QWEN_LLM_API_KEY", "\"${localProps.getProperty("qwen.llm.api.key", "")}\"")
+        // 云端情感TTS（预留）
+        buildConfigField("String", "CLOUD_TTS_APP_KEY", "\"${localProps.getProperty("cloud.tts.app.key", "")}\"")
     }
 
     buildTypes {
