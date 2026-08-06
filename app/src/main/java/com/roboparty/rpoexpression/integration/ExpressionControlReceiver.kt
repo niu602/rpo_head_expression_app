@@ -14,6 +14,7 @@ import com.roboparty.rpoexpression.expression.ExpressionMode
 import com.roboparty.rpoexpression.expression.ExpressionStyle
 import com.roboparty.rpoexpression.expression.ExpressionType
 import com.roboparty.rpoexpression.system.SystemStatusMonitor
+import com.roboparty.rpoexpression.util.PersonaSwitchManager
 
 /**
  * 表情控制广播接收器
@@ -95,7 +96,16 @@ class ExpressionControlReceiver : BroadcastReceiver() {
                     }
                 }
                 Log.d(TAG, "Set style: $style")
-                expressionManager.setStyle(style)
+                // 申请切换锁，确保切换过程原子性
+                if (PersonaSwitchManager.tryStartSwitch("tcpSetStyle")) {
+                    try {
+                        expressionManager.setStyle(style)
+                    } finally {
+                        PersonaSwitchManager.finishSwitch("tcpSetStyle")
+                    }
+                } else {
+                    Log.w(TAG, "tcpSetStyle: switch in progress, drop request")
+                }
             }
             ACTION_SET_INTENSITY -> {
                 val intensity = intent.getIntExtra("intensity", 100).coerceIn(0, 100)

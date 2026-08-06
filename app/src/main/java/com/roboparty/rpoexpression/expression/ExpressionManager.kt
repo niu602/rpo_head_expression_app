@@ -5,13 +5,16 @@
 package com.roboparty.rpoexpression.expression
 
 import android.util.Log
+import androidx.compose.ui.graphics.Color
 import com.roboparty.rpoexpression.RpoExpressionApp
 import com.roboparty.rpoexpression.animation.MicroAnimationLayer
+import com.roboparty.rpoexpression.audio.TtsManager
 import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.asStateFlow
 import java.util.concurrent.atomic.AtomicBoolean
 import kotlin.random.Random
-
+import com.roboparty.rpoexpression.llm.LlmManager
+import com.roboparty.rpoexpression.util.PersonaRegistry
 /**
  * 表情管理器 - 核心状态机
  * 纯眼部表情系统，负责表情切换、自动眨眼、状态管理
@@ -19,6 +22,21 @@ import kotlin.random.Random
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+
+/**
+ * 表情请求来源，用于优先级仲裁
+ * - LLM 情绪驱动：最高优先级（force 可抢占任何触摸表情）
+ * - 系统状态（电量/通信/OTA）：最高优先级
+ * - 语音交互（ASR/LLM思考/TTS说话）：高优先级
+ * - 触摸交互（点脸/点脸颊）：低优先级，不抢占 LLM 情绪
+ */
+enum class ExpressionSource(val weight: Int) {
+    TOUCH(0),           // 触摸交互（最低）
+    VOICE(1),            // 语音交互（ASR/TTS/LLM）
+    LLM_EMOTION(2),      // LLM 情绪驱动
+    SYSTEM(3),           // 系统状态（电量/通信/OTA，最高）
+}
+
 class ExpressionManager private constructor() {
 
     companion object {
@@ -74,6 +92,29 @@ class ExpressionManager private constructor() {
     // Demo演示模式
     private var demoJob: Job? = null
     private var isDemoRunning = false
+
+    // ==================== 光晕颜色状态 ====================
+    /**
+     * 当前光晕颜色（全局）
+     * 支持热更新：ConfigManager 更新后，渲染器在下一帧自动应用新颜色
+     * 男款默认冰蓝色，女款默认粉紫色
+     */
+    private val _currentGlowColor = MutableStateFlow(Color(0xFFCE93D8)) // 默认女款粉紫色
+    val currentGlowColor: StateFlow<Color> = _currentGlowColor.asStateFlow()
+
+    /**
+     * 设置光晕颜色
+     * @param color 新的光晕颜色
+     */
+    fun setGlowColor(color: Color) {
+        _currentGlowColor.value = color
+        Log.d(TAG, "Glow color updated: $color")
+    }
+
+    /**
+     * 获取当前光晕颜色（同步读取，用于渲染循环）
+     */
+    fun getGlowColor(): Color = _currentGlowColor.value
 
     // 自动回退
     private var autoFallbackJob: Job? = null
@@ -204,13 +245,226 @@ class ExpressionManager private constructor() {
     }
 
     /**
+     * 统一风格切换入口
+     *
+     * 解决问题：
+     * 1. setStyle() 与 toggleGender() 两条路径行为不一致
+     * 2. 联动逻辑分散，导致 TTS 音色被切两次
+     * 3. 重复调用行为不一致（一个幂等，一个不检查）
+     *
+     * 所有风格切换最终都汇聚到这个方法，确保：
+     * - 幂等检查统一
+     * - 动画/瞬切策略统一
+     * - 联动回调只触发一次
+     *
+     * @param target 目标风格
+     * @param animated 是否使用过渡动画
+     * @param force 是否强制切换（即使当前风格相同也重新触发）
+     */
+    fun switchStyle(target: ExpressionStyle, animated: Boolean, force: Boolean = false) {
+        // 1. 幂等检查：若当前风格已相同且不强制，直接返回
+        if (currentStyle == target && !force) {
+            Log.d(TAG, "switchStyle: already $target, skip")
+            return
+        }
+
+        // 2. 防重入：如果正在动画切换中，且不强制，直接返回
+        if (isGenderSwitching && !force) {
+            Log.w(TAG, "switchStyle: switch in progress, skip")
+            return
+        }
+
+        Log.i(TAG, "switchStyle: $currentStyle → $target, animated=$animated, force=$force")
+
+        // 3. 策略分支
+        if (animated) {
+            startAnimatedSwitch(target)
+        } else {
+            doInstantSwitch(target)
+        }
+    }
+
+    /**
+     * 直接设置风格（用于冷启动恢复）
+     * 与 switchStyle 的区别：
+     * - 跳过幂等检查，强制设置
+     * 无动画，直接瞬切
+     * 不触发 styleChangeCallbacks（避免不必要的联动）
+     * 不做防重入检查
+     * 专门用于冷启动或底层状态修复
+     *
+     * @param target 目标风格
+     */
+    fun setStyleDirectly(target: ExpressionStyle) {
+        currentStyle = target
+        _expressionState.value = _expressionState.value.copy(style = target)
+
+        // 同步设置对应风格的默认光晕颜色
+        // 虽然不触发回调，但光晕颜色作为风格的一部分，需要同步设置
+        val defaultGlowColor = getDefaultGlowColor(target)
+        _currentGlowColor.value = defaultGlowColor
+
+        Log.d(TAG, "Style directly set to: $target (cold start restore), glow color: $defaultGlowColor")
+    }
+
+    /**
+     * 瞬切：立即更新状态，触发回调
+     */
+    private fun doInstantSwitch(target: ExpressionStyle) {
+        currentStyle = target
+        _expressionState.value = _expressionState.value.copy(style = target)
+
+        // 触发风格变化回调（唯一的联动点）
+        // 所有联动逻辑（LLM 人格、TTS 音色、持久化等）都在回调中统一处理
+        notifyStyleChanged(target)
+    }
+
+    /**
+     * 动画切换：三段式动画序列
+     * 收缩 → 中间切换 → 展开 → 高光闪烁
+     */
+    private fun startAnimatedSwitch(target: ExpressionStyle) {
+        if (isPoweredOff) return
+        isGenderSwitching = true
+        autoFallbackJob?.cancel()
+        blinkJob?.cancel()
+
+        scope.launch {
+            try {
+                // 阶段1：收缩
+                val shrinkDuration = 200L
+                val start = System.currentTimeMillis()
+                var elapsed = 0L
+                while (elapsed < shrinkDuration && isActive) {
+                    val t = (elapsed.toFloat() / shrinkDuration).coerceIn(0f, 1f)
+                    val p = t * t
+                    genderSwitchOverlay = EyeParameters(
+                        eyelidOpenness = 1f - p,
+                        eyeHeightRatio = 0.7f - 0.6f * p,
+                        pupilSize = 0.6f - 0.5f * p,
+                        glowIntensity = 0.3f - 0.3f * p
+                    )
+                    delay(16L)
+                    elapsed = System.currentTimeMillis() - start
+                }
+
+                // 中间：切换风格（在闭眼状态下切换，避免突兀）
+                currentStyle = target
+                _expressionState.value = _expressionState.value.copy(style = target)
+
+                // 触发风格变化回调（唯一的联动点）
+                // 所有联动逻辑（LLM 人格、TTS 音色、持久化等）都在回调中统一处理
+                notifyStyleChanged(target)
+
+                delay(100L)
+
+                // 阶段3：展开（弹性回弹效果）
+                val expandDuration = 250L
+                val expandStart = System.currentTimeMillis()
+                elapsed = 0L
+                val s = 1.70158f
+                while (elapsed < expandDuration && isActive) {
+                    val t = (elapsed.toFloat() / expandDuration).coerceIn(0f, 1f)
+                    val p = 1f + (s + 1f) * (t - 1f) * (t - 1f) * (t - 1f) + s * (t - 1f) * (t - 1f)
+                    genderSwitchOverlay = EyeParameters(
+                        eyelidOpenness = p.coerceIn(0f, 1f),
+                        eyeHeightRatio = 0.1f + 0.6f * p,
+                        pupilSize = 0.1f + 0.5f * p,
+                        glowIntensity = 0.3f * p
+                    )
+                    delay(16L)
+                    elapsed = System.currentTimeMillis() - expandStart
+                }
+
+                // 阶段4：高光闪烁
+                val blinkDuration = 150L
+                val blinkStart = System.currentTimeMillis()
+                elapsed = 0L
+                while (elapsed < blinkDuration && isActive) {
+                    val t = (elapsed.toFloat() / blinkDuration).coerceIn(0f, 1f)
+                    val p = kotlin.math.sin(t * Math.PI.toFloat())
+                    genderSwitchOverlay = EyeParameters(
+                        glowIntensity = 0.3f + 0.5f * p,
+                        glowBlink = p > 0.5f
+                    )
+                    delay(16L)
+                    elapsed = System.currentTimeMillis() - blinkStart
+                }
+
+                genderSwitchOverlay = EyeParameters()
+                isGenderSwitching = false
+                startAutoBlink()
+
+                Log.i(TAG, "Animated switch complete: $target")
+            } catch (e: Exception) {
+                Log.e(TAG, "Animated switch failed", e)
+                genderSwitchOverlay = EyeParameters()
+                isGenderSwitching = false
+                startAutoBlink()
+            }
+        }
+    }
+
+    /**
+     * 通知风格变化（统一的回调触发点）
+     * 所有联动逻辑（LLM 人格、TTS 音色、持久化、光晕颜色等）都在回调中统一处理
+     */
+    private fun notifyStyleChanged(style: ExpressionStyle) {
+        // 设置对应风格的默认光晕颜色
+        val defaultGlowColor = getDefaultGlowColor(style)
+        _currentGlowColor.value = defaultGlowColor
+        Log.d(TAG, "Style changed to $style, glow color updated to $defaultGlowColor")
+
+        styleChangeCallbacks.forEach { callback ->
+            try {
+                callback(style)
+            } catch (e: Exception) {
+                Log.e(TAG, "Style change callback failed", e)
+            }
+        }
+    }
+
+    /**
+     * 根据风格获取默认的光晕颜色
+     * @param style 表情风格
+     * @return 对应的默认光晕颜色
+     */
+    private fun getDefaultGlowColor(style: ExpressionStyle): Color {
+        return when (style) {
+            ExpressionStyle.MALE -> Color(0xFF4FC3F7)    // 男款：冰蓝色
+            ExpressionStyle.FEMALE -> Color(0xFFCE93D8)  // 女款：粉紫色
+        }
+    }
+
+    /**
      * 设置眼内特效（瞳孔区域特效）
      * @param effect 特效类型
      * @param duration 持续时长，null表示持续直到被清除
     **/
     fun setStyle(style: ExpressionStyle) {
-        currentStyle = style
-        _expressionState.value = _expressionState.value.copy(style = style)
+        // 降级为辅助方法，调用统一入口
+        switchStyle(style, animated = false)
+    }
+
+    private fun syncPersonaAndVoice(style: ExpressionStyle) {
+        try {
+            val context = RpoExpressionApp.instance
+            // 从 PersonaRegistry 反向查找人格配置
+            val config = PersonaRegistry.getByStyle(style)
+            if (config != null) {
+                // 1. 切换 TTS 音色
+                TtsManager.getInstance(context).applyVoiceStyle(style)
+
+                // 2. 切换 LLM 人格
+                LlmManager.getInstance(context).setPersona(config.persona)
+
+                Log.i(TAG, "Persona and voice synced with style: $style -> ${config.persona}")
+            } else {
+                Log.w(TAG, "No persona config found for style: $style, skip sync")
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to sync persona/voice", e)
+        }
     }
 
     fun setLongPressProgress(progress: Float) {
@@ -285,73 +539,19 @@ class ExpressionManager private constructor() {
         startSleepCycle()
     }
 
+    /**
+     * 切换男女风格（带动画过渡）
+     *
+     * 降级为辅助方法，仅计算目标风格并调用统一入口 switchStyle()
+     * 动画逻辑已统一到 startAnimatedSwitch() 中
+     */
     fun toggleGender() {
-        if (isPoweredOff || isGenderSwitching) return
-        isGenderSwitching = true
-        autoFallbackJob?.cancel()
-        blinkJob?.cancel()
-
-        scope.launch {
-            // 阶段1：收缩
-            val shrinkDuration = 200L
-            val start = System.currentTimeMillis()
-            var elapsed = 0L
-            while (elapsed < shrinkDuration && isActive) {
-                val t = (elapsed.toFloat() / shrinkDuration).coerceIn(0f, 1f)
-                val p = t * t
-                genderSwitchOverlay = EyeParameters(
-                    eyelidOpenness = 1f - p,
-                    eyeHeightRatio = 0.7f - 0.6f * p,
-                    pupilSize = 0.6f - 0.5f * p,
-                    glowIntensity = 0.3f - 0.3f * p
-                )
-                delay(16L)
-                elapsed = System.currentTimeMillis() - start
-            }
-
-            // 切换性别
-            val newStyle = if (currentStyle == ExpressionStyle.MALE) ExpressionStyle.FEMALE else ExpressionStyle.MALE
-            setStyle(newStyle)
-            styleChangeCallbacks.forEach { it(newStyle) }
-            delay(100L)
-
-            // 阶段3：展开
-            val expandDuration = 250L
-            val expandStart = System.currentTimeMillis()
-            elapsed = 0L
-            val s = 1.70158f
-            while (elapsed < expandDuration && isActive) {
-                val t = (elapsed.toFloat() / expandDuration).coerceIn(0f, 1f)
-                val p = 1f + (s + 1f) * (t - 1f) * (t - 1f) * (t - 1f) + s * (t - 1f) * (t - 1f)
-                genderSwitchOverlay = EyeParameters(
-                    eyelidOpenness = p.coerceIn(0f, 1f),
-                    eyeHeightRatio = 0.1f + 0.6f * p,
-                    pupilSize = 0.1f + 0.5f * p,
-                    glowIntensity = 0.3f * p
-                )
-                delay(16L)
-                elapsed = System.currentTimeMillis() - expandStart
-            }
-
-            // 阶段4：高光闪烁
-            val blinkDuration = 150L
-            val blinkStart = System.currentTimeMillis()
-            elapsed = 0L
-            while (elapsed < blinkDuration && isActive) {
-                val t = (elapsed.toFloat() / blinkDuration).coerceIn(0f, 1f)
-                val p = kotlin.math.sin(t * Math.PI.toFloat())
-                genderSwitchOverlay = EyeParameters(
-                    glowIntensity = 0.3f + 0.5f * p,
-                    glowBlink = p > 0.5f
-                )
-                delay(16L)
-                elapsed = System.currentTimeMillis() - blinkStart
-            }
-
-            genderSwitchOverlay = EyeParameters()
-            isGenderSwitching = false
-            startAutoBlink()
+        val target = if (currentStyle == ExpressionStyle.MALE) {
+            ExpressionStyle.FEMALE
+        } else {
+            ExpressionStyle.MALE
         }
+        switchStyle(target, animated = true)
     }
 
     fun powerOff() {
@@ -459,11 +659,36 @@ class ExpressionManager private constructor() {
         }
     }
 
+    // 当前表情来源（用于优先级仲裁）
+    @Volatile
+    private var currentSource: ExpressionSource = ExpressionSource.VOICE
+
+    /**
+     * 请求表情切换（兼容现有调用的默认方法）
+     * 默认来源为 VOICE，force=true 时绕过优先级检查
+     */
     fun requestExpression(
         type: ExpressionType,
         intensity: Int = 100,
         duration: Long? = null,
         force: Boolean = false
+    ): Boolean = requestExpression(type, intensity, duration, force, ExpressionSource.VOICE)
+
+    /**
+     * 请求表情切换（带来源标记）
+     * @param source 表情请求来源，用于优先级仲裁
+     *
+     * 仲裁规则：
+     * - force=true 始终允许抢占
+     * - 非 force 时：高 weight 来源可抢占低 weight，同等 weight 按类型 priority 抢占
+     * - 触摸来源（weight=0）无法抢占 LLM 情绪（weight=2）
+     */
+    fun requestExpression(
+        type: ExpressionType,
+        intensity: Int,
+        duration: Long?,
+        force: Boolean,
+        source: ExpressionSource
     ): Boolean {
         if (isPoweredOff) return false
         if (type == ExpressionType.BLINK) {
@@ -472,9 +697,18 @@ class ExpressionManager private constructor() {
         }
 
         val now = System.currentTimeMillis()
+
+        // ===== 优先级仲裁 =====
+        // 触摸来源无法抢占更高优先级来源的表情（LLM情绪/系统状态）
+        if (!force && source.weight < currentSource.weight) {
+            Log.d(TAG, "Expression $type blocked: source=$source weight=${source.weight} < current=$currentSource weight=${currentSource.weight}")
+            return false
+        }
+
         if (!force && now - lastSwitchTime < DEBOUNCE_INTERVAL) return false
         if (!force && type.priority < _expressionState.value.type.priority) return false
 
+        currentSource = source
         lastSwitchTime = now
         autoFallbackJob?.cancel()
 
@@ -491,6 +725,8 @@ class ExpressionManager private constructor() {
                 delay(actualDur)
                 if (_expressionState.value.type == type) {
                     _expressionState.value = _expressionState.value.copy(type = ExpressionType.IDLE, startTime = System.currentTimeMillis(), transitionProgress = 0f)
+                    // 表情到期回落，重置来源为默认
+                    currentSource = ExpressionSource.VOICE
                 }
             }
         }
@@ -521,6 +757,7 @@ class ExpressionManager private constructor() {
     fun clearExpression() {
         if (isPoweredOff) return
         autoFallbackJob?.cancel()
+        currentSource = ExpressionSource.VOICE
                     _expressionState.value = _expressionState.value.copy(type = ExpressionType.IDLE, startTime = System.currentTimeMillis(), transitionProgress = 0f)
     }
 

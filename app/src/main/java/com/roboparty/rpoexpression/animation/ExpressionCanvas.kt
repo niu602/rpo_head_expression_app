@@ -35,6 +35,7 @@ import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.graphics.drawscope.Fill
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.graphics.nativeCanvas
 // 滑动区域枚举
 private enum class SwipeSide { NONE, LEFT_BRIGHTNESS, RIGHT_VOLUME }
 
@@ -96,6 +97,9 @@ fun ExpressionCanvas(
     var refreshCountdownProgress by remember { mutableStateOf(0f) }
     var isRefreshCd by remember { mutableStateOf(false) }
 
+    // 设置面板状态
+    var isSettingsPanelVisible by remember { mutableStateOf(false) }
+
     Canvas(
         modifier = modifier
             .fillMaxSize()
@@ -118,10 +122,130 @@ fun ExpressionCanvas(
                         val w = size.width
                         val h = size.height
 
-                        // 检测模式切换按钮点击（左下角）
-                        val modeBtnSize = 50f * density
-                        if (offset.x < modeBtnSize * 1.5f && offset.y > h - modeBtnSize * 1.5f) {
-                            expressionManager.toggleMode()
+                        // 检测设置按钮点击（左下角，原模式切换按钮升级为设置入口）
+                        val settingsBtnSize = 50f * density
+                        if (offset.x < settingsBtnSize * 1.5f && offset.y > h - settingsBtnSize * 1.5f) {
+                            // 切换设置面板显示状态
+                            isSettingsPanelVisible = !isSettingsPanelVisible
+                            return@detectTapGestures
+                        }
+
+                        // 如果设置面板显示中，点击其他区域关闭面板
+                        if (isSettingsPanelVisible) {
+                            // 计算面板区域（居中显示，宽度为屏幕的 70%，高度为 60%）
+                            val panelWidth = w * 0.7f
+                            val panelHeight = h * 0.6f
+                            val panelLeft = (w - panelWidth) / 2f
+                            val panelTop = (h - panelHeight) / 2f
+                            val panelRight = panelLeft + panelWidth
+                            val panelBottom = panelTop + panelHeight
+
+                            // 点击面板外区域，关闭面板
+                            if (offset.x < panelLeft || offset.x > panelRight ||
+                                offset.y < panelTop || offset.y > panelBottom) {
+                                isSettingsPanelVisible = false
+                                return@detectTapGestures
+                            }
+
+                            // 检测关闭按钮点击（右上角 X）
+                            val closeBtnSize = 30f * density
+                            val closeBtnX = panelRight - 25f * density
+                            val closeBtnY = panelTop + 25f * density
+                            val closeBtnLeft = closeBtnX - closeBtnSize / 2f
+                            val closeBtnRight = closeBtnX + closeBtnSize / 2f
+                            val closeBtnTop = closeBtnY - closeBtnSize / 2f
+                            val closeBtnBottom = closeBtnY + closeBtnSize / 2f
+
+                            if (offset.x >= closeBtnLeft && offset.x <= closeBtnRight &&
+                                offset.y >= closeBtnTop && offset.y <= closeBtnBottom) {
+                                isSettingsPanelVisible = false
+                                return@detectTapGestures
+                            }
+
+                            // 点击面板内区域，处理音色选择点击
+                            // 获取当前人格对应的音色列表
+                            val currentPersona = app.llmManager.getPersona()
+                            val config = com.roboparty.rpoexpression.util.PersonaRegistry.getConfig(currentPersona)
+                            val voiceList = com.roboparty.rpoexpression.util.VoiceLibrary.getVoices(config.expressionStyle)
+                            val currentVoiceId = app.voicePreferenceStore.getSelectedVoice(currentPersona)
+                                ?: com.roboparty.rpoexpression.util.VoiceLibrary.getDefault(config.expressionStyle).voiceId
+
+                            // 音色按钮布局：纵向排列，每个按钮高度 50dp
+                            val voiceBtnHeight = 50f * density
+                            val voiceBtnMargin = 10f * density
+                            val voiceListTop = panelTop + 80f * density // 留出标题空间
+
+                            for (i in voiceList.indices) {
+                                val voice = voiceList[i]
+                                val btnTop = voiceListTop + i * (voiceBtnHeight + voiceBtnMargin)
+                                val btnBottom = btnTop + voiceBtnHeight
+                                val btnLeft = panelLeft + 20f * density
+                                val btnRight = panelRight - 20f * density
+
+                                if (offset.y >= btnTop && offset.y <= btnBottom &&
+                                    offset.x >= btnLeft && offset.x <= btnRight) {
+                                    // 点击了音色按钮
+                                    // 区分是点击左侧选择区域还是右侧试听按钮
+                                    val trialBtnWidth = 60f * density
+                                    val trialBtnLeft = btnRight - trialBtnWidth - 10f * density
+
+                                    if (offset.x >= trialBtnLeft) {
+                                        // 点击试听按钮
+                                        // 先切换到该音色，然后播放试听句
+                                        app.audioManager.stopSpeaking()
+                                        app.audioManager.setTtsVoice(voice.voiceId)
+                                        app.audioManager.startSpeaking(voice.sampleText)
+                                    } else {
+                                        // 点击选择区域，切换音色
+                                        // 保存用户选择
+                                        app.voicePreferenceStore.setSelectedVoice(currentPersona, voice.voiceId)
+                                        // 切换 TTS 音色
+                                        app.audioManager.setTtsVoice(voice.voiceId)
+                                        // 播放试听句
+                                        app.audioManager.stopSpeaking()
+                                        app.audioManager.startSpeaking(voice.sampleText)
+
+                                        // 预缓存当前人格的固定句式
+                                        // 后台执行，不阻塞主线程
+                                        kotlinx.coroutines.GlobalScope.launch(kotlinx.coroutines.Dispatchers.IO) {
+                                            try {
+                                                val config = com.roboparty.rpoexpression.util.PersonaRegistry.getConfig(currentPersona)
+                                                val phrases = config.fixedPhrases
+                                                for (phrase in phrases) {
+                                                    app.audioManager.preloadTts(phrase)
+                                                }
+                                                android.util.Log.d("ExpressionCanvas", "Preloaded ${phrases.size} phrases for voice ${voice.voiceId}")
+                                            } catch (e: Exception) {
+                                                android.util.Log.e("ExpressionCanvas", "Preload failed", e)
+                                            }
+                                        }
+                                    }
+                                    return@detectTapGestures
+                                }
+                            }
+
+                            return@detectTapGestures
+                        }
+
+                        // 检测切换男女按钮点击（底部中间，和刷新键一行、和关机键一列）
+                        val genderBtnSize = 60f * density
+                        val genderBtnX = w / 2f
+                        val genderBtnY = h - genderBtnSize * 0.75f
+                        val inGenderArea = offset.y > genderBtnY - genderBtnSize &&
+                                offset.x > genderBtnX - genderBtnSize &&
+                                offset.y < genderBtnY + genderBtnSize &&
+                                offset.x < genderBtnX + genderBtnSize
+                        if (inGenderArea) {
+                            // 关机状态下不响应
+                            if (expressionManager.isPoweredOff()) {
+                                return@detectTapGestures
+                            }
+                            // 切换中不响应（防重入）
+                            if (expressionManager.isGenderSwitching()) {
+                                return@detectTapGestures
+                            }
+                            // 触发男女切换
+                            expressionManager.toggleGender()
                             return@detectTapGestures
                         }
 
@@ -578,7 +702,91 @@ fun ExpressionCanvas(
             }
         }
 
-        // ========== 绘制模式切换按钮（左下角） ==========
+        // ========== 绘制切换男女按钮（底部中间，和刷新键一行、和关机键一列） ==========
+        run {
+            val btnSize = 60f * density
+            val btnX = size.width / 2f
+            val btnY = size.height - btnSize * 0.75f
+            val btnRadius = 16f * density
+            val breath = 0.85f + 0.15f * kotlin.math.sin(System.currentTimeMillis() / 500f)
+
+            // 按钮透明度和颜色
+            val isSwitching = expressionManager.isGenderSwitching()
+            val btnAlpha = when {
+                isSwitching -> 0.5f  // 切换中半透明
+                else -> 0.4f * breath
+            }
+            val btnBgColor = when {
+                isSwitching -> Color(0xFFE0E0E0)
+                else -> Color(0xFFE0E0E0)
+            }
+
+            // 按钮背景：圆角方形
+            drawRoundRect(
+                color = btnBgColor.copy(alpha = btnAlpha),
+                topLeft = Offset(btnX - btnSize/2, btnY - btnSize/2),
+                size = Size(btnSize, btnSize),
+                cornerRadius = CornerRadius(btnRadius, btnRadius),
+                style = Fill
+            )
+
+            // 性别切换图标（左右箭头 + 中间圆点，表示切换）
+            val iconColor = when {
+                isSwitching -> Color(0xFF9E9E9E).copy(alpha = btnAlpha)
+                else -> Color(0xFF616161).copy(alpha = btnAlpha)
+            }
+            val iconHalfWidth = btnSize * 0.25f
+            val iconHalfHeight = btnSize * 0.12f
+
+            // 左箭头
+            drawLine(
+                color = iconColor,
+                start = Offset(btnX - iconHalfWidth * 0.3f, btnY - iconHalfHeight),
+                end = Offset(btnX - iconHalfWidth, btnY),
+                strokeWidth = 3.5f * density,
+                cap = StrokeCap.Round
+            )
+            drawLine(
+                color = iconColor,
+                start = Offset(btnX - iconHalfWidth * 0.3f, btnY + iconHalfHeight),
+                end = Offset(btnX - iconHalfWidth, btnY),
+                strokeWidth = 3.5f * density,
+                cap = StrokeCap.Round
+            )
+
+            // 右箭头
+            drawLine(
+                color = iconColor,
+                start = Offset(btnX + iconHalfWidth * 0.3f, btnY - iconHalfHeight),
+                end = Offset(btnX + iconHalfWidth, btnY),
+                strokeWidth = 3.5f * density,
+                cap = StrokeCap.Round
+            )
+            drawLine(
+                color = iconColor,
+                start = Offset(btnX + iconHalfWidth * 0.3f, btnY + iconHalfHeight),
+                end = Offset(btnX + iconHalfWidth, btnY),
+                strokeWidth = 3.5f * density,
+                cap = StrokeCap.Round
+            )
+
+            // 中间连接线
+            drawLine(
+                color = iconColor,
+                start = Offset(btnX - iconHalfWidth * 0.3f, btnY),
+                end = Offset(btnX + iconHalfWidth * 0.3f, btnY),
+                strokeWidth = 3.5f * density,
+                cap = StrokeCap.Round
+            )
+
+            // 切换中动画：旋转效果
+            if (isSwitching) {
+                val rotation = (System.currentTimeMillis() / 10f) % 360f
+                // 可以在这里添加旋转动画，暂时用简单的呼吸效果代替
+            }
+        }
+
+        // ========== 绘制设置按钮（左下角，原模式切换按钮升级为设置入口） ==========
         run {
             val btnSize = 50f * density
             val btnX = btnSize * 0.75f
@@ -597,7 +805,7 @@ fun ExpressionCanvas(
             )
             // 边框
             drawRoundRect(
-                color = if (currentMode == com.roboparty.rpoexpression.expression.ExpressionMode.ENERGY) {
+                color = if (isSettingsPanelVisible) {
                     Color(0xFF4FC3F7).copy(alpha = alpha + 0.25f)
                 } else {
                     Color(0xFF9E9E9E).copy(alpha = alpha)
@@ -608,44 +816,250 @@ fun ExpressionCanvas(
                 style = Stroke(width = 2f * density)
             )
 
-            // 图标：传统模式=眼睛简化（两个小圆），能量模式=能量球（大圆+光晕）
-            val iconColor = if (currentMode == com.roboparty.rpoexpression.expression.ExpressionMode.ENERGY) {
+            // 齿轮图标（简化版：外圈 + 中心圆 + 8个齿）
+            val iconColor = if (isSettingsPanelVisible) {
                 Color(0xFF4FC3F7).copy(alpha = alpha + 0.35f)
             } else {
                 Color(0xFFE0E0E0).copy(alpha = alpha + 0.2f)
             }
-            if (currentMode == com.roboparty.rpoexpression.expression.ExpressionMode.ENERGY) {
-                // 能量模式图标：中心发光圆 + 光晕
-                drawCircle(
-                    color = iconColor.copy(alpha = iconColor.alpha * 0.3f),
-                    radius = btnSize * 0.28f,
-                    center = Offset(btnX, btnY)
-                )
-                drawCircle(
+            val outerR = btnSize * 0.22f
+            val innerR = btnSize * 0.10f
+            val toothLength = btnSize * 0.06f
+
+            // 绘制 8 个齿（上下左右 + 四个对角）
+            val toothWidth = btnSize * 0.04f
+            for (i in 0 until 8) {
+                val angle = i * 45f
+                val rad = Math.toRadians(angle.toDouble()).toFloat()
+                val cos = kotlin.math.cos(rad)
+                val sin = kotlin.math.sin(rad)
+
+                // 齿的位置：从外圈向外延伸
+                val startX = btnX + cos * outerR
+                val startY = btnY + sin * outerR
+                val endX = btnX + cos * (outerR + toothLength)
+                val endY = btnY + sin * (outerR + toothLength)
+
+                drawLine(
                     color = iconColor,
-                    radius = btnSize * 0.14f,
-                    center = Offset(btnX, btnY)
-                )
-                drawCircle(
-                    color = Color.White.copy(alpha = iconColor.alpha * 0.8f),
-                    radius = btnSize * 0.05f,
-                    center = Offset(btnX, btnY)
-                )
-            } else {
-                // 传统模式图标：左右两个小圆（眼睛）
-                val eyeR = btnSize * 0.1f
-                val eyeSep = btnSize * 0.15f
-                drawCircle(
-                    color = iconColor,
-                    radius = eyeR,
-                    center = Offset(btnX - eyeSep, btnY)
-                )
-                drawCircle(
-                    color = iconColor,
-                    radius = eyeR,
-                    center = Offset(btnX + eyeSep, btnY)
+                    start = Offset(startX, startY),
+                    end = Offset(endX, endY),
+                    strokeWidth = toothWidth,
+                    cap = StrokeCap.Round
                 )
             }
+
+            // 外圈圆
+            drawCircle(
+                color = iconColor,
+                radius = outerR,
+                center = Offset(btnX, btnY),
+                style = Stroke(width = 2.5f * density)
+            )
+
+            // 中心圆
+            drawCircle(
+                color = iconColor,
+                radius = innerR,
+                center = Offset(btnX, btnY),
+                style = Fill
+            )
+        }
+
+        // ========== 绘制设置面板（覆盖在表情画布之上） ==========
+        if (isSettingsPanelVisible) {
+            val w = size.width
+            val h = size.height
+            val panelWidth = w * 0.7f
+            val panelHeight = h * 0.6f
+            val panelLeft = (w - panelWidth) / 2f
+            val panelTop = (h - panelHeight) / 2f
+            val panelRight = panelLeft + panelWidth
+            val panelBottom = panelTop + panelHeight
+            val cornerRadius = 20f * density
+
+            // 半透明遮罩
+            drawRect(
+                color = Color(0x000000).copy(alpha = 0.5f),
+                size = size
+            )
+
+            // 面板背景
+            drawRoundRect(
+                color = Color(0xFF1A1A2E).copy(alpha = 0.95f),
+                topLeft = Offset(panelLeft, panelTop),
+                size = Size(panelWidth, panelHeight),
+                cornerRadius = CornerRadius(cornerRadius, cornerRadius),
+                style = Fill
+            )
+
+            // 面板边框
+            drawRoundRect(
+                color = Color(0xFF4FC3F7).copy(alpha = 0.5f),
+                topLeft = Offset(panelLeft, panelTop),
+                size = Size(panelWidth, panelHeight),
+                cornerRadius = CornerRadius(cornerRadius, cornerRadius),
+                style = Stroke(width = 2f * density)
+            )
+
+            // 面板标题
+            // 用 nativeCanvas 绘制文字
+            val nativeCanvas = drawContext.canvas.nativeCanvas
+            val titlePaint = android.graphics.Paint().apply {
+                color = android.graphics.Color.parseColor("#4FC3F7")
+                textSize = 18f * density
+                isFakeBoldText = true
+                textAlign = android.graphics.Paint.Align.CENTER
+            }
+            val titleY = panelTop + 35f * density
+            nativeCanvas.drawText("音色选择", w / 2f, titleY, titlePaint)
+
+            // 分隔线
+            drawLine(
+                color = Color(0xFF4FC3F7).copy(alpha = 0.5f),
+                start = Offset(panelLeft + 20f * density, titleY + 15f * density),
+                end = Offset(panelRight - 20f * density, titleY + 15f * density),
+                strokeWidth = 1f * density
+            )
+
+            // 音色列表
+            // 获取当前人格对应的音色列表
+            val currentPersona = app.llmManager.getPersona()
+            val config = com.roboparty.rpoexpression.util.PersonaRegistry.getConfig(currentPersona)
+            val voiceList = com.roboparty.rpoexpression.util.VoiceLibrary.getVoices(config.expressionStyle)
+            val currentVoiceId = app.voicePreferenceStore.getSelectedVoice(currentPersona)
+                ?: com.roboparty.rpoexpression.util.VoiceLibrary.getDefault(config.expressionStyle).voiceId
+
+            // 音色按钮布局：纵向排列
+            val voiceBtnHeight = 50f * density
+            val voiceBtnMargin = 10f * density
+            val voiceListTop = titleY + 35f * density
+
+            val namePaint = android.graphics.Paint().apply {
+                color = android.graphics.Color.parseColor("#E0E0E0")
+                textSize = 14f * density
+                textAlign = android.graphics.Paint.Align.LEFT
+            }
+            val tagPaint = android.graphics.Paint().apply {
+                color = android.graphics.Color.parseColor("#9E9E9E")
+                textSize = 11f * density
+                textAlign = android.graphics.Paint.Align.LEFT
+            }
+            val trialPaint = android.graphics.Paint().apply {
+                color = android.graphics.Color.parseColor("#4FC3F7")
+                textSize = 12f * density
+                textAlign = android.graphics.Paint.Align.CENTER
+            }
+
+            for (i in voiceList.indices) {
+                val voice = voiceList[i]
+                val btnTop = voiceListTop + i * (voiceBtnHeight + voiceBtnMargin)
+                val btnBottom = btnTop + voiceBtnHeight
+                val btnLeft = panelLeft + 20f * density
+                val btnRight = panelRight - 20f * density
+                val btnWidth = btnRight - btnLeft
+
+                val isSelected = voice.voiceId == currentVoiceId
+
+                // 按钮背景
+                drawRoundRect(
+                    color = if (isSelected) {
+                        Color(0xFF4FC3F7).copy(alpha = 0.2f)
+                    } else {
+                        Color(0xFF2A2A3E).copy(alpha = 0.5f)
+                    },
+                    topLeft = Offset(btnLeft, btnTop),
+                    size = Size(btnWidth, voiceBtnHeight),
+                    cornerRadius = CornerRadius(10f * density, 10f * density),
+                    style = Fill
+                )
+
+                // 选中边框
+                if (isSelected) {
+                    drawRoundRect(
+                        color = Color(0xFF4FC3F7).copy(alpha = 0.8f),
+                        topLeft = Offset(btnLeft, btnTop),
+                        size = Size(btnWidth, voiceBtnHeight),
+                        cornerRadius = CornerRadius(10f * density, 10f * density),
+                        style = Stroke(width = 1.5f * density)
+                    )
+                }
+
+                // 选中圆点
+                val dotRadius = 6f * density
+                val dotX = btnLeft + 15f * density
+                val dotY = btnTop + voiceBtnHeight / 2f
+                drawCircle(
+                    color = if (isSelected) Color(0xFF4FC3F7) else Color(0xFF616161),
+                    radius = dotRadius,
+                    center = Offset(dotX, dotY),
+                    style = if (isSelected) Fill else Stroke(width = 1.5f * density)
+                )
+
+                // 音色名称
+                val nameX = btnLeft + 35f * density
+                val nameY = btnTop + 20f * density
+                namePaint.color = if (isSelected) {
+                    android.graphics.Color.parseColor("#4FC3F7")
+                } else {
+                    android.graphics.Color.parseColor("#E0E0E0")
+                }
+                nativeCanvas.drawText(voice.displayName, nameX, nameY, namePaint)
+
+                // 风格标签
+                val tagX = btnLeft + 35f * density
+                val tagY = btnTop + 38f * density
+                nativeCanvas.drawText(voice.tag, tagX, tagY, tagPaint)
+
+                // 试听按钮
+                val trialBtnWidth = 50f * density
+                val trialBtnHeight = 28f * density
+                val trialBtnLeft = btnRight - trialBtnWidth - 10f * density
+                val trialBtnTop = btnTop + (voiceBtnHeight - trialBtnHeight) / 2f
+                val trialBtnRight = btnRight - 10f * density
+                val trialBtnBottom = trialBtnTop + trialBtnHeight
+
+                drawRoundRect(
+                    color = Color(0xFF4FC3F7).copy(alpha = 0.3f),
+                    topLeft = Offset(trialBtnLeft, trialBtnTop),
+                    size = Size(trialBtnWidth, trialBtnHeight),
+                    cornerRadius = CornerRadius(6f * density, 6f * density),
+                    style = Fill
+                )
+
+                // 试听文字
+                val trialX = trialBtnLeft + trialBtnWidth / 2f
+                val trialY = trialBtnTop + trialBtnHeight / 2f + 4f * density
+                nativeCanvas.drawText("试听", trialX, trialY, trialPaint)
+            }
+
+            // 底部提示
+            val hintPaint = android.graphics.Paint().apply {
+                color = android.graphics.Color.parseColor("#616161")
+                textSize = 10f * density
+                textAlign = android.graphics.Paint.Align.CENTER
+            }
+            val hintY = panelBottom - 20f * density
+            nativeCanvas.drawText("点击左侧选择，点击右侧试听", w / 2f, hintY, hintPaint)
+
+            // 关闭按钮提示（右上角）
+            val closeBtnSize = 30f * density
+            val closeBtnX = panelRight - 25f * density
+            val closeBtnY = panelTop + 25f * density
+            drawLine(
+                color = Color(0xFF9E9E9E).copy(alpha = 0.8f),
+                start = Offset(closeBtnX - closeBtnSize/2, closeBtnY - closeBtnSize/2),
+                end = Offset(closeBtnX + closeBtnSize/2, closeBtnY + closeBtnSize/2),
+                strokeWidth = 2f * density,
+                cap = StrokeCap.Round
+            )
+            drawLine(
+                color = Color(0xFF9E9E9E).copy(alpha = 0.8f),
+                start = Offset(closeBtnX + closeBtnSize/2, closeBtnY - closeBtnSize/2),
+                end = Offset(closeBtnX - closeBtnSize/2, closeBtnY + closeBtnSize/2),
+                strokeWidth = 2f * density,
+                cap = StrokeCap.Round
+            )
         }
     }
 

@@ -54,10 +54,25 @@ class KwsManager private constructor(private val context: Context) {
      * KWS检测回调
      */
     interface KwsCallback {
-        /** 检测到唤醒词 */
-        fun onKeywordDetected(keyword: String, confidence: Float)
+        /** 检测到唤醒词
+         *  @param keyword 匹配到的原始文本
+         *  @param confidence 置信度
+         *  @param group 唤醒词组（萝卜组/阿冷组）
+         */
+        fun onKeywordDetected(keyword: String, confidence: Float, group: WakeWordGroup)
         /** KWS出错 */
         fun onError(error: String)
+    }
+
+    /**
+     * 唤醒词组枚举
+     * 用于区分不同人格的唤醒词
+     */
+    enum class WakeWordGroup {
+        /** 萝卜人格唤醒词组（女款·活泼可爱） */
+        LUOBO,
+        /** 阿冷人格唤醒词组（男款·冷静沉稳） */
+        ALIN
     }
 
     // ========== 内部状态 ==========
@@ -74,11 +89,17 @@ class KwsManager private constructor(private val context: Context) {
 
     private var callback: KwsCallback? = null
 
-    // 唤醒词列表（ASR fallback模式使用）
-    private val wakeWords = listOf(
+    // 萝卜人格唤醒词（女款·活泼可爱）
+    private val luoboWakeWords = listOf(
         "萝卜", "萝卜萝卜", "罗布", "罗波",
-        "hiro", "hirobot", "hi bot",
-        "小r", "小二", "小儿"
+        "小萝卜", "萝卜头"
+    )
+
+    // 阿冷人格唤醒词（男款·冷静沉稳）
+    // 注意：包含"阿懔"是因为用户可能用这个字，ASR可能识别成各种变体
+    private val alinWakeWords = listOf(
+        "阿冷", "啊凛", "阿林", "阿霖", "阿懔",
+        "凛子", "凛"
     )
 
     /**
@@ -198,6 +219,14 @@ class KwsManager private constructor(private val context: Context) {
             override fun onResult(text: String) {
                 if (!isRunning) return
 
+                // TTS 尾部保护期：防止回声被误判
+                val timeSinceTts = System.currentTimeMillis() - lastTtsStopTime
+                if (timeSinceTts < TTS_TAIL_PROTECTION_MS) {
+                    Log.d(TAG, "KWS TTS tail protection (${TTS_TAIL_PROTECTION_MS - timeSinceTts}ms left)")
+                    restartDetection()
+                    return
+                }
+
                 // 冷却期检查
                 if (System.currentTimeMillis() - lastTriggerTime < TRIGGER_COOLDOWN_MS) {
                     restartDetection()
@@ -208,14 +237,14 @@ class KwsManager private constructor(private val context: Context) {
                 val raw = text.lowercase()
                     .replace(Regex("[^a-z\\u4e00-\\u9fa5]"), "")
 
-                // 唤醒词匹配
-                val hit = wakeWords.any { word -> isFuzzyMatch(raw, word) }
+                // 唤醒词分组匹配
+                val group = matchWakeWordGroup(raw)
 
-                if (hit) {
+                if (group != null) {
                     lastTriggerTime = System.currentTimeMillis()
-                    Log.i(TAG, "Wake word detected via ASR: '$raw'")
+                    Log.i(TAG, "Wake word detected via ASR: '$raw', group=$group")
                     mainHandler.post {
-                        callback?.onKeywordDetected(raw, 0.85f)
+                        callback?.onKeywordDetected(raw, 0.85f, group)
                     }
                     // 唤醒后不再自动重启，上层会调 stop()
                 } else {
@@ -245,6 +274,24 @@ class KwsManager private constructor(private val context: Context) {
     }
 
     // ========== 唤醒词匹配（从MainActivity迁移，保持一致） ==========
+
+    /**
+     * 判断输入文本属于哪个唤醒词组
+     * 先匹配萝卜组，再匹配阿冷组（萝卜组优先级更高，因为是默认人格）
+     *
+     * @return 命中的组，null 表示没有命中任何唤醒词
+     */
+    private fun matchWakeWordGroup(input: String): WakeWordGroup? {
+        // 先匹配萝卜组
+        if (luoboWakeWords.any { word -> isFuzzyMatch(input, word) }) {
+            return WakeWordGroup.LUOBO
+        }
+        // 再匹配阿冷组
+        if (alinWakeWords.any { word -> isFuzzyMatch(input, word) }) {
+            return WakeWordGroup.ALIN
+        }
+        return null
+    }
 
     private fun isFuzzyMatch(input: String, wakeWord: String): Boolean {
         val minInputLen = if (wakeWord.any { it.isChinese() }) 2 else 3
