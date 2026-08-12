@@ -65,6 +65,14 @@ class FaceIdentifier(
         const val UPDATE_THRESHOLD = 0.55f
         /** 增量更新权重：新特征的权重（0.1 = 10%新特征 + 90%旧特征） */
         const val UPDATE_ALPHA = 0.1f
+
+        // ========== trackingId 帧间缓存 ==========
+        /** 缓存最大条目数（最多同时跟踪多少张脸） */
+        private const val CACHE_MAX_SIZE = 10
+        /** 缓存 TTL（毫秒）：2秒内同一 trackingId 直接复用特征，跳过推理 */
+        private const val CACHE_TTL_MS = 2000L
+        /** 缓存质量阈值：只有质量分高于此值的帧才写入缓存 */
+        private const val CACHE_QUALITY_THRESHOLD = 0.5f
     }
 
     // 特征提取器：默认使用TFLite MobileFaceNet
@@ -72,6 +80,32 @@ class FaceIdentifier(
 
     // 协程作用域（Default线程，用于特征提取和比对）
     private val scope = CoroutineScope(Dispatchers.Default + SupervisorJob())
+
+    // ========== trackingId 帧间缓存 ==========
+    /**
+     * 缓存的特征数据
+     */
+    private data class CachedFeature(
+        val feature: FloatArray,
+        val timestamp: Long,
+        val qualityScore: Float
+    )
+
+    /**
+     * LRU 缓存：trackingId → CachedFeature
+     * 使用 LinkedHashMap 实现 LRU，accessOrder = true
+     */
+    private val featureCache = object : LinkedHashMap<Int, CachedFeature>(CACHE_MAX_SIZE, 0.75f, true) {
+        override fun removeEldestEntry(eldest: MutableMap.MutableEntry<Int, CachedFeature>?): Boolean {
+            return size > CACHE_MAX_SIZE
+        }
+    }
+
+    // 缓存统计
+    @Volatile
+    private var cacheHitCount = 0
+    @Volatile
+    private var cacheMissCount = 0
 
     // ========== 多帧确认状态 ==========
     private var consecutiveRecognizedId: String? = null
@@ -203,12 +237,49 @@ class FaceIdentifier(
                 quality.yawAngle, quality.rollAngle, quality.faceWidth.toFloat()/fullImage.width))
         }
 
-        // 2. 提取特征（内部处理：裁剪→对齐→预处理→TFLite推理）
-        // 注意：传入完整帧fullImage，因为face坐标是相对于完整帧的
-        val feature = featureExtractor.extractFeature(fullImage, face, srcWidth, srcHeight, rotation, mirrorX = true)
-            ?: return FaceRecognitionResult.Failed("Feature extraction failed")
+        // 2. 计算质量分（用于缓存门控）
+        val qualityScore = calculateQualityScore(quality, fullImage.width)
 
-        // 3. 和人脸库1:N比对
+        // 3. trackingId 帧间缓存：同一 trackingId 的人脸在 TTL 内复用特征，跳过推理
+        val trackingId = face.trackingId
+        val cachedFeature = if (trackingId != null) {
+            synchronized(featureCache) {
+                val cached = featureCache[trackingId]
+                if (cached != null && System.currentTimeMillis() - cached.timestamp < CACHE_TTL_MS) {
+                    // 缓存命中
+                    cacheHitCount++
+                    Log.v(TAG, "Cache hit for trackingId=$trackingId, age=${System.currentTimeMillis() - cached.timestamp}ms")
+                    cached.feature
+                } else {
+                    // 缓存未命中或已过期
+                    cacheMissCount++
+                    null
+                }
+            }
+        } else {
+            null
+        }
+
+        // 4. 提取特征（缓存未命中时才推理）
+        val feature = cachedFeature ?: run {
+            val f = featureExtractor.extractFeature(fullImage, face, srcWidth, srcHeight, rotation, mirrorX = true)
+                ?: return FaceRecognitionResult.Failed("Feature extraction failed")
+
+            // 质量足够好才写入缓存（避免低质量帧污染缓存）
+            if (trackingId != null && qualityScore >= CACHE_QUALITY_THRESHOLD) {
+                synchronized(featureCache) {
+                    featureCache[trackingId] = CachedFeature(
+                        feature = f.copyOf(),
+                        timestamp = System.currentTimeMillis(),
+                        qualityScore = qualityScore
+                    )
+                }
+                Log.v(TAG, "Cache write for trackingId=$trackingId, quality=%.2f".format(qualityScore))
+            }
+            f
+        }
+
+        // 5. 和人脸库1:N比对
         val profiles = registerManager.getAllProfiles()
         if (profiles.isEmpty()) {
             return FaceRecognitionResult.Stranger(0f)
@@ -226,7 +297,7 @@ class FaceIdentifier(
             }
         }
 
-        // 4. 根据分层阈值判断结果
+        // 6. 根据分层阈值判断结果
         return when {
             bestMatch == null -> FaceRecognitionResult.Stranger(0f)
             bestSimilarity >= THRESHOLD_CONFIRMED ->
@@ -241,6 +312,24 @@ class FaceIdentifier(
                 lastExtractedFeature = feature
             }
         }
+    }
+
+    /**
+     * 计算人脸质量分（0~1）
+     * 用于缓存门控：只有高质量帧才写入缓存
+     */
+    private fun calculateQualityScore(quality: FaceAligner.FaceQuality, imageWidth: Int): Float {
+        // 角度惩罚：偏转角越小分越高
+        val anglePenalty = (kotlin.math.abs(quality.yawAngle) + kotlin.math.abs(quality.rollAngle)) / 40f
+        val angleScore = (1f - anglePenalty.coerceIn(0f, 1f)) * 0.6f
+
+        // 尺寸得分：脸越大分越高
+        val sizeScore = (quality.faceWidth.toFloat() / imageWidth).coerceIn(0f, 0.3f)
+
+        // 关键点完整性：5点齐全 +0.1
+        val landmarkScore = if (quality.isAligned) 0.1f else 0f
+
+        return angleScore + sizeScore + landmarkScore
     }
 
     // 保存最近一次提取的特征，用于增量更新
@@ -381,12 +470,30 @@ class FaceIdentifier(
     }
 
     /**
+     * 指定 trackingId 的人脸丢失：清除对应缓存
+     * 用于多人场景下某张脸离开时，及时清理其缓存
+     */
+    fun onFaceLost(trackingId: Int?) {
+        if (trackingId != null) {
+            synchronized(featureCache) {
+                featureCache.remove(trackingId)
+                Log.v(TAG, "Cache removed for trackingId=$trackingId (face lost)")
+            }
+        }
+    }
+
+    /**
      * 重置识别状态（切换用户/注销时调用）
      */
     fun reset() {
         resetFrameCounters()
         lastRecognizedProfileId = null
         lastRecognizeTime = 0L
+        synchronized(featureCache) {
+            featureCache.clear()
+        }
+        cacheHitCount = 0
+        cacheMissCount = 0
     }
 
     /**

@@ -67,6 +67,7 @@ object FaceAligner {
      *
      * @param originalBitmap 原始帧Bitmap（完整摄像头帧，已处理旋转和镜像）
      * @param face ML Kit检测到的Face对象（包含关键点）
+     * @param outBitmap 可选：传入已有112x112 Bitmap 复用，减少内存分配
      * @return 对齐后的112x112 ARGB_8888 Bitmap；如果关键点缺失返回null
      */
     fun alignFace(
@@ -75,7 +76,8 @@ object FaceAligner {
         srcWidth: Int = originalBitmap.width,
         srcHeight: Int = originalBitmap.height,
         rotationDegrees: Int = 0,
-        mirrorX: Boolean = false
+        mirrorX: Boolean = false,
+        outBitmap: Bitmap? = null
     ): Bitmap? {
         return try {
             // 检查Bitmap有效性
@@ -138,8 +140,16 @@ object FaceAligner {
         // 4. 计算相似变换矩阵（5点最小二乘估计）
         val transform = estimateSimilarityTransform(srcPoints, dstPoints) ?: return null
 
-        // 5. 创建112x112输出Bitmap
-        val alignedBitmap = Bitmap.createBitmap(ALIGNED_SIZE, ALIGNED_SIZE, Bitmap.Config.ARGB_8888)
+        // 5. 创建或复用112x112输出Bitmap
+        val alignedBitmap = if (outBitmap != null && !outBitmap.isRecycled &&
+            outBitmap.width == ALIGNED_SIZE && outBitmap.height == ALIGNED_SIZE &&
+            outBitmap.config == Bitmap.Config.ARGB_8888) {
+            // 复用传入的 Bitmap，先清空
+            outBitmap.eraseColor(0)
+            outBitmap
+        } else {
+            Bitmap.createBitmap(ALIGNED_SIZE, ALIGNED_SIZE, Bitmap.Config.ARGB_8888)
+        }
         val canvas = Canvas(alignedBitmap)
         canvas.drawBitmap(originalBitmap, transform, null)
 
@@ -325,6 +335,8 @@ object FaceAligner {
     /**
      * 简单对齐（当关键点不全时的降级方案）
      * 仅根据双眼中心做旋转+缩放对齐，保证眼睛水平
+     *
+     * @param outBitmap 可选：传入已有112x112 Bitmap 复用，减少内存分配
      */
     fun alignFaceByEyes(
         originalBitmap: Bitmap,
@@ -332,7 +344,8 @@ object FaceAligner {
         srcWidth: Int = originalBitmap.width,
         srcHeight: Int = originalBitmap.height,
         rotationDegrees: Int = 0,
-        mirrorX: Boolean = false
+        mirrorX: Boolean = false,
+        outBitmap: Bitmap? = null
     ): Bitmap? {
         return try {
             if (originalBitmap.isRecycled || originalBitmap.width == 0 || originalBitmap.height == 0) {
@@ -382,7 +395,15 @@ object FaceAligner {
             // 平移到目标位置（眼睛在y=51处，中心x=56）
             matrix.postTranslate(ALIGNED_SIZE / 2f, 51.7f)
 
-            val alignedBitmap = Bitmap.createBitmap(ALIGNED_SIZE, ALIGNED_SIZE, Bitmap.Config.ARGB_8888)
+            // 创建或复用输出Bitmap
+            val alignedBitmap = if (outBitmap != null && !outBitmap.isRecycled &&
+                outBitmap.width == ALIGNED_SIZE && outBitmap.height == ALIGNED_SIZE &&
+                outBitmap.config == Bitmap.Config.ARGB_8888) {
+                outBitmap.eraseColor(0)
+                outBitmap
+            } else {
+                Bitmap.createBitmap(ALIGNED_SIZE, ALIGNED_SIZE, Bitmap.Config.ARGB_8888)
+            }
             val canvas = Canvas(alignedBitmap)
             canvas.drawBitmap(originalBitmap, matrix, null)
 

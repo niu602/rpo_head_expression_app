@@ -57,7 +57,6 @@ class HeadControlManager private constructor() {
 
         // 人脸追踪发送频率限制：约50fps（20ms间隔），保证头部跟踪流畅
         private const val FACE_SEND_INTERVAL_MS = 20L
-
         @Volatile
         private var instance: HeadControlManager? = null
 
@@ -100,8 +99,13 @@ class HeadControlManager private constructor() {
     @Volatile
     private var isManualStop = false // 是否手动停止，用于区分异常断开
 
-    // ========== 人脸追踪发送节流 ==========
-    @Volatile private var lastFaceSendTime = 0L
+    // ========== 人脸追踪发送 ==========
+    // 最新的人脸偏移目标值（生产者-消费者模式：视觉线程写，发送线程读）
+    @Volatile private var latestFaceOffset: FaceOffset? = null
+    // 固定频率发送协程
+    private var faceSendJob: Job? = null
+    // 发送频率
+
 
     // ========== 事件回调 ==========
     interface OnDeviceFeedbackListener {
@@ -165,6 +169,7 @@ class HeadControlManager private constructor() {
         connectJob = null
         reconnectJob?.cancel()
         reconnectJob = null
+        stopFaceSendLoop()
         try {
             outputStream?.close()
             inputStream?.close()
@@ -209,6 +214,8 @@ class HeadControlManager private constructor() {
 
                 // 启动后台接收线程
                 startReceiveLoop()
+                // 启动人脸偏移固定频率发送循环
+                startFaceSendLoop()
             } catch (e: Exception) {
                 Log.e(TAG, "Connect failed: ${e.message}", e)
                 _connectionState.value = HeadConnectionState.ERROR
@@ -234,6 +241,7 @@ class HeadControlManager private constructor() {
         connectJob = null
         reconnectJob?.cancel()
         reconnectJob = null
+        stopFaceSendLoop()
 
         try {
             outputStream?.close()
@@ -312,6 +320,38 @@ class HeadControlManager private constructor() {
     }
 
     /**
+     * 启动人脸偏移固定频率发送循环
+     * 生产者-消费者模式：视觉线程更新 latestFaceOffset，本协程固定频率读取并发送
+     * 优点：
+     * 1. 发送频率稳定，电机运动平滑
+     * 2. 不需要每次都创建新协程
+     * 3. 自动丢弃旧帧，永远发送最新位置
+     */
+    private fun startFaceSendLoop() {
+        faceSendJob?.cancel()
+        faceSendJob = scope.launch {
+            Log.d(TAG, "Face send loop started, interval=${FACE_SEND_INTERVAL_MS}ms")
+            while (isActive && _connectionState.value == HeadConnectionState.CONNECTED) {
+                val offset = latestFaceOffset
+                if (offset != null) {
+                    sendPhoneMessageInternal(PhoneMessage.face(offset))
+                }
+                delay(FACE_SEND_INTERVAL_MS)
+            }
+            Log.d(TAG, "Face send loop stopped")
+        }
+    }
+
+    /**
+     * 停止人脸偏移发送循环
+     */
+    private fun stopFaceSendLoop() {
+        faceSendJob?.cancel()
+        faceSendJob = null
+        latestFaceOffset = null
+    }
+
+    /**
      * 发送头部控制指令（异步，内部自动切到IO线程）
      * 封装为 PhoneMessage(command=cmd) 发送
      *
@@ -341,22 +381,22 @@ class HeadControlManager private constructor() {
      * @param confidence 置信度 [0,1]，>0.5 板端才跟踪
      * @return 是否已提交发送
      */
+    /**
+     * 发送人脸偏移（生产者-消费者模式）
+     * 只更新最新目标值，由独立的发送协程固定频率发送
+     * 这样即使视觉帧率不稳定，电机也能平滑运动
+     *
+     * @param ox 水平偏移 [-1,1]，0=居中，正=人脸在右
+     * @param oy 垂直偏移 [-1,1]，0=居中，正=人脸在下
+     * @param confidence 置信度 [0,1]，>0.5 板端才跟踪
+     * @return 是否已提交（不代表最终发送成功）
+     */
     fun sendFaceOffset(ox: Float, oy: Float, confidence: Float): Boolean {
         if (_connectionState.value != HeadConnectionState.CONNECTED) {
             return false
         }
-
-        val now = System.currentTimeMillis()
-        // 简单节流：距上次发送不足间隔时跳过（丢弃旧帧，只发送最新数据）
-        if (now - lastFaceSendTime < FACE_SEND_INTERVAL_MS) {
-            return true
-        }
-        lastFaceSendTime = now
-
-        val faceOffset = FaceOffset(ox = ox, oy = oy, confidence = confidence)
-        scope.launch {
-            sendPhoneMessageInternal(PhoneMessage.face(faceOffset))
-        }
+        // 只更新最新值，发送协程会自动读取
+        latestFaceOffset = FaceOffset(ox = ox, oy = oy, confidence = confidence)
         return true
     }
 

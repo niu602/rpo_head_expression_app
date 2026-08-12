@@ -13,19 +13,17 @@ import androidx.camera.core.CameraSelector
 import androidx.camera.core.ExperimentalGetImage
 import androidx.camera.core.ImageAnalysis
 import androidx.camera.core.ImageProxy
-import androidx.camera.core.Preview
 import androidx.camera.lifecycle.ProcessCameraProvider
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.LifecycleOwner
 import android.graphics.Bitmap
-import android.media.Image
 import com.google.mlkit.vision.common.InputImage
-import java.nio.ByteBuffer
 import com.google.mlkit.vision.face.Face
 import com.google.mlkit.vision.face.FaceDetection
 import com.google.mlkit.vision.face.FaceDetectorOptions
 import com.google.mlkit.vision.face.FaceLandmark
 import com.roboparty.rpoexpression.communication.HeadControlManager
+import com.roboparty.rpoexpression.config.ConfigManager
 import com.roboparty.rpoexpression.expression.ExpressionManager
 import com.roboparty.rpoexpression.expression.ExpressionType
 import kotlinx.coroutines.CoroutineScope
@@ -82,10 +80,6 @@ class VisionManager private constructor(private val context: Context) {
         private const val FACE_COUNT_DEBOUNCE_MS = 500L     // 人数变化防抖500ms，确认人数稳定才切换模式
         private const val MODE_TRANSITION_MS = 800L         // 模式切换平滑过渡800ms，电机不跳变
 
-        // ========== 注视点计算权重 ==========
-        private const val GAZE_EYE_WEIGHT = 0.7f            // 双眼中心权重
-        private const val GAZE_MOUTH_WEIGHT = 0.3f          // 嘴部中心权重，视线自然落在三角区
-
         // ========== 单人场景参数 ==========
         private const val SINGLE_FACE_CONFIDENCE = 0.9f     // 单人跟踪置信度（高，稳定跟踪）
 
@@ -104,14 +98,17 @@ class VisionManager private constructor(private val context: Context) {
         private const val MULTI_FACE_SWEEP_AMPLITUDE = 0.85f // 多人扫视幅度（大范围）
         private const val MULTI_FACE_CONFIDENCE = 0.6f      // 多人跟踪置信度（较低，写意）
 
+        // ========== 多人主导人脸检测（滞后区控制） ==========
+        // 当一个人明显比其他人近（脸更大）时，退化单人跟踪跟随该人
+        // 使用施密特触发器式双阈值，避免在边界处频繁切换
+        private const val DOMINANT_FACE_RATIO_ENTER = 2.0f  // maxFace/secondFace >= 2.0 → 开始跟随主导人脸
+        private const val DOMINANT_FACE_RATIO_EXIT = 1.5f   // maxFace/secondFace <= 1.5 → 停止跟随，瞳孔扫视
+        // 1.5 < ratio < 2.0 → 滞后区，保持上一帧状态
+
         // ========== 表情分类检测阈值 ==========
         private const val SMILE_THRESHOLD = 0.95f   // 大幅提高阈值，ML Kit smilingProbability 容易误判
         private const val SMILE_FRAME_COUNT = 8     // 连续8帧才确认（约270ms），过滤瞬态表情
         private const val SMILE_COOLDOWN_MS = 5000L // 冷却5秒，减少频繁触发
-        private const val EYE_CLOSED_THRESHOLD = 0.4f
-        private const val BLINK_MIN_DURATION_MS = 80L
-        private const val BLINK_MAX_DURATION_MS = 500L
-        private const val BLINK_COOLDOWN_MS = 500L
         private const val EXPRESSION_FILTER_COUNT = 5
 
         // ========== 距离感知瞳孔缩放 ==========
@@ -119,6 +116,9 @@ class VisionManager private constructor(private val context: Context) {
         private const val DISTANCE_PUPIL_MAX_SCALE = 1.15f
         private const val DISTANCE_REFERENCE_SIZE = 0.25f
         private const val DISTANCE_SMOOTH_FACTOR = 0.1f
+
+        // ========== trackingId 锁定超时 ==========
+        private const val LOCKED_FACE_TIMEOUT_MS = 500L      // 锁定的人脸丢失超过 500ms 才重新选择
 
         // ========== 人脸识别降频 ==========
         private const val RECOGNITION_FRAME_INTERVAL_MS = 500L  // 识别帧间隔500ms（约2fps），降低CPU
@@ -180,13 +180,6 @@ class VisionManager private constructor(private val context: Context) {
     private var smileConsecutiveCount = 0
     private var lastSmileTriggerTime = 0L
     private val smileProbBuffer = ArrayDeque<Float>(EXPRESSION_FILTER_COUNT)
-    private var isEyeClosed = false
-    private var eyeClosedStartTime = 0L
-    private var lastBlinkTriggerTime = 0L
-    private val leftEyeOpenBuffer = ArrayDeque<Float>(EXPRESSION_FILTER_COUNT)
-    private val rightEyeOpenBuffer = ArrayDeque<Float>(EXPRESSION_FILTER_COUNT)
-    private var lastEyeOpenValue = 0.8f
-    private val eyeOpenHistory = ArrayDeque<Pair<Long, Float>>()
 
     // ========== 跟踪模式状态机 ==========
     @Volatile private var currentMode = TrackMode.NO_FACE   // 当前生效的跟踪模式
@@ -225,13 +218,50 @@ class VisionManager private constructor(private val context: Context) {
     private var multiFaceCenterX = 0f                               // 多人扫视中心X
     private var multiFaceCenterY = 0f                               // 多人扫视中心Y
     private var hasSpokenForThisMultiSession = false                // 当前多人会话是否已播报语音
+    private var multiDominantTracking = false                       // 多人模式中是否正在跟随主导人脸
 
     // 距离感知
     private var smoothedDistanceScale = 1f
 
+    // ========== trackingId 锁定（任务3.2） ==========
+    // 单人模式下锁定主脸的 trackingId，防止旁边经过更大的脸导致目标切换
+    private var lockedTrackingId: Int? = null          // 锁定的 trackingId
+    private var lockedFaceLostTime: Long = 0L          // 锁定的人脸丢失时刻（0=未丢失）
+
     // ========== 协程Job ==========
     private var faceLostStayJob: Job? = null
     private var sleepTimeoutJob: Job? = null
+
+    // ========== 丢脸滞留与缓慢回中 ==========
+    private var lastStableMotorX = 0f
+    private var lastStableMotorY = 0f
+    @Volatile private var faceLostPending = false
+    private var returnToCenterJob: Job? = null
+
+    // ========== 电机单一发送器（15Hz + 死区 + 最大步长） ==========
+    // 所有逻辑只写 pendingMotor*，由独立协程统一发送，避免 30fps 直追噪声
+    @Volatile private var pendingMotorX = 0f
+    @Volatile private var pendingMotorY = 0f
+    @Volatile private var pendingMotorConfidence = 0f
+    private var motorSenderJob: Job? = null
+    private var lastSentMotorX = 0f
+    private var lastSentMotorY = 0f
+    private var lastSentMotorConfidence = 0f
+
+    // 电机独立 One Euro Filter（与屏幕瞳孔的 5 帧均值完全独立）
+    private val motorFilterX = OneEuroFilter()
+    private val motorFilterY = OneEuroFilter()
+    private var lastMotorFilterTime = 0L
+
+    // ========== 连续稳定帧确认（采样-保持，防止单帧 outlier 驱动电机） ==========
+    // 跟踪状态下：pendingMotor* 帧间变化 < 死区时累计稳定帧，连续 N 帧后更新 confirmedMotor*
+    // 帧间变化 >= 死区时重置计数，confirmed 保持不变（移动过程中电机不动，停下后到位）
+    private var confirmedMotorX = 0f
+    private var confirmedMotorY = 0f
+    private var lastPendingMotorX = 0f
+    private var lastPendingMotorY = 0f
+    private var stableFrameCount = 0
+    private val STABLE_FRAME_THRESHOLD = 2  // 15Hz 下约 133ms，平衡响应与抗 outlier
 
     // ========== 回调接口 ==========
     interface VisionStateCallback {
@@ -242,8 +272,6 @@ class VisionManager private constructor(private val context: Context) {
         fun onError(errorMsg: String) {}
         fun onStop() {}
         fun onUserSmile(smileProb: Float) {}
-        fun onUserBlink() {}
-        fun onUserSurprised() {}
         /**
          * 请求语音播报（多人场景进入时触发）
          * 由上层（MainActivity）调用AudioManager播放，避免VisionManager直接依赖音频模块
@@ -281,6 +309,7 @@ class VisionManager private constructor(private val context: Context) {
             .setLandmarkMode(FaceDetectorOptions.LANDMARK_MODE_ALL)
             .setClassificationMode(FaceDetectorOptions.CLASSIFICATION_MODE_ALL)
             .setMinFaceSize(MIN_FACE_SIZE_RATIO)
+            .enableTracking()
             .build()
         FaceDetection.getClient(options)
     }
@@ -308,9 +337,33 @@ class VisionManager private constructor(private val context: Context) {
         twoFacePhaseStartTime = 0L
         multiFaceSweepStartTime = 0L
         hasSpokenForThisMultiSession = false
+        multiDominantTracking = false
+        lockedTrackingId = null
+        lockedFaceLostTime = 0L
         smoothedDistanceScale = 1f
         multiSmoothedX = 0f
         multiSmoothedY = 0f
+        faceLostPending = false
+        returnToCenterJob?.cancel()
+        returnToCenterJob = null
+        lastStableMotorX = 0f
+        lastStableMotorY = 0f
+        // 电机单一发送器状态重置
+        pendingMotorX = 0f
+        pendingMotorY = 0f
+        pendingMotorConfidence = 0f
+        lastSentMotorX = 0f
+        lastSentMotorY = 0f
+        lastSentMotorConfidence = 0f
+        motorFilterX.reset()
+        motorFilterY.reset()
+        lastMotorFilterTime = 0L
+        // 稳定帧确认状态重置
+        confirmedMotorX = 0f
+        confirmedMotorY = 0f
+        lastPendingMotorX = 0f
+        lastPendingMotorY = 0f
+        stableFrameCount = 0
     }
 
     private fun clearSmoothBuffer() {
@@ -320,12 +373,7 @@ class VisionManager private constructor(private val context: Context) {
 
     private fun clearExpressionBuffer() {
         smileProbBuffer.clear()
-        leftEyeOpenBuffer.clear()
-        rightEyeOpenBuffer.clear()
-        eyeOpenHistory.clear()
         smileConsecutiveCount = 0
-        isEyeClosed = false
-        lastEyeOpenValue = 0.8f
     }
 
     /**
@@ -342,6 +390,7 @@ class VisionManager private constructor(private val context: Context) {
         hasTriggeredGreeting = false
         isSleepMode = false
         resetAllState()
+        startMotorSenderLoop()
 
         stateCallback?.onStart()
         Log.d(TAG, "启动人脸检测（性能优化版）")
@@ -401,18 +450,20 @@ class VisionManager private constructor(private val context: Context) {
 
         val rotation = imageProxy.imageInfo.rotationDegrees
         val inputImage = InputImage.fromMediaImage(mediaImage, rotation)
-        val imgW = mediaImage.width.toFloat()
-        val imgH = mediaImage.height.toFloat()
+        // ML Kit 返回的 Face 坐标是旋转后自然方向的，归一化时必须用旋转后的宽高
+        val isRotated = rotation == 90 || rotation == 270
+        val analysisW = if (isRotated) mediaImage.height.toFloat() else mediaImage.width.toFloat()
+        val analysisH = if (isRotated) mediaImage.width.toFloat() else mediaImage.height.toFloat()
 
         faceDetector.process(inputImage)
             .addOnSuccessListener { faces ->
                 // 第一步：过滤有效人脸（置信度+大小）
-                val validFaces = filterValidFaces(faces, imgW)
+                val validFaces = filterValidFaces(faces, analysisW)
                 val now = System.currentTimeMillis()
 
                 // 判断这一帧是否需要转Bitmap（调试需要 或 识别需要）
                 val needDebugFrame = DebugVisionState.visible.value && (now - lastDebugFrameTime >= 100) // 调试10fps
-                val needRecognitionFrame = validFaces.size == 1 && (now - lastRecognitionFrameTime >= RECOGNITION_FRAME_INTERVAL_MS)
+                val needRecognitionFrame = validFaces.isNotEmpty() && (now - lastRecognitionFrameTime >= RECOGNITION_FRAME_INTERVAL_MS)
                 val needBitmap = needDebugFrame || needRecognitionFrame
 
                 // 如果需要转Bitmap，先在当前线程（Image还没close）快速拷贝NV21数据
@@ -442,11 +493,11 @@ class VisionManager private constructor(private val context: Context) {
 
                 if (validFaces.isNotEmpty()) {
                     cancelFaceLostStayJob()
-                    processFaces(validFaces, imgW, imgH)
+                    processFaces(validFaces, analysisW, analysisH)
 
                     // 调试：更新人脸信息（不依赖Bitmap，直接更新）
                     if (DebugVisionState.visible.value) {
-                        DebugVisionState.updateFaceInfo(validFaces, imgW, imgH)
+                        DebugVisionState.updateFaceInfo(validFaces, analysisW, analysisH)
                     }
 
                     // 如果需要转Bitmap，异步转（复用同一份NV21数据，只转一次）
@@ -454,8 +505,8 @@ class VisionManager private constructor(private val context: Context) {
                         if (needDebugFrame) lastDebugFrameTime = now
                         if (needRecognitionFrame) lastRecognitionFrameTime = now
                         val primaryFace = validFaces[0]
-                        val isSingleFace = validFaces.size == 1
-                        val wantRecognition = needRecognitionFrame && isSingleFace
+                        // 多人场景也识别最大的那张脸（最靠近镜头的用户）
+                        val wantRecognition = needRecognitionFrame
 
                         scope.launch {
                             var fullBitmap: Bitmap? = null
@@ -502,10 +553,7 @@ class VisionManager private constructor(private val context: Context) {
                                         recognitionFrameCallback?.invoke(bitmapForRecognition, primaryFace, bitmapForRecognition, imgWidth, imgHeight, rotation)
                                     }
 
-                                    // 3. 不需要调试时回收fullBitmap
-                                    if (!needDebugFrame && bitmapForRecognition == null && !fullBitmap.isRecycled) {
-                                        fullBitmap.recycle()
-                                    }
+
                                 }
                             }
 
@@ -516,10 +564,9 @@ class VisionManager private constructor(private val context: Context) {
                     }
                 } else {
                     handleFaceAbsent()
-                    sendMotorCommand(0f, 0f, 0f)
-                    // 调试：无人脸时只更新人脸信息，不清空画面（避免闪烁"无画面"）
+                    // 不再立即发送 (0,0,0)：由丢脸滞留机制保持最后目标，500ms后缓慢回中
                     if (DebugVisionState.visible.value) {
-                        DebugVisionState.updateFaceInfo(emptyList(), imgW, imgH)
+                        DebugVisionState.updateFaceInfo(emptyList(), analysisW, analysisH)
                     }
                 }
             }
@@ -533,16 +580,29 @@ class VisionManager private constructor(private val context: Context) {
 
     /**
      * 过滤有效人脸：
-     * 1. 过滤置信度 < 0.5 的人脸
+     * 1. 过滤质量分 < MIN_FACE_CONFIDENCE 的人脸
      * 2. 过滤占屏比 < 0.05 的远处小人脸
      */
     private fun filterValidFaces(faces: List<Face>, imgW: Float): List<Face> {
         return faces.filter { face ->
-            // ML Kit的trackingId不为空说明是稳定跟踪的人脸
-            // 人脸宽度占屏幕宽度比例
+            // 1. 人脸质量分过滤（ML Kit 无直接 confidence 字段，综合评估）
+            // - trackingId 存在：稳定跟踪的人脸，置信度高（+0.5）
+            // - 关键点数量：检测到的关键点越多，质量越好（+0.3）
+            // - 表情分类有效：微笑/睁眼概率有效（+0.2）
+            var qualityScore = 0f
+            if (face.trackingId != null) qualityScore += 0.5f
+            val landmarkCount = listOf(
+                FaceLandmark.LEFT_EYE, FaceLandmark.RIGHT_EYE,
+                FaceLandmark.MOUTH_BOTTOM, FaceLandmark.NOSE_BASE
+            ).count { face.getLandmark(it) != null }
+            qualityScore += landmarkCount / 4f * 0.3f
+            if (face.smilingProbability != null && face.leftEyeOpenProbability != null) qualityScore += 0.2f
+
+            // 2. 占屏比过滤
             val faceWidth = face.boundingBox.width().toFloat()
             val sizeRatio = faceWidth / imgW
-            sizeRatio >= MIN_FACE_SIZE_RATIO
+
+            qualityScore >= MIN_FACE_CONFIDENCE && sizeRatio >= MIN_FACE_SIZE_RATIO
         }.sortedByDescending { it.boundingBox.width() } // 按人脸大小排序，大脸优先
     }
 
@@ -553,6 +613,17 @@ class VisionManager private constructor(private val context: Context) {
     private fun processFaces(faces: List<Face>, imgW: Float, imgH: Float) {
         val now = System.currentTimeMillis()
         val faceCount = faces.size
+
+        // 从丢脸滞留/回中过程中恢复：立即取消回中与滞留定时器，直接跟踪（跳过人数防抖等待）
+        val recoveringFromLoss = faceLostPending || returnToCenterJob != null
+        if (recoveringFromLoss) {
+            faceLostPending = false
+            cancelFaceLostStayJob()
+            returnToCenterJob?.cancel()
+            returnToCenterJob = null
+            pendingFaceCount = faceCount
+            faceCountStableSince = now - FACE_COUNT_DEBOUNCE_MS - 1
+        }
 
         // ========== 第一步：人数变化500ms防抖 ==========
         if (faceCount != pendingFaceCount) {
@@ -581,24 +652,93 @@ class VisionManager private constructor(private val context: Context) {
             return
         }
 
-        // ========== 第四步：公共处理（唤醒、问候、表情镜像） ==========
-        // 只对主脸（最大的脸）做表情分类
-        val primaryFace = faces[0]
-        processFaceCommon(primaryFace, imgW)
+        // ========== 第四步：选择主脸（trackingId 锁定 or 最大脸） ==========
+        val primaryFace = selectPrimaryFace(faces, now)
+
+        // ========== 第五步：公共处理（唤醒、问候、表情镜像） ==========
+        processFaceCommon(primaryFace)
 
         // 距离感知（平均人脸大小）
         val avgFaceSize = faces.map { it.boundingBox.width().toFloat() / imgW }.average().toFloat()
         updatePupilSizeByDistance(avgFaceSize)
 
-        // ========== 第五步：按模式分发处理 ==========
+        // 过渡期间：过渡协程是唯一电机/瞳孔指令源，普通帧不发送位置命令，避免锯齿振荡
+        if (isTransitioning) {
+            return
+        }
+
+        // ========== 第六步：按模式分发处理 ==========
         when (currentMode) {
             TrackMode.SINGLE -> handleSingleFaceMode(primaryFace, imgW, imgH)
             TrackMode.TWO_FACE -> handleTwoFaceMode(faces, imgW, imgH, now)
             TrackMode.MULTI_FACE -> handleMultiFaceMode(faces, imgW, imgH, now)
             TrackMode.NO_FACE -> {
-                sendMotorCommand(0f, 0f, 0f)
+                setMotorTarget(0f, 0f, 0f)
                 setPupilImmediate(0f, 0f)
             }
+        }
+    }
+
+    /**
+     * 选择主脸（任务3.2：trackingId 锁定）
+     *
+     * 单人模式：优先选择 trackingId 匹配的人脸，防止旁边经过更大的脸导致目标切换
+     * 多人模式：保持最大脸策略（不锁定）
+     *
+     * 锁定规则：
+     * - 首次进入 SINGLE 模式时记录主脸 trackingId
+     * - 后续帧优先选择 trackingId 匹配的人脸
+     * - 锁定的人脸丢失超过 500ms 后才重新选择最大脸
+     */
+    private fun selectPrimaryFace(faces: List<Face>, now: Long): Face {
+        // faces 已按 boundingBox.width() 降序排列
+        val maxFace = faces[0]
+
+        // 多人模式下不锁定，始终用最大脸
+        if (faces.size >= 2) {
+            // 如果之前锁定了某个人但现在进入多人场景，清除锁定
+            if (lockedTrackingId != null) {
+                lockedTrackingId = null
+                lockedFaceLostTime = 0L
+            }
+            return maxFace
+        }
+
+        // ========== 单人模式：trackingId 锁定逻辑 ==========
+        val lockedId = lockedTrackingId
+
+        if (lockedId != null) {
+            // 尝试在当前帧中找到锁定的人脸
+            val lockedFace = faces.find { it.trackingId == lockedId }
+
+            if (lockedFace != null) {
+                // 找到锁定的人脸，重置丢失计时
+                lockedFaceLostTime = 0L
+                return lockedFace
+            } else {
+                // 锁定的人脸在本帧丢失
+                if (lockedFaceLostTime == 0L) {
+                    lockedFaceLostTime = now
+                    Log.d(TAG, "锁定人脸 $lockedId 丢失，等待 ${LOCKED_FACE_TIMEOUT_MS}ms")
+                }
+
+                // 在超时时间内，保持锁定（不切换），返回当前最大脸作为临时跟踪目标
+                if (now - lockedFaceLostTime < LOCKED_FACE_TIMEOUT_MS) {
+                    return maxFace
+                } else {
+                    // 超过 500ms，放弃锁定，重新选择最大脸
+                    Log.d(TAG, "锁定人脸 $lockedId 超时，重新选择主脸")
+                    lockedTrackingId = maxFace.trackingId
+                    lockedFaceLostTime = 0L
+                    return maxFace
+                }
+            }
+        } else {
+            // 没有锁定的人脸，记录当前最大脸的 trackingId
+            lockedTrackingId = maxFace.trackingId
+            lockedFaceLostTime = 0L
+            Log.d(TAG, "锁定主脸 trackingId=${maxFace.trackingId}")
+            return maxFace
         }
     }
 
@@ -635,7 +775,7 @@ class VisionManager private constructor(private val context: Context) {
                         (Math.random() * (TWO_FACE_PERIOD_MAX_MS - TWO_FACE_PERIOD_MIN_MS)).toLong()
                 // 强制校准一次人脸位置（忽略间隔检查）
                 lastFaceCalibrateTime = 0L
-                calibrateFacePositionsForMode(faces, imgW, imgH, TrackMode.TWO_FACE)
+                calibrateFacePositionsForMode(faces, imgW, imgH)
                 twoFacePhaseStartTime = now + MODE_TRANSITION_MS // 过渡结束后正式开始
             }
             TrackMode.MULTI_FACE -> {
@@ -643,9 +783,10 @@ class VisionManager private constructor(private val context: Context) {
                         (Math.random() * (MULTI_FACE_PERIOD_MAX_MS - MULTI_FACE_PERIOD_MIN_MS)).toLong()
                 // 强制校准一次人脸位置
                 lastFaceCalibrateTime = 0L
-                calibrateFacePositionsForMode(faces, imgW, imgH, TrackMode.MULTI_FACE)
+                calibrateFacePositionsForMode(faces, imgW, imgH)
                 multiFaceSweepStartTime = now + MODE_TRANSITION_MS
                 hasSpokenForThisMultiSession = false
+                multiDominantTracking = false
             }
             TrackMode.SINGLE -> {
                 // 单人模式不需要预计算，直接跟踪
@@ -693,7 +834,7 @@ class VisionManager private constructor(private val context: Context) {
                     TrackMode.MULTI_FACE -> MULTI_FACE_CONFIDENCE
                     TrackMode.NO_FACE -> 0f
                 }
-                sendMotorCommand(currentX, currentY, motorConfidence * progress)
+                setMotorTarget(currentX, currentY, motorConfidence * progress)
                 delay(33) // ~30fps更新
             }
 
@@ -747,7 +888,7 @@ class VisionManager private constructor(private val context: Context) {
     /**
      * 模式切换时的校准：指定目标模式
      */
-    private fun calibrateFacePositionsForMode(faces: List<Face>, imgW: Float, imgH: Float, mode: TrackMode) {
+    private fun calibrateFacePositionsForMode(faces: List<Face>, imgW: Float, imgH: Float) {
         doCalibrate(faces, imgW, imgH)
         lastFaceCalibrateTime = System.currentTimeMillis()
     }
@@ -758,7 +899,8 @@ class VisionManager private constructor(private val context: Context) {
     private fun doCalibrate(faces: List<Face>, imgW: Float, imgH: Float) {
         // 重新计算所有人脸的注视点并缓存
         cachedFacePositions = faces.map { face ->
-            calculateGazeOffset(face, imgW, imgH)
+            val gaze = calculateGazeOffset(face, imgW, imgH)
+            Pair(gaze.correctedX, gaze.correctedY)
         }
 
         // 更新中心位置（用于正弦/扫视路径）
@@ -783,14 +925,38 @@ class VisionManager private constructor(private val context: Context) {
      * - 高置信度发送给电机
      */
     private fun handleSingleFaceMode(face: Face, imgW: Float, imgH: Float) {
-        val (rawOffsetX, rawOffsetY) = calculateGazeOffset(face, imgW, imgH)
-        val smoothX = getSmoothValue(offsetXBuffer, rawOffsetX)
-        val smoothY = getSmoothValue(offsetYBuffer, rawOffsetY)
+        val gaze = calculateGazeOffset(face, imgW, imgH)
+
+        // 屏幕瞳孔：5帧均值滤波（视觉效果需要更平滑）
+        val smoothX = getSmoothValue(offsetXBuffer, gaze.correctedX)
+        val smoothY = getSmoothValue(offsetYBuffer, gaze.correctedY)
+
+        // 电机：One Euro Filter（静止时强滤波抑制噪声，快速移动时自动降低延迟）
+        // 与屏幕瞳孔的 5 帧均值完全独立，参数从配置读取支持热更新
+        val now = System.currentTimeMillis()
+        val dt = if (lastMotorFilterTime > 0L) (now - lastMotorFilterTime) / 1000f else 0.033f
+        lastMotorFilterTime = now
+        val cfg = ConfigManager.getInstance().config.value.faceDetection
+        motorFilterX.setParameters(cfg.motorOneEuroMinCutoff, cfg.motorOneEuroBeta, cfg.motorOneEuroDCutoff)
+        motorFilterY.setParameters(cfg.motorOneEuroMinCutoff, cfg.motorOneEuroBeta, cfg.motorOneEuroDCutoff)
+        val motorX = motorFilterX.filter(gaze.correctedX, dt)
+        val motorY = motorFilterY.filter(gaze.correctedY, dt)
+
         val faceSize = (face.boundingBox.width().toFloat() / imgW).coerceIn(0f, 1f)
+
+        // 更新调试信息（校准用，显示屏幕瞳孔的滤波值）
+        if (DebugVisionState.visible.value) {
+            DebugVisionState.updatePupilCalibration(
+                rawOffsetX = gaze.rawX,
+                rawOffsetY = gaze.rawY,
+                correctedOffsetX = smoothX,
+                correctedOffsetY = smoothY
+            )
+        }
 
         stateCallback?.onFaceDetected(smoothX, smoothY, faceSize)
         setPupilImmediate(smoothX, smoothY)
-        sendMotorCommand(smoothX, smoothY, SINGLE_FACE_CONFIDENCE)
+        setMotorTarget(motorX, motorY, SINGLE_FACE_CONFIDENCE)
     }
 
     /**
@@ -821,7 +987,7 @@ class VisionManager private constructor(private val context: Context) {
         val targetY = twoFaceCenterY
 
         setPupilSmooth(targetX, targetY)
-        sendMotorCommand(targetX, targetY, TWO_FACE_CONFIDENCE)
+        setMotorTarget(targetX, targetY, TWO_FACE_CONFIDENCE)
     }
 
     /**
@@ -832,22 +998,66 @@ class VisionManager private constructor(private val context: Context) {
      * - 进入时已触发语音播报
      */
     private fun handleMultiFaceMode(faces: List<Face>, imgW: Float, imgH: Float, now: Long) {
-        // 低频校准
-        calibrateFacePositions(faces, imgW, imgH)
+        // faces 已按 boundingBox.width() 降序排列（filterValidFaces 中 sortedByDescending）
+        val maxFace = faces[0]
+        val secondFace = faces.getOrNull(1)
 
-        // 基于时间计算扫视路径（椭圆 Lissajous 曲线，更自然的大范围扫视）
-        val elapsed = (now - multiFaceSweepStartTime).toFloat()
-        val phaseX = (elapsed / multiFacePeriodMs) * 2f * PI.toFloat()
-        val phaseY = phaseX * 0.7f + PI.toFloat() / 4f // Y轴相位偏移，形成8字/椭圆
+        // ========== 主导人脸检测（滞后区控制） ==========
+        if (secondFace != null) {
+            val ratio = maxFace.boundingBox.width().toFloat() /
+                    secondFace.boundingBox.width().toFloat()
+            when {
+                ratio >= DOMINANT_FACE_RATIO_ENTER -> {
+                    if (!multiDominantTracking) {
+                        multiDominantTracking = true
+                        Log.d(TAG, "多人模式 → 主导人脸跟踪 ratio=%.2f".format(ratio))
+                    }
+                }
+                ratio <= DOMINANT_FACE_RATIO_EXIT -> {
+                    if (multiDominantTracking) {
+                        multiDominantTracking = false
+                        lastFaceCalibrateTime = 0L // 切回扫视时强制校准一次人脸位置
+                        Log.d(TAG, "多人模式 → 瞳孔扫视（头部保持不动）ratio=%.2f".format(ratio))
+                    }
+                }
+                // 1.5 < ratio < 2.0：滞后区，保持上一帧状态，不切换
+            }
+        }
 
-        val sweepX = sin(phaseX) * MULTI_FACE_SWEEP_AMPLITUDE
-        val sweepY = sin(phaseY) * MULTI_FACE_SWEEP_AMPLITUDE * 0.5f // Y轴幅度小一些
+        if (multiDominantTracking) {
+            // ========== 退化单人跟踪：跟随主导人脸 ==========
+            val gaze = calculateGazeOffset(maxFace, imgW, imgH)
 
-        val targetX = multiFaceCenterX + sweepX
-        val targetY = multiFaceCenterY + sweepY
+            // 电机：One Euro Filter（与单人模式一致）
+            val dt = if (lastMotorFilterTime > 0L) (now - lastMotorFilterTime) / 1000f else 0.033f
+            lastMotorFilterTime = now
+            val cfg = ConfigManager.getInstance().config.value.faceDetection
+            motorFilterX.setParameters(cfg.motorOneEuroMinCutoff, cfg.motorOneEuroBeta, cfg.motorOneEuroDCutoff)
+            motorFilterY.setParameters(cfg.motorOneEuroMinCutoff, cfg.motorOneEuroBeta, cfg.motorOneEuroDCutoff)
+            val motorX = motorFilterX.filter(gaze.correctedX, dt)
+            val motorY = motorFilterY.filter(gaze.correctedY, dt)
 
-        setPupilSmooth(targetX, targetY)
-        sendMotorCommand(targetX, targetY, MULTI_FACE_CONFIDENCE)
+            // 瞳孔和电机都跟随主导人脸
+            setPupilSmooth(gaze.correctedX, gaze.correctedY)
+            setMotorTarget(motorX, motorY, SINGLE_FACE_CONFIDENCE)
+        } else {
+            // ========== 多人扫视：瞳孔 Lissajous 扫视，头部保持不动 ==========
+            calibrateFacePositions(faces, imgW, imgH)
+
+            // 基于时间计算扫视路径（椭圆 Lissajous 曲线，更自然的大范围扫视）
+            val elapsed = (now - multiFaceSweepStartTime).toFloat()
+            val phaseX = (elapsed / multiFacePeriodMs) * 2f * PI.toFloat()
+            val phaseY = phaseX * 0.7f + PI.toFloat() / 4f // Y轴相位偏移，形成8字/椭圆
+
+            val sweepX = sin(phaseX) * MULTI_FACE_SWEEP_AMPLITUDE
+            val sweepY = sin(phaseY) * MULTI_FACE_SWEEP_AMPLITUDE * 0.5f // Y轴幅度小一些
+
+            val targetX = multiFaceCenterX + sweepX
+            val targetY = multiFaceCenterY + sweepY
+
+            // 瞳孔继续扫视，头部保持不动（不调用 setMotorTarget，电机保持最后位置）
+            setPupilSmooth(targetX, targetY)
+        }
     }
 
     /**
@@ -862,61 +1072,77 @@ class VisionManager private constructor(private val context: Context) {
     // ========== 注视点计算 ==========
 
     /**
-     * 计算单个人脸的自然注视点（双眼+嘴部加权三角区）
-     * @return (normalizedX, normalizedY) 归一化坐标 -1~1，已做镜像翻转
+     * 计算单个人脸的注视点（双眼中心）
+     * @return (rawOffsetX, rawOffsetY, correctedOffsetX, correctedOffsetY)
+     *         raw: 原始归一化坐标 -1~1，已做镜像翻转，未做摄像头位置校正
+     *         corrected: 经过摄像头位置校正后的坐标
      */
-    private fun calculateGazeOffset(face: Face, imgW: Float, imgH: Float): Pair<Float, Float> {
+    private fun calculateGazeOffset(face: Face, imgW: Float, imgH: Float): GazeOffsetResult {
         val leftEye = face.getLandmark(FaceLandmark.LEFT_EYE)
         val rightEye = face.getLandmark(FaceLandmark.RIGHT_EYE)
-        val mouth = face.getLandmark(FaceLandmark.MOUTH_BOTTOM)
-        val mouthLeft = face.getLandmark(FaceLandmark.MOUTH_LEFT)
-        val mouthRight = face.getLandmark(FaceLandmark.MOUTH_RIGHT)
+
+        // 从配置读取融合权重
+        val cfg = ConfigManager.getInstance().config.value.faceDetection
+        val eyeWeightX = cfg.gazeEyeWeightX
+        val eyeWeightY = cfg.gazeEyeWeightY
+
+        // 人脸框中心（始终可用，比 landmark 稳定）
+        val bounds = face.boundingBox
+        val faceX = bounds.exactCenterX()
+        // Y轴用脸部偏上位置（约40%高度处），更接近视觉中心
+        val faceY = bounds.top + bounds.height() * 0.40f
 
         val gazeCenterX: Float
         val gazeCenterY: Float
 
         if (leftEye != null && rightEye != null) {
-            val eyeCenterX = (leftEye.position.x + rightEye.position.x) / 2f
-            val eyeCenterY = (leftEye.position.y + rightEye.position.y) / 2f
-
-            val mouthCenterX: Float
-            val mouthCenterY: Float
-            if (mouthLeft != null && mouthRight != null) {
-                mouthCenterX = (mouthLeft.position.x + mouthRight.position.x) / 2f
-                mouthCenterY = if (mouth != null) {
-                    (mouth.position.y + (mouthLeft.position.y + mouthRight.position.y) / 2f) / 2f
-                } else {
-                    (mouthLeft.position.y + mouthRight.position.y) / 2f
-                }
-            } else if (mouth != null) {
-                mouthCenterX = mouth.position.x
-                mouthCenterY = mouth.position.y
-            } else {
-                val eyeDistance = Math.abs(rightEye.position.x - leftEye.position.x)
-                mouthCenterX = eyeCenterX
-                mouthCenterY = eyeCenterY + eyeDistance * 0.6f
-            }
-
-            gazeCenterX = eyeCenterX * GAZE_EYE_WEIGHT + mouthCenterX * GAZE_MOUTH_WEIGHT
-            gazeCenterY = eyeCenterY * GAZE_EYE_WEIGHT + mouthCenterY * GAZE_MOUTH_WEIGHT
+            // 双眼中心
+            val eyeX = (leftEye.position.x + rightEye.position.x) / 2f
+            val eyeY = (leftEye.position.y + rightEye.position.y) / 2f
+            // 融合：双眼中心 * weight + 人脸框中心 * (1 - weight)
+            // X轴双眼权重高（更符合"看向眼睛"的视觉目标）
+            // Y轴人脸框权重更高（landmark 噪声更大）
+            gazeCenterX = eyeX * eyeWeightX + faceX * (1f - eyeWeightX)
+            gazeCenterY = eyeY * eyeWeightY + faceY * (1f - eyeWeightY)
         } else {
-            val bounds = face.boundingBox
-            gazeCenterX = bounds.centerX().toFloat()
-            gazeCenterY = bounds.centerY().toFloat() + bounds.height() * 0.1f
+            // 眼睛关键点丢失时，自动降级为 100% 人脸框中心
+            gazeCenterX = faceX
+            gazeCenterY = faceY
         }
 
         // 归一化 + 前置摄像头镜像翻转
         var rawOffsetX = (gazeCenterX - imgW / 2f) / (imgW / 2f)
         rawOffsetX = -rawOffsetX.coerceIn(-1f, 1f)
+
+        // Y轴归一化
         val rawOffsetY = ((gazeCenterY - imgH / 2f) / (imgH / 2f)).coerceIn(-1f, 1f)
-        return Pair(rawOffsetX, rawOffsetY)
+
+        // 摄像头位置校正（统一加法：corrected = raw + correction）
+        // correction 正值 = 目标向对应正方向移动（X正向右，Y正向下）
+        val cameraOffsetCorrectionX = cfg.cameraOffsetCorrectionX
+        val cameraOffsetCorrectionY = cfg.cameraOffsetCorrectionY
+        val correctedOffsetX = (rawOffsetX + cameraOffsetCorrectionX).coerceIn(-1f, 1f)
+        val correctedOffsetY = (rawOffsetY + cameraOffsetCorrectionY).coerceIn(-1f, 1f)
+
+        return GazeOffsetResult(rawOffsetX, rawOffsetY, correctedOffsetX, correctedOffsetY)
     }
+
+    /**
+     * 注视点计算结果
+     */
+    private data class GazeOffsetResult(
+        val rawX: Float,
+        val rawY: Float,
+        val correctedX: Float,
+        val correctedY: Float
+    )
 
     // ========== 公共处理逻辑 ==========
 
-    private fun processFaceCommon(face: Face, imgW: Float) {
+    private fun processFaceCommon(face: Face) {
         if (!hasFace) {
             hasFace = true
+            ExpressionManager.getInstance().setVisionTrackingActive(true)
             cancelSleepTimer()
 
             if (isSleepMode) {
@@ -949,21 +1175,120 @@ class VisionManager private constructor(private val context: Context) {
      * 发送电机控制指令（统一出口）
      * 所有模式最终都通过这个方法发送给HeadControlManager
      */
-    private fun sendMotorCommand(x: Float, y: Float, confidence: Float) {
+    /**
+     * 设置电机目标（不直接发送，写入 pending 变量由 15Hz 发送协程统一发出）
+     * 所有电机指令必须通过此方法写入，确保单一入口。
+     */
+    private fun setMotorTarget(x: Float, y: Float, confidence: Float) {
         val clampedX = x.coerceIn(-1f, 1f)
         val clampedY = y.coerceIn(-1f, 1f)
         val clampedConf = confidence.coerceIn(0f, 1f)
-        headControlManager.sendFaceOffset(clampedX, clampedY, clampedConf)
+        // 记录最后一个有效稳定目标（置信度>0.5 表示有效跟踪），供丢脸滞留时保持
+        if (clampedConf > 0.5f) {
+            lastStableMotorX = clampedX
+            lastStableMotorY = clampedY
+        }
+        pendingMotorX = clampedX
+        pendingMotorY = clampedY
+        pendingMotorConfidence = clampedConf
     }
 
     /**
-     * 立即设置瞳孔位置（单人模式用，带5帧平滑）
+     * 电机发送协程：固定频率（默认 15Hz）读取 pending 目标，
+     * 经死区 + 最大步长后处理后发送到板端。
+     * 是唯一调用 headControlManager.sendFaceOffset 的地方。
+     */
+    private fun startMotorSenderLoop() {
+        motorSenderJob?.cancel()
+        motorSenderJob = scope.launch {
+            while (true) {
+                val cfg = ConfigManager.getInstance().config.value.faceDetection
+                delay(cfg.motorSendIntervalMs)
+
+                val x = pendingMotorX
+                val y = pendingMotorY
+                val conf = pendingMotorConfidence
+
+                val isTracking = conf > 0.5f
+                val wasTracking = lastSentMotorConfidence > 0.5f
+                val trackingStateChanged = isTracking != wasTracking
+
+                // 非跟踪状态（回中/过渡/休眠）：直接发送 pending 目标，不同步做稳定帧确认
+                if (trackingStateChanged || !isTracking) {
+                    val stepX = (x - lastSentMotorX).coerceIn(-cfg.motorMaxStep, cfg.motorMaxStep)
+                    val stepY = (y - lastSentMotorY).coerceIn(-cfg.motorMaxStep, cfg.motorMaxStep)
+                    val sendX = lastSentMotorX + stepX
+                    val sendY = lastSentMotorY + stepY
+                    headControlManager.sendFaceOffset(sendX, sendY, conf)
+                    lastSentMotorX = sendX
+                    lastSentMotorY = sendY
+                    lastSentMotorConfidence = conf
+                    // 同步重置确认状态，确保回到跟踪状态时从当前值开始
+                    confirmedMotorX = x
+                    confirmedMotorY = y
+                    lastPendingMotorX = x
+                    lastPendingMotorY = y
+                    stableFrameCount = 0
+                    continue
+                }
+
+                // ========== 跟踪状态：连续稳定帧确认（采样-保持） ==========
+                // 比较相邻两次读取的 pending 目标的帧间变化
+                val frameDeltaX = Math.abs(x - lastPendingMotorX)
+                val frameDeltaY = Math.abs(y - lastPendingMotorY)
+
+                if (frameDeltaX < cfg.motorDeadZoneX && frameDeltaY < cfg.motorDeadZoneY) {
+                    // 帧间变化小于死区：目标稳定，计数 +1
+                    stableFrameCount++
+                    if (stableFrameCount >= STABLE_FRAME_THRESHOLD) {
+                        // 连续稳定 N 帧：确认目标，更新 confirmed 值
+                        confirmedMotorX = x
+                        confirmedMotorY = y
+                    }
+                } else {
+                    // 帧间变化超过死区：目标在移动或出现 outlier，重置计数
+                    // confirmed 保持不变（采样-保持：移动过程中电机不动）
+                    stableFrameCount = 0
+                }
+                lastPendingMotorX = x
+                lastPendingMotorY = y
+
+                // 发送 confirmed 目标（经死区 + 最大步长后处理）
+                val sendDeltaX = Math.abs(confirmedMotorX - lastSentMotorX)
+                val sendDeltaY = Math.abs(confirmedMotorY - lastSentMotorY)
+
+                // 死区：确认目标与上次发送值差异在死区内 → 跳过
+                if (sendDeltaX < cfg.motorDeadZoneX && sendDeltaY < cfg.motorDeadZoneY) {
+                    continue
+                }
+
+                // 最大步长限制
+                val stepX = (confirmedMotorX - lastSentMotorX).coerceIn(-cfg.motorMaxStep, cfg.motorMaxStep)
+                val stepY = (confirmedMotorY - lastSentMotorY).coerceIn(-cfg.motorMaxStep, cfg.motorMaxStep)
+                val sendX = lastSentMotorX + stepX
+                val sendY = lastSentMotorY + stepY
+
+                headControlManager.sendFaceOffset(sendX, sendY, conf)
+                lastSentMotorX = sendX
+                lastSentMotorY = sendY
+                lastSentMotorConfidence = conf
+            }
+        }
+    }
+
+    private fun stopMotorSenderLoop() {
+        motorSenderJob?.cancel()
+        motorSenderJob = null
+    }
+
+    /**
+     * 立即设置瞳孔位置（纯设置，不做滤波）
+     * 调用方负责滤波：handleSingleFaceMode 先 getSmoothValue 再传入，
+     * 确保屏幕瞳孔与电机收到同一个滤波值，且 buffer 每帧只写入一次。
      */
     private fun setPupilImmediate(targetX: Float, targetY: Float) {
-        val smoothX = getSmoothValue(offsetXBuffer, targetX)
-        val smoothY = getSmoothValue(offsetYBuffer, targetY)
         mainHandler.post {
-            ExpressionManager.getInstance().setPupilOffset(smoothX, smoothY)
+            ExpressionManager.getInstance().setPupilOffset(targetX, targetY)
         }
     }
 
@@ -1004,17 +1329,12 @@ class VisionManager private constructor(private val context: Context) {
     private fun processFaceClassification(face: Face) {
         val now = System.currentTimeMillis()
         val smileProb = face.smilingProbability ?: -1f
-        val leftEyeOpen = face.leftEyeOpenProbability ?: -1f
-        val rightEyeOpen = face.rightEyeOpenProbability ?: -1f
 
-        if (smileProb < 0f || leftEyeOpen < 0f || rightEyeOpen < 0f) return
+        if (smileProb < 0f) return
 
         val smoothSmile = getSmoothValue(smileProbBuffer, smileProb)
-        val smoothLeftEye = getSmoothValue(leftEyeOpenBuffer, leftEyeOpen)
-        val smoothRightEye = getSmoothValue(rightEyeOpenBuffer, rightEyeOpen)
 
         detectSmile(smoothSmile, now)
-        detectBlink(smoothLeftEye, smoothRightEye, (smoothLeftEye + smoothRightEye) / 2f, now)
     }
 
     private fun detectSmile(smileProb: Float, now: Long) {
@@ -1036,48 +1356,22 @@ class VisionManager private constructor(private val context: Context) {
         }
     }
 
-    private fun detectBlink(leftEyeOpen: Float, rightEyeOpen: Float, avgEyeOpen: Float, now: Long) {
-        val bothClosed = leftEyeOpen < EYE_CLOSED_THRESHOLD && rightEyeOpen < EYE_CLOSED_THRESHOLD
-        when {
-            bothClosed && !isEyeClosed -> {
-                isEyeClosed = true
-                eyeClosedStartTime = now
-            }
-            !bothClosed && isEyeClosed -> {
-                val closedDuration = now - eyeClosedStartTime
-                isEyeClosed = false
-                if (closedDuration in BLINK_MIN_DURATION_MS..BLINK_MAX_DURATION_MS
-                    && now - lastBlinkTriggerTime > BLINK_COOLDOWN_MS
-                ) {
-                    lastBlinkTriggerTime = now
-                    Log.d(TAG, "检测到眨眼 → 镜像眨眼")
-                    mainHandler.post {
-                        ExpressionManager.getInstance().requestExpression(ExpressionType.BLINK)
-                    }
-                    stateCallback?.onUserBlink()
-                }
-            }
-        }
-    }
-
     private fun handleFaceAbsent() {
-        if (hasFace) {
-            hasFace = false
-            pendingFaceCount = 0
-            currentMode = TrackMode.NO_FACE
-            isTransitioning = false
-            transitionJob?.cancel()
-            transitionJob = null
+        if (hasFace && !faceLostPending) {
+            // 第一次检测到丢脸：进入 500ms 滞留期，保持最后电机目标不跳变
+            faceLostPending = true
+            // 滞留期间不改变 hasFace / currentMode / pendingFaceCount，
+            // 避免触发模式过渡与重复打招呼；500ms 后仍无脸再正式切 NO_FACE
             stateCallback?.onFaceLost()
             startFaceLostStayTimer()
             resetSleepTimer()
             mainHandler.post {
                 ExpressionManager.getInstance().setDistancePupilScale(1f)
             }
-            cachedFacePositions = emptyList()
-            multiSmoothedX = 0f
-            multiSmoothedY = 0f
+            // 不发送电机命令，保持 lastStableMotorX/Y
+            // 不清空 cachedFacePositions / multiSmoothed，可能马上恢复
         }
+        // faceLostPending 已为 true 时：什么都不做，继续保持最后目标
     }
 
     private fun getSmoothValue(buffer: ArrayDeque<Float>, newValue: Float): Float {
@@ -1090,9 +1384,21 @@ class VisionManager private constructor(private val context: Context) {
         faceLostStayJob?.cancel()
         faceLostStayJob = scope.launch {
             delay(FACE_LOST_STAY_TIME)
-            mainHandler.post {
-                ExpressionManager.getInstance().setPupilOffset(0f, 0f)
+            // 500ms 后仍处于丢脸滞留：正式进入无人脸状态，启动缓慢回中
+            if (faceLostPending) {
+                hasFace = false
+                faceLostPending = false
+                // 视觉跟踪丢失，恢复待机微动作
+                ExpressionManager.getInstance().setVisionTrackingActive(false)
+                currentMode = TrackMode.NO_FACE
+                lockedTrackingId = null
+                lockedFaceLostTime = 0L
+                transitionJob?.cancel()
+                transitionJob = null
+                isTransitioning = false
+                cachedFacePositions = emptyList()
                 clearSmoothBuffer()
+                startReturnToCenter()
             }
         }
     }
@@ -1100,6 +1406,38 @@ class VisionManager private constructor(private val context: Context) {
     private fun cancelFaceLostStayJob() {
         faceLostStayJob?.cancel()
         faceLostStayJob = null
+    }
+
+    /**
+     * 缓慢回中协程：从 lastStableMotorX/Y 指数平滑到 (0,0)，耗时约 300ms
+     * 可被新检测到的人脸取消（cancel returnToCenterJob）
+     */
+    private fun startReturnToCenter() {
+        returnToCenterJob?.cancel()
+        returnToCenterJob = scope.launch {
+            var curX = lastStableMotorX
+            var curY = lastStableMotorY
+            val stepMs = 16L
+            val totalSteps = 20 // ~320ms
+            val factor = 0.2f // 指数平滑系数，20步后残余约 0.8^20 ≈ 1.15%
+            repeat(totalSteps) {
+                curX += (0f - curX) * factor
+                curY += (0f - curY) * factor
+                mainHandler.post {
+                    ExpressionManager.getInstance().setPupilOffset(curX, curY)
+                }
+                setMotorTarget(curX, curY, 0.3f)
+                delay(stepMs)
+            }
+            // 最终归零
+            mainHandler.post {
+                ExpressionManager.getInstance().setPupilOffset(0f, 0f)
+            }
+            setMotorTarget(0f, 0f, 0f)
+            multiSmoothedX = 0f
+            multiSmoothedY = 0f
+            returnToCenterJob = null
+        }
     }
 
     private fun resetSleepTimer() {
@@ -1128,12 +1466,32 @@ class VisionManager private constructor(private val context: Context) {
         isStopping = true
         isDetecting = false
         hasFace = false
+        ExpressionManager.getInstance().setVisionTrackingActive(false)
         isSleepMode = false
         isTransitioning = false
         transitionJob?.cancel()
         transitionJob = null
+        faceLostPending = false
+        returnToCenterJob?.cancel()
+        returnToCenterJob = null
 
-        sendMotorCommand(0f, 0f, 0f)
+        // 停止电机发送协程，强制发送一次归零（绕过 pending 机制，确保立即生效）
+        stopMotorSenderLoop()
+        headControlManager.sendFaceOffset(0f, 0f, 0f)
+        lastSentMotorX = 0f
+        lastSentMotorY = 0f
+        lastSentMotorConfidence = 0f
+        pendingMotorX = 0f
+        pendingMotorY = 0f
+        pendingMotorConfidence = 0f
+        motorFilterX.reset()
+        motorFilterY.reset()
+        lastMotorFilterTime = 0L
+        confirmedMotorX = 0f
+        confirmedMotorY = 0f
+        lastPendingMotorX = 0f
+        lastPendingMotorY = 0f
+        stableFrameCount = 0
 
         cancelSleepTimer()
         cancelFaceLostStayJob()
@@ -1141,6 +1499,8 @@ class VisionManager private constructor(private val context: Context) {
         clearExpressionBuffer()
         multiSmoothedX = 0f
         multiSmoothedY = 0f
+        lastStableMotorX = 0f
+        lastStableMotorY = 0f
 
         mainHandler.post {
             try {
@@ -1169,83 +1529,6 @@ class VisionManager private constructor(private val context: Context) {
     // ========== 人脸识别辅助方法 ==========
 
     /**
-     * 将Camera2 YUV_420_888 Image转换为Bitmap（处理旋转+前置镜像）
-     * 使用YuvImage转JPEG再decode，兼容性最好
-     */
-    /**
-     * 裁剪人脸区域Bitmap（带20%margin）
-     * 自动处理坐标旋转+镜像转换
-     */
-    private fun cropFaceBitmap(
-        fullImage: Bitmap,
-        face: Face,
-        srcWidth: Int,
-        srcHeight: Int,
-        rotationDegrees: Int,
-        mirrorX: Boolean
-    ): Bitmap? {
-        return try {
-            if (fullImage.isRecycled || fullImage.width == 0 || fullImage.height == 0) {
-                return null
-            }
-
-            // 坐标转换：原始帧坐标 → 旋转+镜像后Bitmap坐标
-            fun transformPoint(x: Float, y: Float): Pair<Float, Float> {
-                var px = x
-                var py = y
-                when (rotationDegrees) {
-                    90 -> {
-                        val newX = py
-                        val newY = srcWidth - px
-                        px = newX
-                        py = newY
-                    }
-                    180 -> {
-                        px = srcWidth - px
-                        py = srcHeight - py
-                    }
-                    270 -> {
-                        val newX = srcHeight - py
-                        val newY = px
-                        px = newX
-                        py = newY
-                    }
-                }
-                if (mirrorX) {
-                    val dstW = if (rotationDegrees == 90 || rotationDegrees == 270) srcHeight else srcWidth
-                    px = dstW - px
-                }
-                return Pair(px, py)
-            }
-
-            val box = face.boundingBox
-            // 转换四个角的坐标
-            val (l, t) = transformPoint(box.left.toFloat(), box.top.toFloat())
-            val (r, b) = transformPoint(box.right.toFloat(), box.bottom.toFloat())
-            val left = minOf(l, r)
-            val top = minOf(t, b)
-            val right = maxOf(l, r)
-            val bottom = maxOf(t, b)
-
-            val marginX = ((right - left) * 0.2f)
-            val marginY = ((bottom - top) * 0.2f)
-
-            val cropLeft = (left - marginX).toInt().coerceAtLeast(0)
-            val cropTop = (top - marginY).toInt().coerceAtLeast(0)
-            val cropRight = (right + marginX).toInt().coerceAtMost(fullImage.width)
-            val cropBottom = (bottom + marginY).toInt().coerceAtMost(fullImage.height)
-
-            val width = cropRight - cropLeft
-            val height = cropBottom - cropTop
-            if (width <= 0 || height <= 0) null
-            else Bitmap.createBitmap(fullImage, cropLeft, cropTop, width, height)
-        } catch (e: Exception) {
-            Log.e(TAG, "Crop face bitmap failed", e)
-            null
-        }
-    }
-
-    /**
      * 从NV21字节数组转Bitmap（带旋转+前置镜像）
      * 不依赖Image对象生命周期，可以在imageProxy.close()之后安全调用
      */
@@ -1262,7 +1545,7 @@ class VisionManager private constructor(private val context: Context) {
             val out = java.io.ByteArrayOutputStream()
             yuvImage.compressToJpeg(android.graphics.Rect(0, 0, width, height), 85, out)
             val jpegBytes = out.toByteArray()
-            var bitmap = android.graphics.BitmapFactory.decodeByteArray(jpegBytes, 0, jpegBytes.size)
+            val bitmap = android.graphics.BitmapFactory.decodeByteArray(jpegBytes, 0, jpegBytes.size)
 
             // 处理旋转+前置镜像
             val matrix = android.graphics.Matrix()
@@ -1276,52 +1559,6 @@ class VisionManager private constructor(private val context: Context) {
             rotatedBitmap
         } catch (e: Exception) {
             Log.e(TAG, "NV21 to Bitmap failed", e)
-            null
-        }
-    }
-
-    private fun Image.toBitmap(rotationDegrees: Int): Bitmap? {
-        return try {
-            // YUV_420_888 -> NV21 byte array
-            val yBuffer = planes[0].buffer
-            val uBuffer = planes[1].buffer
-            val vBuffer = planes[2].buffer
-
-            val ySize = yBuffer.remaining()
-            val uSize = uBuffer.remaining()
-            val vSize = vBuffer.remaining()
-
-            val nv21 = ByteArray(ySize + uSize + vSize)
-            yBuffer.get(nv21, 0, ySize)
-            // NV21: V在前U在后
-            vBuffer.get(nv21, ySize, vSize)
-            uBuffer.get(nv21, ySize + vSize, uSize)
-
-            // YUV -> JPEG -> Bitmap
-            val yuvImage = android.graphics.YuvImage(
-                nv21,
-                android.graphics.ImageFormat.NV21,
-                width,
-                height,
-                null
-            )
-            val out = java.io.ByteArrayOutputStream()
-            yuvImage.compressToJpeg(android.graphics.Rect(0, 0, width, height), 90, out)
-            val jpegBytes = out.toByteArray()
-            var bitmap = android.graphics.BitmapFactory.decodeByteArray(jpegBytes, 0, jpegBytes.size)
-
-            // 处理旋转+前置镜像
-            val matrix = android.graphics.Matrix()
-            matrix.postRotate(rotationDegrees.toFloat())
-            matrix.postScale(-1f, 1f, bitmap.width / 2f, bitmap.height / 2f)
-
-            val rotatedBitmap = Bitmap.createBitmap(bitmap, 0, 0, bitmap.width, bitmap.height, matrix, true)
-            if (rotatedBitmap != bitmap) {
-                bitmap.recycle()
-            }
-            rotatedBitmap
-        } catch (e: Exception) {
-            Log.e(TAG, "Image to Bitmap failed", e)
             null
         }
     }

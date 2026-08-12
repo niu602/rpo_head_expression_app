@@ -48,6 +48,8 @@ class KwsManager private constructor(private val context: Context) {
         private const val TRIGGER_COOLDOWN_MS = 3000L
         /** TTS停止后的尾音保护时间，2.5秒内不触发 */
         private const val TTS_TAIL_PROTECTION_MS = 2500L
+        /** KWS 专用会话ID（负数，与正常对话 sessionId 区分） */
+        private const val KWS_SESSION_ID = -2L
     }
 
     /**
@@ -215,8 +217,8 @@ class KwsManager private constructor(private val context: Context) {
             return
         }
 
-        mgr.startListening(object : AsrManager.AsrResultCallback {
-            override fun onResult(text: String) {
+        mgr.startListening(KWS_SESSION_ID, object : AsrManager.AsrResultCallback {
+            override fun onResult(text: String, sessionId: Long) {
                 if (!isRunning) return
 
                 // TTS 尾部保护期：防止回声被误判
@@ -253,7 +255,7 @@ class KwsManager private constructor(private val context: Context) {
                 }
             }
 
-            override fun onError(errorMsg: String) {
+            override fun onError(errorMsg: String, sessionId: Long) {
                 if (!isRunning) return
                 Log.w(TAG, "ASR wake detection error: $errorMsg, retry in 1s")
                 mainHandler.postDelayed({

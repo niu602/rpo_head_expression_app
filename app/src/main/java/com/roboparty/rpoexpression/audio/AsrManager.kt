@@ -56,41 +56,44 @@ class AsrManager private constructor(private val context: Context) {
 
     /**
      * ASR识别结果回调
+     *
+     * 所有回调方法均携带 sessionId，用于上层校验回调是否属于当前活跃会话。
+     * 当 sessionId != currentSessionId 时，上层应丢弃该回调（会话已被取消/切换）。
      */
     interface AsrResultCallback {
         /**
          * 麦克风实际开始录音
          * 用于打断场景：从这个时间点起算回声保护期最准确
          */
-        fun onRecordingStarted() {}
+        fun onRecordingStarted(sessionId: Long) {}
 
         /**
          * 检测到用户开始说话（VAD语音起点）
          * 用于打断场景：一检测到说话就立即触发，不用等完整识别结果
          */
-        fun onSpeechStarted() {}
+        fun onSpeechStarted(sessionId: Long) {}
 
         /**
          * 检测到用户停止说话（VAD语音终点）
          * 用于打断场景：配合onSpeechStarted做语音持续确认，
          * 避免短促的回声/爆音被误判为用户说话。
          */
-        fun onSpeechStopped() {}
+        fun onSpeechStopped(sessionId: Long) {}
 
         /**
          * 识别完成，返回最终结果
          */
-        fun onResult(text: String) {}
+        fun onResult(text: String, sessionId: Long) {}
 
         /**
          * 识别过程中返回临时结果（可选）
          */
-        fun onPartialResult(text: String) {}
+        fun onPartialResult(text: String, sessionId: Long) {}
 
         /**
          * 识别出错
          */
-        fun onError(errorMsg: String) {}
+        fun onError(errorMsg: String, sessionId: Long) {}
 
         /**
          * 实时音频音量回调
@@ -98,7 +101,7 @@ class AsrManager private constructor(private val context: Context) {
          *
          * @param rms 当前音频帧的 RMS（均方根）音量值，范围 0~32767（16bit PCM）
          */
-        fun onAudioVolume(rms: Int) {}
+        fun onAudioVolume(rms: Int, sessionId: Long) {}
     }
 
     private val gson = Gson()
@@ -114,12 +117,22 @@ class AsrManager private constructor(private val context: Context) {
     @Volatile private var isBargeInSession = false // 当前会话是否为打断监听（Barge-in）模式
     @Volatile var recordingStartTime = 0L // 麦克风实际开始录音的时间戳
     private var resultCallback: AsrResultCallback? = null
+    /**
+     * 当前活跃会话ID
+     * - startListening(sessionId) 时设置为该 sessionId
+     * - stopListening() 时重置为 0（表示无活跃会话）
+     * - WebSocket 回调到达时，若捕获的 sessionId != currentSessionId 则丢弃
+     * - sessionId 从 1 开始递增，0 始终表示"无效/无会话"
+     */
+    @Volatile private var currentSessionId: Long = 0L
     // 识别超时处理：15秒无结果自动超时
     private val mainHandler = Handler(Looper.getMainLooper())
     private val timeoutRunnable = Runnable {
+        val sid = currentSessionId
+        if (sid == 0L) return@Runnable // 会话已停止，丢弃超时回调
         if (isRecording) {
-            Log.w(TAG, "Recognition timeout after 15s")
-            resultCallback?.onError("识别超时，请再说一次")
+            Log.w(TAG, "Recognition timeout after 15s, sessionId=$sid")
+            safeCallCallback { resultCallback?.onError("识别超时，请再说一次", sid) }
             if (shouldTriggerExpression) {
                 ModuleStateManager.onAsrError()
             }
@@ -145,31 +158,35 @@ class AsrManager private constructor(private val context: Context) {
 
     /**
      * 开始语音识别
+     * @param sessionId 会话唯一ID，用于回调校验和过期回调丢弃
      * @param callback 识别结果回调
      * @param triggerExpression 是否触发识别中表情（语音唤醒模式传false，避免常驻显示识别中）
+     * @param bargeIn 是否为打断监听模式（Barge-in），使用更高VAD阈值降低灵敏度
      */
-    fun startListening(callback: AsrResultCallback, triggerExpression: Boolean = true, bargeIn: Boolean = false) {
+    fun startListening(sessionId: Long, callback: AsrResultCallback, triggerExpression: Boolean = true, bargeIn: Boolean = false) {
         if (!isInitialized) {
-            callback.onError("ASR未初始化")
+            callback.onError("ASR未初始化", sessionId)
             return
         }
         if (isRecording) {
-            Log.w(TAG, "Already listening")
+            Log.w(TAG, "Already listening, ignore start request sessionId=$sessionId")
             return
         }
         // 检查录音权限
         if (ContextCompat.checkSelfPermission(context, Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
-            callback.onError("未授予录音权限")
+            callback.onError("未授予录音权限", sessionId)
             return
         }
 
+        // 绑定当前会话
+        currentSessionId = sessionId
         resultCallback = callback
         isSessionConfigured = false
         shouldTriggerExpression = triggerExpression
         isBargeInSession = bargeIn
         // 注意：识别中表情不在这触发，而是在真正开始录音时（startAudioRecording）触发
         // 避免WebSocket连接还没建立就显示表情，用户以为可以说话了但麦克风还没准备好
-        Log.d(TAG, "Start ASR listening, triggerExpression=$triggerExpression, connecting WebSocket...")
+        Log.d(TAG, "Start ASR listening, sessionId=$sessionId, triggerExpression=$triggerExpression, connecting WebSocket...")
 
         // 建立WebSocket连接
         val request = Request.Builder()
@@ -180,7 +197,11 @@ class AsrManager private constructor(private val context: Context) {
 
         webSocket = okHttpClient.newWebSocket(request, object : WebSocketListener() {
             override fun onOpen(webSocket: WebSocket, response: Response) {
-                Log.d(TAG, "WebSocket connected")
+                if (sessionId != currentSessionId) {
+                    Log.w(TAG, "onOpen dropped: session expired, request=$sessionId current=$currentSessionId")
+                    return
+                }
+                Log.d(TAG, "WebSocket connected, sessionId=$sessionId")
                 isWsConnected = true
                 // 连接成功后发送session.update配置
                 sendSessionUpdate(webSocket)
@@ -188,18 +209,26 @@ class AsrManager private constructor(private val context: Context) {
 
             @RequiresPermission(Manifest.permission.RECORD_AUDIO)
             override fun onMessage(webSocket: WebSocket, text: String) {
+                if (sessionId != currentSessionId) {
+                    Log.w(TAG, "onMessage dropped: session expired, request=$sessionId current=$currentSessionId")
+                    return
+                }
                 Log.d(TAG, "Received message: $text")
-                handleServerMessage(text)
+                handleServerMessage(text, sessionId)
             }
 
             override fun onClosed(webSocket: WebSocket, code: Int, reason: String) {
-                Log.d(TAG, "WebSocket closed, code=$code, reason=$reason")
+                if (sessionId != currentSessionId) {
+                    Log.w(TAG, "onClosed dropped: session expired, request=$sessionId current=$currentSessionId")
+                    return
+                }
+                Log.d(TAG, "WebSocket closed, code=$code, reason=$reason, sessionId=$sessionId")
                 isWsConnected = false
                 isSessionConfigured = false
                 stopAudioRecording()
                 if (code != 1000) {
                     // 异常关闭
-                    resultCallback?.onError("连接断开: $reason")
+                    safeCallCallback { resultCallback?.onError("连接断开: $reason", sessionId) }
                     if (shouldTriggerExpression) {
                         ModuleStateManager.onAsrError()
                     }
@@ -207,11 +236,15 @@ class AsrManager private constructor(private val context: Context) {
             }
 
             override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
-                Log.e(TAG, "WebSocket failure", t)
+                if (sessionId != currentSessionId) {
+                    Log.w(TAG, "onFailure dropped: session expired, request=$sessionId current=$currentSessionId")
+                    return
+                }
+                Log.e(TAG, "WebSocket failure, sessionId=$sessionId", t)
                 isWsConnected = false
                 isSessionConfigured = false
                 stopAudioRecording()
-                resultCallback?.onError("连接失败: ${t.message}")
+                safeCallCallback { resultCallback?.onError("连接失败: ${t.message}", sessionId) }
                 if (shouldTriggerExpression) {
                     ModuleStateManager.onAsrError()
                 }
@@ -250,55 +283,58 @@ class AsrManager private constructor(private val context: Context) {
 
     /**
      * 处理服务端消息
+     *
+     * @param message 服务端推送的 JSON 文本
+     * @param sessionId 当前会话ID，用于回调透传
      */
     @RequiresPermission(Manifest.permission.RECORD_AUDIO)
-    private fun handleServerMessage(message: String) {
+    private fun handleServerMessage(message: String, sessionId: Long) {
         try {
             val json = gson.fromJson(message, JsonObject::class.java)
             val type = json.get("type")?.asString ?: return
             when (type) {
                 "session.created" -> {
-                    Log.d(TAG, "Session created")
+                    Log.d(TAG, "Session created, sessionId=$sessionId")
                 }
                 "session.updated" -> {
-                    Log.d(TAG, "Session configured successfully, start audio recording")
+                    Log.d(TAG, "Session configured successfully, start audio recording, sessionId=$sessionId")
                     isSessionConfigured = true
                     // 配置成功，开始录音
-                    startAudioRecording()
+                    startAudioRecording(sessionId)
                 }
                 "error" -> {
                     val errorMsg = json.get("message")?.asString ?: "未知错误"
-                    Log.e(TAG, "Server error: $errorMsg")
-                    resultCallback?.onError("服务端错误: $errorMsg")
+                    Log.e(TAG, "Server error: $errorMsg, sessionId=$sessionId")
+                    safeCallCallback { resultCallback?.onError("服务端错误: $errorMsg", sessionId) }
                     if (shouldTriggerExpression) {
                         ModuleStateManager.onAsrError()
                     }
                     stopListening()
                 }
                 "input_audio_buffer.speech_started" -> {
-                    Log.d(TAG, "Speech started")
+                    Log.d(TAG, "Speech started, sessionId=$sessionId")
                     // 触发语音开始回调，用于打断场景
                     // 安全调用：捕获AbstractMethodError，兼容旧的实现类（增量编译未重新生成）
-                    safeCallCallback { resultCallback?.onSpeechStarted() }
+                    safeCallCallback { resultCallback?.onSpeechStarted(sessionId) }
                     if (shouldTriggerExpression) {
                         ModuleStateManager.onAsrProcessing()
                     }
                 }
                 "input_audio_buffer.speech_stopped" -> {
-                    Log.d(TAG, "Speech stopped")
+                    Log.d(TAG, "Speech stopped, sessionId=$sessionId")
                     // 触发语音结束回调，用于打断场景的语音持续确认
                     // 安全调用：捕获AbstractMethodError，兼容旧的实现类
-                    safeCallCallback { resultCallback?.onSpeechStopped() }
+                    safeCallCallback { resultCallback?.onSpeechStopped(sessionId) }
                 }
                 "conversation.item.input_audio_transcription.completed" -> {
                     // 识别完成，返回最终结果：transcript直接是结果字符串
                     val text = json.get("transcript")?.asString?.trim() ?: ""
-                    Log.d(TAG, "Recognition completed: $text")
+                    Log.d(TAG, "Recognition completed: $text, sessionId=$sessionId")
                     if (shouldTriggerExpression) {
                         ModuleStateManager.onAsrFinish()
                     }
                     if (text.isNotEmpty()) {
-                        resultCallback?.onResult(text)
+                        safeCallCallback { resultCallback?.onResult(text, sessionId) }
                     }
                     // 识别完成后停止录音，等待下一次开始
                     stopListening()
@@ -310,21 +346,21 @@ class AsrManager private constructor(private val context: Context) {
                     val partialText = (confirmed + stash).trim()
                     if (partialText.isNotEmpty()) {
                         // 安全调用：onPartialResult是可选方法，有默认实现
-                        safeCallCallback { resultCallback?.onPartialResult(partialText) }
+                        safeCallCallback { resultCallback?.onPartialResult(partialText, sessionId) }
                     }
                 }
                 "conversation.item.input_audio_transcription.failed" -> {
                     // 识别失败
                     val errorMsg = json.getAsJsonObject("error")?.get("message")?.asString ?: "识别失败"
-                    Log.e(TAG, "Recognition failed: $errorMsg")
-                    resultCallback?.onError(errorMsg)
+                    Log.e(TAG, "Recognition failed: $errorMsg, sessionId=$sessionId")
+                    safeCallCallback { resultCallback?.onError(errorMsg, sessionId) }
                     if (shouldTriggerExpression) {
                         ModuleStateManager.onAsrError()
                     }
                     stopListening()
                 }
                 "session.finished" -> {
-                    Log.d(TAG, "Session finished")
+                    Log.d(TAG, "Session finished, sessionId=$sessionId")
                     stopListening()
                 }
                 else -> {
@@ -338,11 +374,17 @@ class AsrManager private constructor(private val context: Context) {
 
     /**
      * 开始录音并发送音频数据
+     *
+     * @param sessionId 当前会话ID，用于回调透传
      */
     @RequiresPermission(Manifest.permission.RECORD_AUDIO)
     @SuppressLint("MissingPermission")
-    private fun startAudioRecording() {
+    private fun startAudioRecording(sessionId: Long) {
         if (isRecording) {
+            return
+        }
+        if (sessionId != currentSessionId) {
+            Log.w(TAG, "startAudioRecording dropped: session expired, request=$sessionId current=$currentSessionId")
             return
         }
         try {
@@ -352,7 +394,7 @@ class AsrManager private constructor(private val context: Context) {
                 Constants.AUDIO_FORMAT
             )
             if (minBufferSize == AudioRecord.ERROR_BAD_VALUE || minBufferSize == AudioRecord.ERROR) {
-                resultCallback?.onError("录音参数不支持")
+                safeCallCallback { resultCallback?.onError("录音参数不支持", sessionId) }
                 if (shouldTriggerExpression) {
                     ModuleStateManager.onAsrError()
                 }
@@ -382,7 +424,7 @@ class AsrManager private constructor(private val context: Context) {
             )
 
             if (audioRecord?.state != AudioRecord.STATE_INITIALIZED) {
-                resultCallback?.onError("录音初始化失败")
+                safeCallCallback { resultCallback?.onError("录音初始化失败", sessionId) }
                 if (shouldTriggerExpression) {
                     ModuleStateManager.onAsrError()
                 }
@@ -394,7 +436,7 @@ class AsrManager private constructor(private val context: Context) {
             audioRecord?.startRecording()
             isRecording = true
             recordingStartTime = System.currentTimeMillis()
-            Log.d(TAG, "Audio recording started, bufferSize=$bufferSize")
+            Log.d(TAG, "Audio recording started, bufferSize=$bufferSize, sessionId=$sessionId")
 
             // 真正开始录音了，才显示"正在听"表情（瞳孔放大）
             // 之前在startListening()里就显示会导致：WebSocket还在连接中，用户看到表情就说话，但麦克风还没准备好
@@ -404,7 +446,7 @@ class AsrManager private constructor(private val context: Context) {
 
             // 通知回调：麦克风实际开始录音（用于打断回声保护期）
             // 安全调用：捕获AbstractMethodError，兼容旧的实现类
-            safeCallCallback { resultCallback?.onRecordingStarted() }
+            safeCallCallback { resultCallback?.onRecordingStarted(sessionId) }
             // 启动15秒识别超时
             mainHandler.removeCallbacks(timeoutRunnable)
             mainHandler.postDelayed(timeoutRunnable, 15000)
@@ -422,7 +464,10 @@ class AsrManager private constructor(private val context: Context) {
                         }
                         val rms = Math.sqrt(sum.toDouble() / readCount).toInt()
                         // 回调音量（安全调用，兼容旧实现类）
-                        safeCallCallback { resultCallback?.onAudioVolume(rms) }
+                        // 注意：音量回调频率高（~50次/秒），仅在会话有效时透传
+                        if (sessionId == currentSessionId) {
+                            safeCallCallback { resultCallback?.onAudioVolume(rms, sessionId) }
+                        }
 
                         if (isWsConnected && isSessionConfigured) {
                             // 转成字节数组，Base64编码发送
@@ -446,7 +491,7 @@ class AsrManager private constructor(private val context: Context) {
             }
         } catch (e: Exception) {
             Log.e(TAG, "Start recording failed", e)
-            resultCallback?.onError("录音启动失败: ${e.message}")
+            safeCallCallback { resultCallback?.onError("录音启动失败: ${e.message}", sessionId) }
             if (shouldTriggerExpression) {
                 ModuleStateManager.onAsrError()
             }
@@ -475,13 +520,20 @@ class AsrManager private constructor(private val context: Context) {
 
     /**
      * 停止识别
+     *
+     * 重置 currentSessionId = 0，使所有尚未到达的 WebSocket 回调自动失效（会话校验不通过则丢弃）。
+     * 这比"逐个取消回调"更可靠，因为网络回调可能在 stop 之后任意时刻到达。
      */
     fun stopListening() {
         if (!isRecording && !isWsConnected) {
+            // 即使没有在录音/连接，也要确保会话ID重置（防御性）
+            currentSessionId = 0L
             return
         }
+        val stoppedSessionId = currentSessionId
+        currentSessionId = 0L // 立即失效，后续回调全部丢弃
         mainHandler.removeCallbacks(timeoutRunnable)
-        Log.d(TAG, "Stop ASR listening")
+        Log.d(TAG, "Stop ASR listening, stoppedSessionId=$stoppedSessionId")
         stopAudioRecording()
         if (isWsConnected) {
             // 发送结束会话

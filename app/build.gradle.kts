@@ -96,6 +96,9 @@ dependencies {
     // JSON解析
     implementation("com.google.code.gson:gson:2.11.0")
 
+    // 安全加密：EncryptedSharedPreferences（生物特征数据加密存储）
+    implementation("androidx.security:security-crypto:1.1.0-alpha06")
+
     // ML Kit 人脸检测
     implementation("com.google.mlkit:face-detection:16.1.6")
 

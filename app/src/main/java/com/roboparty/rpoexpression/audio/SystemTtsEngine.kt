@@ -37,6 +37,13 @@ class SystemTtsEngine(private val context: Context) : TtsEngine {
 
     private var stateCallback: TtsManager.TtsStateCallback? = null
 
+    /**
+     * 当前活跃会话ID（用于回调透传）
+     * 系统 TTS 由系统管理队列，无需像 CosyVoice 那样做队列校验，
+     * 但回调仍需携带 sessionId 以保持接口一致性。
+     */
+    @Volatile private var currentSessionId: Long = 0L
+
     // 流式播报标记
     @Volatile private var firstChunkId: String? = null
     @Volatile private var lastChunkId: String? = null
@@ -69,9 +76,10 @@ class SystemTtsEngine(private val context: Context) : TtsEngine {
                 } else {
                     Log.e(TAG, "TTS init failed with default engine, status=$status, retry=$retryCount")
                     if (retryCount < 1) {
-                        mainHandler.postDelayed({
-                            initWithRetry(retryCount + 1, callback)
-                        }, 500)
+                        mainHandler.postDelayed(
+                            { initWithRetry(retryCount + 1, callback) },
+                            500,
+                        )
                     } else {
                         tryOtherEngines(callback)
                     }
@@ -101,8 +109,7 @@ class SystemTtsEngine(private val context: Context) : TtsEngine {
     }
 
     private fun setupChineseLanguage(): Boolean {
-        val result = textToSpeech?.setLanguage(Locale.CHINA)
-        return when (result) {
+        return when (textToSpeech?.setLanguage(Locale.CHINA)) {
             TextToSpeech.LANG_MISSING_DATA -> {
                 Log.e(TAG, "Chinese language data missing")
                 false
@@ -134,7 +141,7 @@ class SystemTtsEngine(private val context: Context) : TtsEngine {
                 "com.baidu.duersdk.opensdk",
                 "com.iflytek.speechcloud",
                 "com.google.android.tts",
-                "com.samsung.SMT"
+                "com.samsung.SMT",
             )
             val availableEngineNames = engines.map { it.name }
             val engineToTry = priorityEngines.filter { it in availableEngineNames } +
@@ -158,7 +165,7 @@ class SystemTtsEngine(private val context: Context) : TtsEngine {
         Log.d(TAG, "Trying TTS engine: $engineName")
         try {
             textToSpeech = TextToSpeech(context, { status ->
-                if (status == TextToSpeech.SUCCESS && setupChineseLanguage()) {
+                if ((status == TextToSpeech.SUCCESS) && setupChineseLanguage()) {
                     isInitSuccess = true
                     setupUtteranceListener()
                     Log.i(TAG, "Success with engine: $engineName")
@@ -187,8 +194,9 @@ class SystemTtsEngine(private val context: Context) : TtsEngine {
 
     fun applyVoiceStyle(style: ExpressionStyle) {
         val profile = when (style) {
-            ExpressionStyle.MALE -> TtsManager.VOICE_MALE
-            ExpressionStyle.FEMALE -> TtsManager.VOICE_FEMALE
+            ExpressionStyle.MALE, ExpressionStyle.SHAPE_MALE -> TtsManager.VOICE_MALE
+            ExpressionStyle.FEMALE, ExpressionStyle.SHAPE_FEMALE -> TtsManager.VOICE_FEMALE
+            else -> TtsManager.VOICE_FEMALE
         }
         applyVoiceProfile(profile)
     }
@@ -203,10 +211,11 @@ class SystemTtsEngine(private val context: Context) : TtsEngine {
 
     // ==================== TtsEngine 接口 ====================
 
-    override fun speak(text: String, callback: TtsManager.TtsStateCallback?) {
+    override fun speak(text: String, sessionId: Long, callback: TtsManager.TtsStateCallback?) {
         stateCallback = callback
+        currentSessionId = sessionId
         if (!isInitSuccess) {
-            Log.e(TAG, "TTS not available, try re-init")
+            Log.e(TAG, "TTS not available, try re-init, sessionId=$sessionId")
             init { success ->
                 if (success) {
                     doSpeak(text)
@@ -214,11 +223,14 @@ class SystemTtsEngine(private val context: Context) : TtsEngine {
                     Log.e(TAG, "TTS init failed, fallback to silent mode")
                     ModuleStateManager.onTtsStartSpeaking()
                     val duration = (text.length * 150L).coerceIn(500L, 3000L)
-                    mainHandler.postDelayed({
-                        ModuleStateManager.onTtsError()
-                        callback?.onError(TextToSpeech.ERROR)
-                        stateCallback?.onError(TextToSpeech.ERROR)
-                    }, duration)
+                    mainHandler.postDelayed(
+                        {
+                            ModuleStateManager.onTtsError()
+                            callback?.onError(TextToSpeech.ERROR, sessionId)
+                            stateCallback?.onError(TextToSpeech.ERROR, sessionId)
+                        },
+                        duration,
+                    )
                 }
             }
             return
@@ -237,8 +249,11 @@ class SystemTtsEngine(private val context: Context) : TtsEngine {
         stateCallback = callback
     }
 
-    override fun speakChunk(text: String, isFirst: Boolean) {
+    override fun speakChunk(text: String, isFirst: Boolean, sessionId: Long) {
         if (!isInitSuccess || text.isBlank()) return
+        if (isFirst) {
+            currentSessionId = sessionId
+        }
         val utteranceId = "rpo_chunk_${chunkIdCounter++}"
         isStreamingMode = true
         lastChunkId = utteranceId
@@ -256,9 +271,12 @@ class SystemTtsEngine(private val context: Context) : TtsEngine {
         // 仅标记输入结束，不清理播放状态
     }
 
-    override fun stop() {
+    override fun stop(clearQueue: Boolean) {
         val wasSpeaking = isSpeaking()
-        Log.i(TAG, "[DIAG] stop(): wasSpeaking=$wasSpeaking, firstChunkId=$firstChunkId, lastChunkId=$lastChunkId")
+        val stoppedSessionId = currentSessionId
+        currentSessionId = 0L
+        Log.i(TAG, "[DIAG] stop(): wasSpeaking=$wasSpeaking, clearQueue=$clearQueue, sessionId=$stoppedSessionId, firstChunkId=$firstChunkId, lastChunkId=$lastChunkId")
+        // 系统 TTS 由系统管理队列，stop() 总是会清空队列，clearQueue 参数对系统 TTS 无实际意义
         textToSpeech?.stop()
         chunkIdCounter = 0
         // 关键修复：不立即清空 firstChunkId/lastChunkId，
@@ -268,9 +286,9 @@ class SystemTtsEngine(private val context: Context) : TtsEngine {
         lastChunkId = null
         isStreamingMode = false
         if (wasSpeaking) {
-            Log.d(TAG, "TTS stopped manually, trigger onDone")
+            Log.d(TAG, "TTS stopped manually, trigger onDone, sessionId=$stoppedSessionId")
             ModuleStateManager.onTtsFinishSpeaking()
-            stateCallback?.onDone()
+            stateCallback?.onDone(stoppedSessionId)
         }
     }
 
@@ -289,20 +307,23 @@ class SystemTtsEngine(private val context: Context) : TtsEngine {
     // ==================== UtteranceProgressListener ====================
 
     private fun setupUtteranceListener() {
-        textToSpeech?.setOnUtteranceProgressListener(object : UtteranceProgressListener() {
+        textToSpeech?.setOnUtteranceProgressListener(
+            object : UtteranceProgressListener() {
             override fun onStart(utteranceId: String?) {
-                if (utteranceId == UTTERANCE_ID || utteranceId == firstChunkId) {
-                    Log.d(TAG, "TTS start (utteranceId=$utteranceId)")
+                if ((utteranceId == UTTERANCE_ID) || (utteranceId == firstChunkId)) {
+                    val sid = currentSessionId
+                    Log.d(TAG, "TTS start (utteranceId=$utteranceId, sessionId=$sid)")
                     ModuleStateManager.onTtsStartSpeaking()
-                    stateCallback?.onStart()
+                    stateCallback?.onStart(sid)
                 }
             }
 
             override fun onDone(utteranceId: String?) {
-                if (utteranceId == UTTERANCE_ID || utteranceId == lastChunkId) {
-                    Log.d(TAG, "TTS done (utteranceId=$utteranceId)")
+                if ((utteranceId == UTTERANCE_ID) || (utteranceId == lastChunkId)) {
+                    val sid = currentSessionId
+                    Log.d(TAG, "TTS done (utteranceId=$utteranceId, sessionId=$sid)")
                     ModuleStateManager.onTtsFinishSpeaking()
-                    stateCallback?.onDone()
+                    stateCallback?.onDone(sid)
                     if (utteranceId != UTTERANCE_ID) {
                         isStreamingMode = false
                         firstChunkId = null
@@ -318,9 +339,10 @@ class SystemTtsEngine(private val context: Context) : TtsEngine {
 
             override fun onError(utteranceId: String?, errorCode: Int) {
                 if (utteranceId == UTTERANCE_ID || utteranceId == lastChunkId) {
-                    Log.e(TAG, "TTS error: code=$errorCode (utteranceId=$utteranceId)")
+                    val sid = currentSessionId
+                    Log.e(TAG, "TTS error: code=$errorCode (utteranceId=$utteranceId, sessionId=$sid)")
                     ModuleStateManager.onTtsError()
-                    stateCallback?.onError(errorCode)
+                    stateCallback?.onError(errorCode, sid)
                     if (utteranceId != UTTERANCE_ID) {
                         isStreamingMode = false
                         firstChunkId = null
@@ -328,6 +350,7 @@ class SystemTtsEngine(private val context: Context) : TtsEngine {
                     }
                 }
             }
-        })
+            },
+        )
     }
 }

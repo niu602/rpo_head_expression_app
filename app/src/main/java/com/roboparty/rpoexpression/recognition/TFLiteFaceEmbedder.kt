@@ -10,9 +10,8 @@ import android.graphics.Bitmap
 import android.util.Log
 import com.google.mlkit.vision.face.Face
 import org.tensorflow.lite.Interpreter
-// GPU delegate暂时禁用，先用CPU跑通
-// import org.tensorflow.lite.gpu.CompatibilityList
-// import org.tensorflow.lite.gpu.GpuDelegate
+import org.tensorflow.lite.gpu.CompatibilityList
+import org.tensorflow.lite.gpu.GpuDelegate
 import kotlin.math.sqrt
 import java.io.FileInputStream
 import java.nio.ByteBuffer
@@ -56,6 +55,7 @@ class TFLiteFaceEmbedder(private val context: Context) : FaceFeatureExtractor {
 
         // 推理线程数（4线程在骁龙7+ Gen2上最优）
         private const val NUM_THREADS = 4
+        private const val MAX_POOL_SIZE = 2
     }
 
     override val featureDimension: Int get() = actualOutputDim
@@ -63,9 +63,11 @@ class TFLiteFaceEmbedder(private val context: Context) : FaceFeatureExtractor {
     @Volatile
     private var interpreter: Interpreter? = null
 
-    // GPU delegate暂时禁用，先用CPU跑通
-    // @Volatile
-    // private var gpuDelegate: GpuDelegate? = null
+    @Volatile
+    private var gpuDelegate: GpuDelegate? = null
+
+    @Volatile
+    private var isUsingGPU = false  // 是否使用 GPU 加速
 
     @Volatile
     private var isUsingFallback = false  // 是否使用降级特征提取器
@@ -92,6 +94,54 @@ class TFLiteFaceEmbedder(private val context: Context) : FaceFeatureExtractor {
     @Volatile
     private var inferenceCount = 0
 
+    // ========== 对齐 Bitmap 池化 ==========
+    // 对齐后的 112x112 Bitmap 尺寸固定，池化可减少频繁分配/回收导致的 GC 压力
+    private val alignedBitmapPool = ArrayDeque<Bitmap>(2)
+
+
+    /**
+     * 从池中获取一个 112x112 ARGB_8888 Bitmap
+     * 池为空则新建
+     */
+    private fun obtainAlignedBitmap(): Bitmap {
+        synchronized(alignedBitmapPool) {
+            if (alignedBitmapPool.isNotEmpty()) {
+                return alignedBitmapPool.removeFirst()
+            }
+        }
+        return Bitmap.createBitmap(INPUT_SIZE, INPUT_SIZE, Bitmap.Config.ARGB_8888)
+    }
+
+    /**
+     * 将对齐 Bitmap 放回池中
+     * 池满则直接回收
+     */
+    private fun recycleAlignedBitmap(bitmap: Bitmap?) {
+        if (bitmap == null || bitmap.isRecycled) return
+        if (bitmap.width != INPUT_SIZE || bitmap.height != INPUT_SIZE) {
+            try { bitmap.recycle() } catch (_: Exception) {}
+            return
+        }
+        synchronized(alignedBitmapPool) {
+            if (alignedBitmapPool.size < MAX_POOL_SIZE) {
+                alignedBitmapPool.addLast(bitmap)
+                return
+            }
+        }
+        try { bitmap.recycle() } catch (_: Exception) {}
+    }
+
+    /**
+     * 清空 Bitmap 池（release 时调用）
+     */
+    private fun clearAlignedBitmapPool() {
+        synchronized(alignedBitmapPool) {
+            while (alignedBitmapPool.isNotEmpty()) {
+                try { alignedBitmapPool.removeFirst().recycle() } catch (_: Exception) {}
+            }
+        }
+    }
+
     override fun isReady(): Boolean = interpreter != null || isUsingFallback
 
     override fun initialize(context: Context) {
@@ -113,24 +163,35 @@ class TFLiteFaceEmbedder(private val context: Context) : FaceFeatureExtractor {
             }
             Log.i(TAG, "Model file loaded, size=${modelBuffer.capacity()/1024}KB")
 
-            // 配置TFLite选项（先用CPU+XNNPACK，GPU delegate后续再开）
+            // 配置TFLite选项：优先尝试 GPU 加速，失败自动降级到 CPU + XNNPACK
             val options = Interpreter.Options().apply {
-                setNumThreads(NUM_THREADS)
-                setUseXNNPACK(true)  // XNNPACK CPU加速，兼容性好
-                Log.i(TAG, "TFLite options: threads=$NUM_THREADS, XNNPACK=true, GPU=disabled(debug)")
+                // 先尝试 GPU Delegate
+                var gpuEnabled = false
+                try {
+                    val compatList = CompatibilityList()
+                    if (compatList.isDelegateSupportedOnThisDevice) {
+                        val gpuOptions = compatList.bestOptionsForThisDevice
+                        gpuDelegate = GpuDelegate(gpuOptions)
+                        addDelegate(gpuDelegate)
+                        gpuEnabled = true
+                        isUsingGPU = true
+                        Log.i(TAG, "GPU Delegate enabled (FP16, sustained speed)")
+                    } else {
+                        Log.i(TAG, "GPU Delegate NOT supported on this device, falling back to CPU")
+                    }
+                } catch (e: Exception) {
+                    Log.w(TAG, "GPU Delegate init failed: ${e.message}, falling back to CPU")
+                    gpuDelegate?.close()
+                    gpuDelegate = null
+                    isUsingGPU = false
+                }
 
-                // TODO: GPU delegate调试稳定后再开启
-                // Vivo部分机型GPU driver有兼容性问题，先用CPU跑通
-                // try {
-                //     val compatList = CompatibilityList()
-                //     if (compatList.isDelegateSupportedOnThisDevice) {
-                //         gpuDelegate = GpuDelegate(compatList.bestOptionsForThisDevice)
-                //         addDelegate(gpuDelegate)
-                //         Log.i(TAG, "GPU Delegate enabled")
-                //     }
-                // } catch (e: Exception) {
-                //     Log.w(TAG, "GPU Delegate not available: ${e.message}")
-                // }
+                // CPU 配置（GPU 失败时生效）
+                if (!gpuEnabled) {
+                    setNumThreads(NUM_THREADS)
+                    setUseXNNPACK(true)
+                    Log.i(TAG, "TFLite CPU mode: threads=$NUM_THREADS, XNNPACK=true")
+                }
             }
 
             interpreter = Interpreter(modelBuffer, options)
@@ -217,13 +278,19 @@ class TFLiteFaceEmbedder(private val context: Context) : FaceFeatureExtractor {
         val tflite = interpreter ?: return null
         val startTime = System.nanoTime()
 
-        // 人脸对齐在锁外执行（耗时操作，不需要互斥）
-        // 传入坐标转换参数，正确处理旋转+镜像
-        val alignedBitmap = FaceAligner.alignFace(faceBitmap, face, srcWidth, srcHeight, rotation, mirrorX)
-            ?: FaceAligner.alignFaceByEyes(faceBitmap, face, srcWidth, srcHeight, rotation, mirrorX)
-            ?: return null
+        // 从池中获取对齐用 Bitmap，减少内存分配
+        val alignedBitmap = obtainAlignedBitmap()
 
         return try {
+            // 人脸对齐在锁外执行（耗时操作，不需要互斥）
+            // 传入坐标转换参数，正确处理旋转+镜像
+            val aligned = FaceAligner.alignFace(faceBitmap, face, srcWidth, srcHeight, rotation, mirrorX, outBitmap = alignedBitmap)
+                ?: FaceAligner.alignFaceByEyes(faceBitmap, face, srcWidth, srcHeight, rotation, mirrorX, outBitmap = alignedBitmap)
+
+            if (aligned == null) {
+                return null
+            }
+
             val embedding = synchronized(inferenceLock) {
                 // 2. 预处理：Bitmap -> ByteBuffer，归一化到[-1, 1]
                 // 如果模型batch>1（Siamese模式），用相同数据填满所有batch slot
@@ -265,8 +332,8 @@ class TFLiteFaceEmbedder(private val context: Context) : FaceFeatureExtractor {
             Log.e(TAG, "Feature extraction failed", e)
             null
         } finally {
-            // 回收临时Bitmap（alignedBitmap是新创建的，需要回收）
-            try { alignedBitmap.recycle() } catch (_: Exception) {}
+            // 对齐 Bitmap 放回池中复用，减少 GC 压力
+            recycleAlignedBitmap(alignedBitmap)
         }
     }
 
@@ -374,10 +441,12 @@ class TFLiteFaceEmbedder(private val context: Context) : FaceFeatureExtractor {
         try {
             interpreter?.close()
             interpreter = null
-            // gpuDelegate?.close()
-            // gpuDelegate = null
+            gpuDelegate?.close()
+            gpuDelegate = null
+            isUsingGPU = false
             fallbackExtractor?.release()
             fallbackExtractor = null
+            clearAlignedBitmapPool()
             Log.i(TAG, "TFLiteFaceEmbedder released")
         } catch (e: Exception) {
             Log.e(TAG, "Release failed", e)

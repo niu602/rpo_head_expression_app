@@ -11,7 +11,7 @@ import java.util.concurrent.atomic.AtomicLong
 
 /**
  * 感知事件管理器
- * 统一处理触摸、人脸、IMU等感知事件的结构化Protobuf上行
+ * 统一处理触摸、人脸等感知事件的结构化Protobuf上行
  * 形成交互闭环
  */
 class PerceptionEventManager private constructor() {
@@ -22,7 +22,6 @@ class PerceptionEventManager private constructor() {
         // 事件上报节流（避免事件风暴）
         private const val TOUCH_THROTTLE_MS = 50L
         private const val FACE_THROTTLE_MS = 100L
-        private const val IMU_THROTTLE_MS = 80L
 
         @Volatile
         private var instance: PerceptionEventManager? = null
@@ -39,7 +38,6 @@ class PerceptionEventManager private constructor() {
 
     private val lastTouchReport = AtomicLong(0)
     private val lastFaceReport = AtomicLong(0)
-    private val lastImuReport = AtomicLong(0)
 
     // ========== 触摸事件 ==========
 
@@ -135,48 +133,6 @@ class PerceptionEventManager private constructor() {
             Log.v(TAG, "Face event reported: count=$faceCount, smile=$smileProb")
         } catch (e: Exception) {
             Log.e(TAG, "Failed to report face event", e)
-        }
-    }
-
-    // ========== IMU姿态事件 ==========
-
-    /**
-     * 上报IMU姿态事件
-     * @param pitch 俯仰角(度)
-     * @param roll 横滚角(度)
-     * @param yaw 偏航角(度)
-     * @param acceleration 加速度G值
-     * @param action 动作类型: 0=倾斜,1=摇晃,2=点头,3=摇头
-     */
-    fun reportImuEvent(
-        pitch: Float, roll: Float, yaw: Float,
-        acceleration: Float = 1f,
-        action: Int = 0
-    ) {
-        val now = System.currentTimeMillis()
-        if (now - lastImuReport.get() < IMU_THROTTLE_MS) return
-        lastImuReport.set(now)
-
-        try {
-            val msg = codec.encodePerceptionEvent(
-                msgId = multiLinkManager.nextMsgId(),
-                seq = multiLinkManager.nextSeq(),
-                eventType = 3, // IMU/手势
-                linkType = multiLinkManager.getActiveLinkType().value,
-            ) {
-                // GestureEvent field 22
-                writeMessage(22) {
-                    writeEnum(1, action)
-                    writeFloat(2, 0.9f) // confidence
-                    writeFloat(3, yaw)
-                    writeFloat(4, pitch)
-                }
-            }
-
-            multiLinkManager.sendUdp(msg)
-            Log.v(TAG, "IMU event reported: pitch=$pitch, roll=$roll, action=$action")
-        } catch (e: Exception) {
-            Log.e(TAG, "Failed to report IMU event", e)
         }
     }
 

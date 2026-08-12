@@ -17,6 +17,12 @@ import com.roboparty.rpoexpression.expression.EyeParameters
 interface EyeStyleRenderer {
 
     /**
+     * 是否支持眼内特效
+     * 传统风格默认支持，SVG等极简风格可以禁用
+     */
+    val supportsEyeEffects: Boolean get() = true
+
+    /**
      * 绘制双眼
      * @param params 眼部参数
      * @param centerX 画布中心X

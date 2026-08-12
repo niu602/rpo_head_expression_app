@@ -134,8 +134,9 @@ object VoiceLibrary {
      */
     fun getVoices(gender: ExpressionStyle): List<VoiceOption> {
         return when (gender) {
-            ExpressionStyle.MALE -> MALE_VOICES
-            ExpressionStyle.FEMALE -> FEMALE_VOICES
+            ExpressionStyle.MALE, ExpressionStyle.SHAPE_MALE -> MALE_VOICES
+            ExpressionStyle.FEMALE, ExpressionStyle.SHAPE_FEMALE -> FEMALE_VOICES
+            else -> emptyList()
         }
     }
 
@@ -160,8 +161,9 @@ object VoiceLibrary {
      */
     fun getDefault(gender: ExpressionStyle): VoiceOption {
         return when (gender) {
-            ExpressionStyle.MALE -> MALE_VOICES.first()
-            ExpressionStyle.FEMALE -> FEMALE_VOICES.first()
+            ExpressionStyle.MALE, ExpressionStyle.SHAPE_MALE -> MALE_VOICES.first()
+            ExpressionStyle.FEMALE, ExpressionStyle.SHAPE_FEMALE -> FEMALE_VOICES.first()
+            else -> MALE_VOICES.first()
         }
     }
 
@@ -175,6 +177,16 @@ object VoiceLibrary {
      */
     fun isVoiceMatchingGender(voiceId: String, expectedGender: ExpressionStyle): Boolean {
         val voice = getById(voiceId) ?: return false
-        return voice.gender == expectedGender
+        return isMaleStyle(voice.gender) == isMaleStyle(expectedGender)
+    }
+
+    /**
+     * 判断风格是否属于男性分组
+     */
+    private fun isMaleStyle(style: ExpressionStyle): Boolean {
+        return when (style) {
+            ExpressionStyle.MALE, ExpressionStyle.SHAPE_MALE -> true
+            ExpressionStyle.FEMALE, ExpressionStyle.SHAPE_FEMALE -> false
+        }
     }
 }

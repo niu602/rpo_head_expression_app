@@ -1,9 +1,11 @@
-﻿/*
+/*
  * SPDX-FileCopyrightText: 2026 Roboparty Camp
  * SPDX-License-Identifier: GPL-3.0-only
  */
 
 package com.roboparty.rpoexpression.expression
+
+import com.roboparty.rpoexpression.config.ConfigManager
 
 /**
  * 表情状态数据类
@@ -62,14 +64,16 @@ data class ExpressionState(
 
         val manager = ExpressionManager.getInstance()
 
-        // 计算目标瞳孔偏移（表情基础偏移 + 视线跟踪 + 微动作 + 临时晃动 + 触摸）
+        // 瞳孔跟随系数（从配置读取，统一所有风格的跟随幅度）
+        val followFactor = ConfigManager.getInstance().config.value.faceDetection.pupilFollowFactor
+
+        // 计算目标瞳孔偏移（表情基础偏移 + 视线跟踪 + 微动作 + 触摸）
         val targetPupilX = finalParams.pupilOffsetX +
-                manager.pupilOffsetX * 0.8f +
+                manager.pupilOffsetX * followFactor +
                 manager.microPupilOffsetX +
-                manager.tempPupilShakeX +
                 manager.touchPupilOffsetX
         val targetPupilY = finalParams.pupilOffsetY +
-                manager.pupilOffsetY * 0.8f +
+                manager.pupilOffsetY * followFactor +
                 manager.microPupilOffsetY +
                 manager.touchPupilOffsetY
 
@@ -77,10 +81,9 @@ data class ExpressionState(
         val smoothedPupilX = manager.updateSmoothedPupilX(targetPupilX)
         val smoothedPupilY = manager.updateSmoothedPupilY(targetPupilY)
 
-        // 应用眨眼叠加、IMU临时偏移
+        // 应用眨眼叠加
         val blinkOverlay = manager.blinkProgress
-        val tempEyelidOffset = manager.tempEyelidOffset
-        val finalEyelidOpenness = (finalParams.eyelidOpenness * (1f - blinkOverlay) + tempEyelidOffset)
+        val finalEyelidOpenness = (finalParams.eyelidOpenness * (1f - blinkOverlay))
             .coerceIn(0f, 1f)
 
         // 距离感知瞳孔缩放
@@ -168,7 +171,6 @@ data class ExpressionState(
         val gazeX = finalParams.corePositionX +
                 manager.pupilOffsetX * 0.5f +
                 manager.microPupilOffsetX * 0.5f +
-                manager.tempPupilShakeX * 0.5f +
                 manager.touchPupilOffsetX
         val gazeY = finalParams.corePositionY +
                 manager.pupilOffsetY * 0.5f +

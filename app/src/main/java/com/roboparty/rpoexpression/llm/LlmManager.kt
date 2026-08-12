@@ -92,14 +92,17 @@ class LlmManager private constructor(private val context: Context) {
 
     /**
      * LLM流式请求回调
+     *
+     * 所有回调方法均携带 sessionId，用于上层校验回调是否属于当前活跃会话。
+     * 当 sessionId != currentSessionId 时，上层应丢弃该回调（会话已被取消/切换）。
      */
     interface StreamCallback {
         /** 收到一段增量文本（IO线程回调） */
-        fun onDelta(delta: String)
+        fun onDelta(delta: String, sessionId: Long)
         /** 流式传输全部结束 */
-        fun onComplete(fullText: String)
+        fun onComplete(fullText: String, sessionId: Long)
         /** 请求失败 */
-        fun onError(errorMsg: String)
+        fun onError(errorMsg: String, sessionId: Long)
     }
 
     // ========== 内部状态 ==========
@@ -117,6 +120,16 @@ class LlmManager private constructor(private val context: Context) {
      */
     @Volatile
     private var currentSessionJob: Job? = null
+
+    /**
+     * 当前活跃会话ID
+     * - sendQueryStream(sessionId) 时设置为该 sessionId
+     * - cancelRequest() / setPersona() / exitConversation() 时重置为 0
+     * - 回调守卫：sessionJob.isActive && sessionId == currentSessionId 才透传
+     * - 与 currentSessionJob 形成双重校验：Job 管协程内取消，sessionId 管网络回调过期
+     */
+    @Volatile
+    private var currentSessionId: Long = 0L
 
     lateinit var okHttpClient: OkHttpClient
         private set
@@ -224,6 +237,7 @@ class LlmManager private constructor(private val context: Context) {
         // 退出对话时，取消当前会话的 Job
         currentSessionJob?.cancel()
         currentSessionJob = null
+        currentSessionId = 0L // 会话ID失效，后续回调全部丢弃
 
         conversationHistory.clear()
         Log.d(TAG, "Conversation exited, short-term memory cleared")
@@ -236,6 +250,7 @@ class LlmManager private constructor(private val context: Context) {
         // 完全重置时，取消当前会话的 Job
         currentSessionJob?.cancel()
         currentSessionJob = null
+        currentSessionId = 0L
 
         conversationHistory.clear()
         longTermMemories.clear()
@@ -317,6 +332,7 @@ class LlmManager private constructor(private val context: Context) {
         // 防止旧人格的流式回复和新人格的开场白混播
         currentSessionJob?.cancel()
         currentSessionJob = null
+        currentSessionId = 0L // 旧会话ID失效
         Log.d(TAG, "Session job cancelled due to persona switch")
 
         currentPersona = persona
@@ -455,21 +471,25 @@ class LlmManager private constructor(private val context: Context) {
     /**
      * 发送流式对话请求（带历史记忆）
      *
+     * @param sessionId 会话唯一ID，用于回调校验和过期回调丢弃
      * @param query 用户输入
      * @param callback 流式回调
      * @param addToHistory 是否加入对话历史，默认true
      */
-    fun sendQueryStream(query: String, callback: StreamCallback, addToHistory: Boolean = true) {
-        Log.d(TAG, "Send LLM stream query (multi-turn): $query")
+    fun sendQueryStream(sessionId: Long, query: String, callback: StreamCallback, addToHistory: Boolean = true) {
+        Log.d(TAG, "Send LLM stream query (multi-turn): $query, sessionId=$sessionId")
         ModuleStateManager.onLlmStartThinking()
         isStreamCancelled = false
 
-        // ========== SessionJob 生命周期管理 ==========
-        // 每次新请求创建一个新的 Job，人格切换时取消旧的 Job
-        // 利用 Kotlin 协程的协作式取消机制，确保旧人格的回调不会污染新会话
+        // ========== SessionJob + SessionId 双重生命周期管理 ==========
+        // 每次新请求创建一个新的 Job + 绑定 sessionId
+        // - sessionJob：管协程内取消（Mock模式、人格切换）
+        // - sessionId：管网络回调过期（cancelRequest后旧回调到达）
+        // 回调守卫：sessionJob.isActive && sessionId == currentSessionId 才透传
         val sessionJob = Job()
         currentSessionJob = sessionJob
-        Log.d(TAG, "New session job created: ${sessionJob}")
+        currentSessionId = sessionId
+        Log.d(TAG, "New session job created: ${sessionJob}, sessionId=$sessionId")
 
         val userMessage = ChatMessage("user", query.trim())
 
@@ -487,10 +507,10 @@ class LlmManager private constructor(private val context: Context) {
                 parts.forEach { part ->
                     delay(400)
                     // 协程取消时会自动抛出 CancellationException
-                    // 这里额外检查 isActive 是为了更及时地响应取消
-                    if (!isActive) return@launch
+                    // 这里额外检查 isActive + sessionId 是为了更及时地响应取消
+                    if (!isActive || sessionId != currentSessionId) return@launch
                     full.append(part)
-                    callback.onDelta(part)
+                    callback.onDelta(part, sessionId)
                 }
                 val response = full.toString()
                 if (addToHistory) {
@@ -499,7 +519,9 @@ class LlmManager private constructor(private val context: Context) {
                     trimHistoryIfNeeded()
                 }
                 ModuleStateManager.onLlmFinish()
-                callback.onComplete(response)
+                if (sessionId == currentSessionId) {
+                    callback.onComplete(response, sessionId)
+                }
             }
             return
         }
@@ -510,10 +532,10 @@ class LlmManager private constructor(private val context: Context) {
 
         okHttpClient.newCall(request).enqueue(object : okhttp3.Callback {
             override fun onFailure(call: okhttp3.Call, e: java.io.IOException) {
-                // ========== 回调守卫 ==========
-                // 如果 sessionJob 已取消，直接返回，不触发任何回调
-                if (!sessionJob.isActive) {
-                    Log.d(TAG, "LLM stream onFailure: session job cancelled, drop callback")
+                // ========== 回调守卫（双重校验） ==========
+                // sessionJob 已取消 或 sessionId 已过期，直接返回
+                if (!sessionJob.isActive || sessionId != currentSessionId) {
+                    Log.d(TAG, "LLM stream onFailure: session expired, jobActive=${sessionJob.isActive}, sidMatch=${sessionId == currentSessionId}")
                     return
                 }
 
@@ -524,14 +546,13 @@ class LlmManager private constructor(private val context: Context) {
                 val errorMsg = "LLM stream failed: [${e.javaClass.simpleName}] ${e.message}"
                 Log.e(TAG, errorMsg, e)
                 ModuleStateManager.onLlmError()
-                callback.onError(errorMsg)
+                callback.onError(errorMsg, sessionId)
             }
 
             override fun onResponse(call: okhttp3.Call, response: okhttp3.Response) {
-                // ========== 回调守卫 ==========
-                // 如果 sessionJob 已取消，直接返回，不触发任何回调
-                if (!sessionJob.isActive) {
-                    Log.d(TAG, "LLM stream onResponse: session job cancelled, drop callback")
+                // ========== 回调守卫（双重校验） ==========
+                if (!sessionJob.isActive || sessionId != currentSessionId) {
+                    Log.d(TAG, "LLM stream onResponse: session expired, jobActive=${sessionJob.isActive}, sidMatch=${sessionId == currentSessionId}")
                     return
                 }
 
@@ -541,13 +562,13 @@ class LlmManager private constructor(private val context: Context) {
                         val errorMsg = "LLM stream error: code=${resp.code}, $errorBody"
                         Log.e(TAG, errorMsg)
                         ModuleStateManager.onLlmError()
-                        callback.onError(errorMsg)
+                        callback.onError(errorMsg, sessionId)
                         return
                     }
 
                     val source: BufferedSource = resp.body?.source()
                         ?: run {
-                            callback.onError("LLM stream body is null")
+                            callback.onError("LLM stream body is null", sessionId)
                             return
                         }
 
@@ -555,10 +576,10 @@ class LlmManager private constructor(private val context: Context) {
                     try {
                         while (!source.exhausted()) {
                             if (isStreamCancelled) break
-                            // ========== 回调守卫 ==========
-                            // 每次循环都检查，如果 sessionJob 已取消，停止读取
-                            if (!sessionJob.isActive) {
-                                Log.d(TAG, "LLM stream read: session job cancelled, stop reading")
+                            // ========== 回调守卫（双重校验） ==========
+                            // 每次循环都检查，如果会话已过期，停止读取
+                            if (!sessionJob.isActive || sessionId != currentSessionId) {
+                                Log.d(TAG, "LLM stream read: session expired, stop reading")
                                 break
                             }
                             val line = source.readUtf8Line() ?: break
@@ -575,12 +596,12 @@ class LlmManager private constructor(private val context: Context) {
                                     val content = delta?.get("content")?.asString
                                     if (!content.isNullOrEmpty()) {
                                         fullText.append(content)
-                                        // ========== 回调守卫 ==========
+                                        // ========== 回调守卫（双重校验） ==========
                                         // 调用 onDelta 前再检查一次
-                                        if (sessionJob.isActive) {
-                                            callback.onDelta(content)
+                                        if (sessionJob.isActive && sessionId == currentSessionId) {
+                                            callback.onDelta(content, sessionId)
                                         } else {
-                                            Log.d(TAG, "LLM stream onDelta: session job cancelled, drop delta")
+                                            Log.d(TAG, "LLM stream onDelta: session expired, drop delta")
                                         }
                                     }
                                 }
@@ -595,10 +616,9 @@ class LlmManager private constructor(private val context: Context) {
                             return
                         }
 
-                        // ========== 回调守卫 ==========
-                        // 调用 onComplete 前检查
-                        if (!sessionJob.isActive) {
-                            Log.d(TAG, "LLM stream onComplete: session job cancelled, drop callback")
+                        // ========== 回调守卫（双重校验） ==========
+                        if (!sessionJob.isActive || sessionId != currentSessionId) {
+                            Log.d(TAG, "LLM stream onComplete: session expired, drop callback")
                             return
                         }
 
@@ -609,18 +629,18 @@ class LlmManager private constructor(private val context: Context) {
                             trimHistoryIfNeeded()
                         }
 
-                        Log.d(TAG, "LLM stream complete, length: ${result.length}")
+                        Log.d(TAG, "LLM stream complete, length: ${result.length}, sessionId=$sessionId")
                         ModuleStateManager.onLlmFinish()
-                        callback.onComplete(result)
+                        callback.onComplete(result, sessionId)
                     } catch (e: Exception) {
                         if (isStreamCancelled) {
                             Log.d(TAG, "LLM stream cancelled during read")
                             return
                         }
 
-                        // ========== 回调守卫 ==========
-                        if (!sessionJob.isActive) {
-                            Log.d(TAG, "LLM stream exception: session job cancelled, drop callback")
+                        // ========== 回调守卫（双重校验） ==========
+                        if (!sessionJob.isActive || sessionId != currentSessionId) {
+                            Log.d(TAG, "LLM stream exception: session expired, drop callback")
                             return
                         }
 
@@ -634,9 +654,9 @@ class LlmManager private constructor(private val context: Context) {
                                 conversationHistory.add(ChatMessage("assistant", partial))
                                 trimHistoryIfNeeded()
                             }
-                            callback.onComplete(partial)
+                            callback.onComplete(partial, sessionId)
                         } else {
-                            callback.onError(errorMsg)
+                            callback.onError(errorMsg, sessionId)
                         }
                     }
                 }
@@ -650,14 +670,15 @@ class LlmManager private constructor(private val context: Context) {
      * 不仅取消 HTTP 请求，还取消当前会话的 Job，确保所有回调都被拦截
      */
     fun cancelRequest() {
-        Log.d(TAG, "Cancel LLM request")
+        Log.d(TAG, "Cancel LLM request, currentSessionId=$currentSessionId")
         isStreamCancelled = true
         okHttpClient.dispatcher.cancelAll()
 
-        // 取消当前会话的 Job，确保所有回调都被拦截
+        // 取消当前会话的 Job + 失效 sessionId，确保所有回调都被拦截
         currentSessionJob?.cancel()
         currentSessionJob = null
-        Log.d(TAG, "Session job cancelled")
+        currentSessionId = 0L
+        Log.d(TAG, "Session job cancelled, sessionId invalidated")
     }
 
     /**

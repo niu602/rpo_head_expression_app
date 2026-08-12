@@ -68,11 +68,14 @@ class TtsManager private constructor(private val context: Context) {
 
     /**
      * TTS状态回调
+     *
+     * 所有回调方法均携带 sessionId，用于上层校验回调是否属于当前活跃会话。
+     * 当 sessionId != currentSessionId 时，上层应丢弃该回调（会话已被取消/切换）。
      */
     interface TtsStateCallback {
-        fun onStart() {}
-        fun onDone() {}
-        fun onError(errorCode: Int) {}
+        fun onStart(sessionId: Long) {}
+        fun onDone(sessionId: Long) {}
+        fun onError(errorCode: Int, sessionId: Long) {}
     }
 
     // 当前引擎（云端或系统）
@@ -178,19 +181,27 @@ class TtsManager private constructor(private val context: Context) {
 
     /**
      * 开始播报文本（整句模式）
+     *
+     * @param text 要播报的文本
+     * @param sessionId 会话唯一ID，用于回调校验
+     * @param callback 播报状态回调
      */
-    fun speak(text: String, callback: TtsStateCallback? = null) {
-        engine?.speak(text, callback) ?: run {
+    fun speak(text: String, sessionId: Long, callback: TtsStateCallback? = null) {
+        engine?.speak(text, sessionId, callback) ?: run {
             Log.e(TAG, "No TTS engine available")
-            callback?.onError(TextToSpeech.ERROR)
+            callback?.onError(TextToSpeech.ERROR, sessionId)
         }
     }
 
     /**
      * 流式播报：喂入一个文本块
+     *
+     * @param text 一个句子或一段文本
+     * @param isFirst 是否是本轮第一句
+     * @param sessionId 会话唯一ID，用于队列绑定
      */
-    fun speakChunk(text: String, isFirst: Boolean) {
-        engine?.speakChunk(text, isFirst)
+    fun speakChunk(text: String, isFirst: Boolean, sessionId: Long) {
+        engine?.speakChunk(text, isFirst, sessionId)
     }
 
     /**
@@ -261,6 +272,23 @@ class TtsManager private constructor(private val context: Context) {
      */
     fun isSpeaking(): Boolean {
         return engine?.isSpeaking() ?: false
+    }
+
+    // ========== 句间倾听窗（P3：句间打断机制）==========
+
+    /**
+     * 设置句间倾听窗回调
+     * 每句播完后停顿 800~1200ms，期间可检测用户语音打断
+     */
+    fun setOnInterSentenceListener(listener: TtsEngine.OnInterSentenceListener?) {
+        engine?.setOnInterSentenceListener(listener)
+    }
+
+    /**
+     * 打断当前句间倾听窗（用户在停顿期间说话时调用）
+     */
+    fun interruptInterSentence() {
+        engine?.interruptInterSentence()
     }
 
     /**

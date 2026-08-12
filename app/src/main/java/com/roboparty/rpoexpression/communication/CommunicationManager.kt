@@ -225,13 +225,6 @@ class CommunicationManager private constructor() {
     }
 
     /**
-     * 上报IMU事件（新增API）
-     */
-    fun reportImu(pitch: Float, roll: Float, yaw: Float, acceleration: Float, action: Int) {
-        perceptionManager.reportImuEvent(pitch, roll, yaw, acceleration, action)
-    }
-
-    /**
      * 获取当前活跃链路类型
      */
     fun getActiveLinkType(): CommLink.LinkType = multiLinkManager.getActiveLinkType()

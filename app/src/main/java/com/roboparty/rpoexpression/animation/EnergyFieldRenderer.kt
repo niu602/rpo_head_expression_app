@@ -31,8 +31,6 @@ interface EnergyFieldRenderer {
      * @param centerY   画布中心 Y
      * @param size      画布尺寸
      * @param time      当前时间（秒），驱动动画
-     * @param imuPitch  IMU 俯仰角（Phase 3 使用，暂不处理）
-     * @param imuRoll   IMU 翻滚角（Phase 3 使用，暂不处理）
      */
     fun DrawScope.renderField(
         params: EnergyFieldParameters,
@@ -40,7 +38,5 @@ interface EnergyFieldRenderer {
         centerY: Float,
         size: Size,
         time: Float,
-        imuPitch: Float = 0f,
-        imuRoll: Float = 0f
     )
 }

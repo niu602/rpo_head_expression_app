@@ -62,6 +62,7 @@ fun DebugVisionOverlay(
     val faceInfo by DebugVisionState.faceInfo.collectAsState()
     val recognition by DebugVisionState.recognition.collectAsState()
     val register by DebugVisionState.register.collectAsState()
+    val pupilCal by DebugVisionState.pupilCalibration.collectAsState()
 
     Box(
         modifier = modifier
@@ -122,19 +123,20 @@ fun DebugVisionOverlay(
             Column(
                 modifier = Modifier
                     .fillMaxSize()
-                    .padding(6.dp)
+                    .padding(4.dp)
             ) {
                 // 人脸数
                 val fc = frame.faceCount
                 Text(
                     text = "人脸: ${fc} ${if (fc == 0) "⚠" else "✓"}",
                     color = if (fc > 0) Color(0xFF4CAF50) else Color(0xFFFF9800),
-                    fontSize = 10.sp,
+                    fontSize = 9.sp,
                     fontWeight = FontWeight.Bold,
-                    fontFamily = FontFamily.Monospace
+                    fontFamily = FontFamily.Monospace,
+                    lineHeight = 11.sp
                 )
 
-                Spacer(modifier = Modifier.height(2.dp))
+                Spacer(modifier = Modifier.height(1.dp))
 
                 // 质量信息（如果有检测到人脸）
                 if (faceInfo.faces.isNotEmpty() && faceInfo.imgWidth > 0) {
@@ -144,24 +146,27 @@ fun DebugVisionOverlay(
                     Text(
                         text = "偏转: ${"%.0f".format(q.yawAngle)}° 旋转: ${"%.0f".format(q.rollAngle)}°",
                         color = color,
-                        fontSize = 8.sp,
-                        fontFamily = FontFamily.Monospace
+                        fontSize = 7.sp,
+                        fontFamily = FontFamily.Monospace,
+                        lineHeight = 9.sp
                     )
                     Text(
                         text = "占屏: ${"%.0f".format(q.faceWidth.toFloat() / faceInfo.imgWidth * 100)}% 关键点: ${if (q.isAligned) "✓" else "✗"}",
                         color = color,
-                        fontSize = 8.sp,
-                        fontFamily = FontFamily.Monospace
+                        fontSize = 7.sp,
+                        fontFamily = FontFamily.Monospace,
+                        lineHeight = 9.sp
                     )
                     Text(
                         text = if (q.isGoodQuality) "质量✓" else "质量差",
                         color = color,
-                        fontSize = 8.sp,
-                        fontFamily = FontFamily.Monospace
+                        fontSize = 7.sp,
+                        fontFamily = FontFamily.Monospace,
+                        lineHeight = 9.sp
                     )
                 }
 
-                Spacer(modifier = Modifier.height(2.dp))
+                Spacer(modifier = Modifier.height(1.dp))
 
                 // 识别结果
                 if (recognition.resultText.isNotEmpty()) {
@@ -173,29 +178,32 @@ fun DebugVisionOverlay(
                             recognition.resultText.startsWith("⚠") -> Color(0xFFE57373)
                             else -> Color.White
                         },
-                        fontSize = 9.sp,
+                        fontSize = 8.sp,
                         fontWeight = FontWeight.Bold,
-                        fontFamily = FontFamily.Monospace
+                        fontFamily = FontFamily.Monospace,
+                        lineHeight = 10.sp
                     )
                     if (recognition.qualityText.isNotEmpty()) {
                         Text(
                             text = recognition.qualityText,
                             color = Color(0xAAFFFFFF),
-                            fontSize = 8.sp,
-                            fontFamily = FontFamily.Monospace
+                            fontSize = 7.sp,
+                            fontFamily = FontFamily.Monospace,
+                            lineHeight = 9.sp
                         )
                     }
                 }
 
                 // 注册进度
                 if (register.isRegistering) {
-                    Spacer(modifier = Modifier.height(4.dp))
+                    Spacer(modifier = Modifier.height(2.dp))
                     Text(
                         text = "注册: ${register.name} ${register.collected}/${register.total}",
                         color = Color(0xFF2196F3),
-                        fontSize = 9.sp,
+                        fontSize = 8.sp,
                         fontWeight = FontWeight.Bold,
-                        fontFamily = FontFamily.Monospace
+                        fontFamily = FontFamily.Monospace,
+                        lineHeight = 10.sp
                     )
                     // 进度条
                     if (register.total > 0) {
@@ -211,6 +219,59 @@ fun DebugVisionOverlay(
                         }
                     }
                 }
+
+                // 瞳孔偏移校准信息
+                Spacer(modifier = Modifier.height(2.dp))
+                Text(
+                    text = "── 瞳孔校准 ──",
+                    color = Color(0xFFFFC107),
+                    fontSize = 7.sp,
+                    fontWeight = FontWeight.Bold,
+                    fontFamily = FontFamily.Monospace,
+                    lineHeight = 9.sp
+                )
+                Text(
+                    text = "原始偏移: X=${"%.2f".format(pupilCal.rawOffsetX)} Y=${"%.2f".format(pupilCal.rawOffsetY)}",
+                    color = Color(0xAAFFFFFF),
+                    fontSize = 6.sp,
+                    fontFamily = FontFamily.Monospace,
+                    lineHeight = 8.sp
+                )
+                Text(
+                    text = "校正后: X=${"%.2f".format(pupilCal.correctedOffsetX)} Y=${"%.2f".format(pupilCal.correctedOffsetY)}",
+                    color = Color(0xFF4CAF50),
+                    fontSize = 6.sp,
+                    fontFamily = FontFamily.Monospace,
+                    lineHeight = 8.sp
+                )
+                Text(
+                    text = "X校正: ${"%.2f".format(pupilCal.cameraOffsetCorrectionX)}  Y校正: ${"%.2f".format(pupilCal.cameraOffsetCorrectionY)}",
+                    color = Color(0xAAFFFFFF),
+                    fontSize = 6.sp,
+                    fontFamily = FontFamily.Monospace,
+                    lineHeight = 8.sp
+                )
+                Text(
+                    text = "跟随系数: ${"%.1f".format(pupilCal.pupilFollowFactor)}",
+                    color = Color(0xAAFFFFFF),
+                    fontSize = 6.sp,
+                    fontFamily = FontFamily.Monospace,
+                    lineHeight = 8.sp
+                )
+                Text(
+                    text = "校准方法: 正视机器人眼睛，",
+                    color = Color(0xFFFFC107),
+                    fontSize = 6.sp,
+                    fontFamily = FontFamily.Monospace,
+                    lineHeight = 8.sp
+                )
+                Text(
+                    text = "调整Y校正值使校正后Y≈0",
+                    color = Color(0xFFFFC107),
+                    fontSize = 6.sp,
+                    fontFamily = FontFamily.Monospace,
+                    lineHeight = 8.sp
+                )
             }
         }
     }
