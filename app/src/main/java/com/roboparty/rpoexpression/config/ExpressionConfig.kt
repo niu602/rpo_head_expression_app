@@ -55,7 +55,35 @@ data class FaceDetectionConfig(
     val distancePupilMaxScale: Float = 1.15f,
     // 滤波
     val expressionFilterCount: Int = 5,
-    val faceSmoothFactor: Float = 0.2f
+    val faceSmoothFactor: Float = 0.2f,
+    // ========== 摄像头位置校正 ==========
+    // 坐标系约定：X 正值=机器人视角向右（用户的左边），Y 正值=向下
+    // correction 正值 = 最终目标向对应正方向移动
+    // 公式：corrected = raw + correction（加法统一）
+    // 摄像头在屏幕顶部偏右，正视机器人眼睛时人脸在画面偏左偏下
+    val cameraOffsetCorrectionX: Float = -0.40f,  // 摄像头偏右，需将目标向左（负方向）校正
+    val cameraOffsetCorrectionY: Float = 0.05f,   // 摄像头偏高，需将目标向下（正方向）校正
+    // 瞳孔跟随系数（统一所有风格的跟随幅度）
+    // 传统风格历史值为0.8，形状风格历史值为1.0，现统一为0.8
+    val pupilFollowFactor: Float = 1.0f,
+    // ========== 注视点融合参数 ==========
+    // 双眼中心与人脸框中心的融合权重（双眼中心 * weight + 人脸框中心 * (1-weight)）
+    // X轴：双眼权重0.65，人脸框权重0.35
+    val gazeEyeWeightX: Float = 0.65f,
+    // Y轴：双眼权重0.55，人脸框权重0.45（Y轴 landmark 噪声更大，人脸框权重更高）
+    val gazeEyeWeightY: Float = 0.55f,
+    // ========== 电机控制参数 ==========
+    // 死区：小于该阈值的位置变化不发送电机指令（抑制 landmark 噪声）
+    val motorDeadZoneX: Float = 0.03f,
+    val motorDeadZoneY: Float = 0.05f,
+    // 最大步长：单次发送的位置变化不超过该值（防止跳变）
+    val motorMaxStep: Float = 0.06f,
+    // 电机发送间隔(ms)，66ms≈15Hz，平衡响应速度和稳定性
+    val motorSendIntervalMs: Long = 66L,
+    // 电机 One Euro Filter 参数（独立于屏幕瞳孔的5帧均值）
+    val motorOneEuroMinCutoff: Float = 1.0f,
+    val motorOneEuroBeta: Float = 0.01f,
+    val motorOneEuroDCutoff: Float = 1.0f
 )
 
 /**

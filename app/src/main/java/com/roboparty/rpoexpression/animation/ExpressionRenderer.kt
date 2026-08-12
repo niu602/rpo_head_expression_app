@@ -1,4 +1,4 @@
-﻿/*
+/*
  * SPDX-FileCopyrightText: 2026 Roboparty Camp
  * SPDX-License-Identifier: GPL-3.0-only
  */
@@ -19,9 +19,11 @@ import androidx.compose.ui.graphics.drawscope.translate
 import androidx.compose.ui.graphics.drawscope.withTransform
 import com.roboparty.rpoexpression.animation.style.EyeMetrics
 import com.roboparty.rpoexpression.animation.style.EyeStyleFactory
+import com.roboparty.rpoexpression.animation.shape.ShapeExpressionRenderer
 import com.roboparty.rpoexpression.expression.ExpressionMode
 import com.roboparty.rpoexpression.expression.ExpressionState
 import com.roboparty.rpoexpression.expression.ExpressionType
+import com.roboparty.rpoexpression.expression.ExpressionStyle
 import com.roboparty.rpoexpression.expression.EyeEffectType
 import kotlin.math.PI
 import kotlin.math.abs
@@ -48,11 +50,6 @@ class ExpressionRenderer {
     private val filterPaint = androidx.compose.ui.graphics.Paint()
     private val tempPath = Path()
 
-    // 上一帧尺寸缓存，尺寸变化时才重新计算
-    private var lastSize: Size = Size.Zero
-    private var lastCenterX = 0f
-    private var lastCenterY = 0f
-
     // ========== 能量模式渲染器 ==========
     private val energyRenderer = RorschachEnergyRenderer()
 
@@ -68,25 +65,25 @@ class ExpressionRenderer {
         // 绘制纯黑背景
         drawRect(color = Color.Black, size = size)
 
-        // 尺寸变化时更新中心缓存
-        if (size != lastSize) {
-            lastSize = size
-            lastCenterX = size.width / 2f
-            // 能量模式布局偏下（横屏下方1/3），并补偿摄像头位于顶部带来的 Y 轴偏移
-            // 摄像头在手机最上方，人脸检测的注视点偏上，能量场需整体下移补偿
-            lastCenterY = if (currentMode == ExpressionMode.ENERGY) {
-                size.height * 0.68f
-            } else {
-                size.height / 2f
-            }
+        // 计算中心点：能量模式偏下，传统模式居中
+        // 每帧直接计算，避免模式切换时缓存状态错误
+        val centerX = size.width / 2f
+        val centerY = if (currentMode == ExpressionMode.ENERGY) {
+            size.height * 0.68f
+        } else {
+            size.height / 2f
         }
-        val centerX = lastCenterX
-        val centerY = lastCenterY
         val time = System.currentTimeMillis() / 1000f
+
+        // 验证亮度值（调试用）
+        android.util.Log.d("ExpressionRenderer", "lightConfig: brightness=${lightConfig.brightness}, highlight=${lightConfig.highlight}, colorTemp=${lightConfig.colorTemp}, isNight=${lightConfig.isNightMode}")
 
         // 更新色温颜色矩阵（复用已有对象，不新建）
         updateColorMatrix(lightConfig)
         filterPaint.colorFilter = ColorFilter.colorMatrix(colorMatrix)
+        
+        // 验证颜色矩阵值（调试用）
+        android.util.Log.d("ExpressionRenderer", "colorMatrix: R=${colorMatrix.values[0]}, G=${colorMatrix.values[6]}, B=${colorMatrix.values[12]}, A=${colorMatrix.values[18]}")
 
         // 应用微动画：呼吸缩放
         val microAnim = MicroAnimationLayer.getInstance().apply(state.type)
@@ -110,79 +107,101 @@ class ExpressionRenderer {
                     )
                 }
             } else {
-                // ========== 传统模式：现有眼部渲染管线（不修改） ==========
-                // 应用呼吸缩放
-                scale(microAnim.scale, microAnim.scale, pivot = Offset(centerX, centerY)) {
-                    // 应用头部Y轴微动
-                    translate(top = microAnim.offsetY * size.height * 0.05f) {
-                        // 获取当前风格渲染器
-                        val styleRenderer = EyeStyleFactory.getRenderer(state.style)
+                // ========== 传统模式 ==========
+                if (state.style == ExpressionStyle.SHAPE_MALE || state.style == ExpressionStyle.SHAPE_FEMALE) {
+                    // 形状风格：独立渲染体系，不复用传统模式的scale/translate
+                    val expressionManager = ExpressionManager.getInstance()
+                    val pupilOffsetX = expressionManager.pupilOffsetX
+                    val pupilOffsetY = expressionManager.pupilOffsetY
+                    
+                    ShapeExpressionRenderer.render(
+                        drawScope = this,
+                        style = state.style,
+                        type = state.type,
+                        size = size,
+                        centerX = centerX,
+                        centerY = centerY,
+                        pupilOffsetX = pupilOffsetX,
+                        pupilOffsetY = pupilOffsetY,
+                        transitionProgress = state.transitionProgress,
+                        time = time
+                    )
+                } else {
+                    // 传统参数化风格：应用呼吸缩放和头部微动
+                    scale(microAnim.scale, microAnim.scale, pivot = Offset(centerX, centerY)) {
+                        translate(top = microAnim.offsetY * size.height * 0.05f) {
+                            // 获取当前风格渲染器
+                            val styleRenderer = EyeStyleFactory.getRenderer(state.style)
 
-                        // 获取应用了强度和过渡的眼部参数
-                        val eyeParams = state.getEyeParameters()
-                        // 计算眼睛位置度量
-                        val eyeMetrics = with(styleRenderer) {
-                            calculateEyeMetrics(eyeParams, centerX, centerY, size)
-                        }
-                        // 计算左右瞳孔位置
-                        val leftPupil = with(styleRenderer) {
-                            calculatePupilPosition(eyeMetrics.leftEyeCenter, eyeMetrics.eyeWidth, eyeMetrics.eyeHeight, eyeParams)
-                        }
-                        val rightPupil = with(styleRenderer) {
-                            calculatePupilPosition(eyeMetrics.rightEyeCenter, eyeMetrics.eyeWidth, eyeMetrics.eyeHeight, eyeParams)
-                        }
-                        var adjustedPupilRadius = eyeMetrics.eyeWidth * 0.18f
-                        var adjustedLeftPupil = leftPupil
-                        var adjustedRightPupil = rightPupil
-
-                        // 表情过渡进度（弹性缓动），用于平滑切换
-                        val transitionProgress = state.transitionProgress.coerceIn(0f, 1f)
-                        val easedProgress = (1f - (1f - transitionProgress) * (1f - transitionProgress)).coerceIn(0f, 1f) // easeOutQuad
-
-                        // 根据表情调整瞳孔大小和位置，带平滑过渡
-                        when (state.type) {
-                            ExpressionType.HAPPY -> {
-                                // 开心：瞳孔放大30%，随过渡进度平滑变化
-                                adjustedPupilRadius *= 1f + 0.3f * easedProgress
+                            // 获取应用了强度和过渡的眼部参数
+                            val eyeParams = state.getEyeParameters()
+                            // 计算眼睛位置度量
+                            val eyeMetrics = with(styleRenderer) {
+                                calculateEyeMetrics(eyeParams, centerX, centerY, size)
                             }
-                            ExpressionType.CONFUSED -> {
-                                // 思考：瞳孔向上偏移30%半径，随过渡进度平滑变化
-                                val offsetY = adjustedPupilRadius * 0.3f * easedProgress
-                                adjustedLeftPupil = Offset(leftPupil.x, leftPupil.y - offsetY)
-                                adjustedRightPupil = Offset(rightPupil.x, rightPupil.y - offsetY)
+                            // 计算左右瞳孔位置
+                            val leftPupil = with(styleRenderer) {
+                                calculatePupilPosition(eyeMetrics.leftEyeCenter, eyeMetrics.eyeWidth, eyeMetrics.eyeHeight, eyeParams)
                             }
-                            else -> {}
-                        }
+                            val rightPupil = with(styleRenderer) {
+                                calculatePupilPosition(eyeMetrics.rightEyeCenter, eyeMetrics.eyeWidth, eyeMetrics.eyeHeight, eyeParams)
+                            }
+                            var adjustedPupilRadius = eyeMetrics.eyeWidth * 0.18f
+                            var adjustedLeftPupil = leftPupil
+                            var adjustedRightPupil = rightPupil
 
-                        // 绘制眼睛
-                        with(styleRenderer) {
-                            drawEyes(eyeParams, centerX, centerY, size, time)
-                        }
+                            // 表情过渡进度（弹性缓动），用于平滑切换
+                            val transitionProgress = state.transitionProgress.coerceIn(0f, 1f)
+                            val easedProgress = (1f - (1f - transitionProgress) * (1f - transitionProgress)).coerceIn(0f, 1f) // easeOutQuad
 
-                        // 如果瞳孔有调整，用黑色覆盖原瞳孔，画调整后的瞳孔（带过渡）
-                        if (easedProgress > 0.01f && (state.type == ExpressionType.HAPPY || state.type == ExpressionType.CONFUSED)) {
-                            drawCircle(
-                                color = Color.Black,
-                                radius = adjustedPupilRadius,
-                                center = adjustedLeftPupil
+                            // 根据表情调整瞳孔大小和位置，带平滑过渡
+                            when (state.type) {
+                                ExpressionType.HAPPY -> {
+                                    // 开心：瞳孔放大30%，随过渡进度平滑变化
+                                    adjustedPupilRadius *= 1f + 0.3f * easedProgress
+                                }
+                                ExpressionType.CONFUSED -> {
+                                    // 思考：瞳孔向上偏移30%半径，随过渡进度平滑变化
+                                    val offsetY = adjustedPupilRadius * 0.3f * easedProgress
+                                    adjustedLeftPupil = Offset(leftPupil.x, leftPupil.y - offsetY)
+                                    adjustedRightPupil = Offset(rightPupil.x, rightPupil.y - offsetY)
+                                }
+                                else -> {}
+                            }
+
+                            // 绘制眼睛
+                            with(styleRenderer) {
+                                drawEyes(eyeParams, centerX, centerY, size, time)
+                            }
+
+                            // 如果瞳孔有调整，用黑色覆盖原瞳孔，画调整后的瞳孔（带过渡）
+                            if (easedProgress > 0.01f && (state.type == ExpressionType.HAPPY || state.type == ExpressionType.CONFUSED)) {
+                                drawCircle(
+                                    color = Color.Black,
+                                    radius = adjustedPupilRadius,
+                                    center = adjustedLeftPupil
+                                )
+                                drawCircle(
+                                    color = Color.Black,
+                                    radius = adjustedPupilRadius,
+                                    center = adjustedRightPupil
+                                )
+                            }
+
+                            // 绘制眼内特效（使用调整后的瞳孔位置和大小，带淡入淡出）
+                            // 仅当当前风格支持眼内特效时才绘制
+                            if (styleRenderer.supportsEyeEffects) {
+                                drawEyeEffects(adjustedLeftPupil, adjustedRightPupil, adjustedPupilRadius, eyeMetrics.scale, time, lightConfig.highlight * easedProgress, effect)
+                            }
+                            drawSystemStateOverlays(
+                                state = state,
+                                eyeMetrics = eyeMetrics,
+                                centerX = centerX,
+                                centerY = centerY,
+                                size = size,
+                                time = time
                             )
-                            drawCircle(
-                                color = Color.Black,
-                                radius = adjustedPupilRadius,
-                                center = adjustedRightPupil
-                            )
                         }
-
-                        // 绘制眼内特效（使用调整后的瞳孔位置和大小，带淡入淡出）
-                        drawEyeEffects(adjustedLeftPupil, adjustedRightPupil, adjustedPupilRadius, eyeMetrics.scale, time, lightConfig.highlight * easedProgress, effect)
-                        drawSystemStateOverlays(
-                            state = state,
-                            eyeMetrics = eyeMetrics,
-                            centerX = centerX,
-                            centerY = centerY,
-                            size = size,
-                            time = time
-                        )
                     }
                 }
             }

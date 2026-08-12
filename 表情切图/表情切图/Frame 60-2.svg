@@ -1,0 +1,12 @@
+<svg width="320" height="189" viewBox="0 0 320 189" fill="none" xmlns="http://www.w3.org/2000/svg">
+<g id="Frame 60">
+<rect width="320" height="189" rx="18" fill="black"/>
+<g id="Frame 32">
+<path id="Subtract" d="M133 120C133 122.761 130.761 125 128 125H78C75.2386 125 73 122.761 73 120V70C73 67.2386 75.2386 65 78 65H128C130.761 65 133 67.2386 133 70V120Z" fill="white"/>
+<path id="Subtract_2" d="M247 120C247 122.761 244.761 125 242 125H192C189.239 125 187 122.761 187 120V70C187 67.2386 189.239 65 192 65H242C244.761 65 247 67.2386 247 70V120Z" fill="white"/>
+<circle id="Ellipse 53" cx="90" cy="116.5" r="9" fill="black"/>
+<circle id="Ellipse 54" cx="204" cy="116.5" r="9" fill="black"/>
+</g>
+<path id="Vector 32" d="M136 156.5H185" stroke="white" stroke-width="5" stroke-linecap="round"/>
+</g>
+</svg>

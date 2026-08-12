@@ -9,6 +9,8 @@ import android.content.Context
 import android.content.SharedPreferences
 import android.graphics.Bitmap
 import android.util.Log
+import androidx.security.crypto.EncryptedSharedPreferences
+import androidx.security.crypto.MasterKey
 import com.google.gson.Gson
 import com.google.gson.GsonBuilder
 import com.google.gson.JsonArray
@@ -55,7 +57,8 @@ class FaceRegisterManager private constructor(private val context: Context) {
 
     companion object {
         private const val TAG = "FaceRegisterManager"
-        private const val PREFS_NAME = "rpo_face_profiles"
+        private const val PREFS_NAME = "rpo_face_profiles_encrypted"  // 加密存储
+        private const val LEGACY_PREFS_NAME = "rpo_face_profiles"     // 旧版明文存储（用于迁移）
         private const val KEY_PROFILES = "profiles_json"
 
         // 注册参数
@@ -64,6 +67,7 @@ class FaceRegisterManager private constructor(private val context: Context) {
         private const val REGISTER_TIMEOUT_MS = 10000L        // 注册超时10秒
         private const val SAMPLE_INTERVAL_MS = 200L           // 采样间隔200ms
         private const val MIN_FRAME_SIMILARITY = 0.6f         // 帧间最小相似度（确保是同一人）
+        private const val OVERRIDE_SIMILARITY_THRESHOLD = 0.35f // 同名覆盖相似度阈值（低于则视为不同人，自动加编号）
 
         @Volatile
         private var instance: FaceRegisterManager? = null
@@ -118,7 +122,28 @@ class FaceRegisterManager private constructor(private val context: Context) {
     private val gson: Gson = GsonBuilder()
         .registerTypeAdapter(FloatArray::class.java, FloatArrayTypeAdapter())
         .create()
-    private val prefs: SharedPreferences = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+
+    // 加密 SharedPreferences：生物特征数据加密存储
+    // 初始化失败时自动降级到普通 SharedPreferences
+    private val prefs: SharedPreferences by lazy {
+        try {
+            val masterKey = MasterKey.Builder(context)
+                .setKeyScheme(MasterKey.KeyScheme.AES256_GCM)
+                .build()
+            EncryptedSharedPreferences.create(
+                context,
+                PREFS_NAME,
+                masterKey,
+                EncryptedSharedPreferences.PrefKeyEncryptionScheme.AES256_SIV,
+                EncryptedSharedPreferences.PrefValueEncryptionScheme.AES256_GCM
+            ).also {
+                Log.i(TAG, "EncryptedSharedPreferences initialized (AES256_GCM)")
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "EncryptedSharedPreferences init failed, falling back to plain SharedPreferences", e)
+            context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+        }
+    }
     private val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
 
         // 特征提取器在 setFeatureExtractor() 中由外部注入（共享FaceIdentifier的TFLite实例）
@@ -132,6 +157,7 @@ class FaceRegisterManager private constructor(private val context: Context) {
     @Volatile private var registerState = RegisterState.IDLE
     private var currentRegisterName: String = ""
     private var currentRegisterProfile: FaceProfile? = null
+    private var pendingOverrideProfile: FaceProfile? = null  // 待覆盖的同名档案（用于相似度比对）
     private val candidateFrames = Collections.synchronizedList(mutableListOf<CandidateFrame>())
     private var lastSampleTime = 0L
     private var registerCallback: RegisterCallback? = null
@@ -141,9 +167,46 @@ class FaceRegisterManager private constructor(private val context: Context) {
      * 初始化：加载已持久化的人脸档案，初始化特征提取器
      */
     fun initialize() {
+        // 数据迁移：从旧版明文 SharedPreferences 迁移到加密版
+        migrateFromLegacyPrefs()
+
         loadProfiles()
         // 注意：featureExtractor的initialize在FaceIdentifier中统一调用，避免重复加载模型
         Log.i(TAG, "FaceRegisterManager initialized, ${profiles.size} profiles loaded")
+    }
+
+    /**
+     * 从旧版明文 SharedPreferences 迁移到加密版
+     * 只在第一次启动且旧版有数据时执行
+     */
+    private fun migrateFromLegacyPrefs() {
+        try {
+            val legacyPrefs = context.getSharedPreferences(LEGACY_PREFS_NAME, Context.MODE_PRIVATE)
+            val legacyJson = legacyPrefs.getString(KEY_PROFILES, null)
+            if (!legacyJson.isNullOrEmpty()) {
+                Log.i(TAG, "Found legacy plaintext profiles, migrating to encrypted storage...")
+
+                // 读取旧数据
+                val type = object : TypeToken<List<FaceProfile>>() {}.type
+                val list: List<FaceProfile> = gson.fromJson(legacyJson, type) ?: emptyList()
+
+                // 写入新的加密 SharedPreferences
+                prefs.edit().putString(KEY_PROFILES, legacyJson).apply()
+
+                // 验证：读取新数据确认迁移成功
+                val newJson = prefs.getString(KEY_PROFILES, null)
+                if (!newJson.isNullOrEmpty() && newJson.length == legacyJson.length) {
+                    // 迁移成功，删除旧数据
+                    legacyPrefs.edit().remove(KEY_PROFILES).apply()
+                    Log.i(TAG, "✅ Migration successful: ${list.size} profiles migrated, legacy data deleted")
+                } else {
+                    Log.w(TAG, "Migration verification failed, legacy data kept as backup")
+                }
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "Migration from legacy prefs failed", e)
+            // 迁移失败不影响正常使用，旧数据保留
+        }
     }
 
     /**
@@ -174,9 +237,19 @@ class FaceRegisterManager private constructor(private val context: Context) {
 
         // 检查是否已注册同名用户
         val existing = getProfileByName(name)
-        if (existing != null) {
-            Log.i(TAG, "User '$name' already registered, updating features")
-            // 已注册则更新特征，不创建新档案
+        if (existing != null && existing.feature != null) {
+            Log.i(TAG, "User '$name' already registered, will check similarity before override")
+            // 已注册同名用户：先标记为"待确认覆盖"
+            // 采集到特征后比对相似度，是同一人则覆盖，不是同一人则自动加编号
+            pendingOverrideProfile = existing
+            currentRegisterProfile = FaceProfile(
+                id = UUID.randomUUID().toString().take(8),
+                name = name.trim(),
+                registerTime = System.currentTimeMillis()
+            )
+        } else if (existing != null) {
+            // 同名但没有特征（异常状态），直接覆盖
+            Log.i(TAG, "User '$name' exists but no feature, overriding")
             currentRegisterProfile = existing
         } else {
             currentRegisterProfile = FaceProfile(
@@ -359,8 +432,33 @@ class FaceRegisterManager private constructor(private val context: Context) {
             profile.feature = finalFeature
             profile.sampleCount = topFrames.size
 
-            // 4. 保存到内存和持久化
-            profiles[profile.id] = profile
+            // 4. 同名覆盖检查：与待覆盖的同名档案比对相似度
+            val overrideProfile = pendingOverrideProfile
+            if (overrideProfile != null && overrideProfile.feature != null) {
+                val sim = featureExtractor.cosineSimilarity(finalFeature, overrideProfile.feature!!)
+                Log.i(TAG, "Same name check: similarity=%.3f, threshold=%.2f".format(sim, OVERRIDE_SIMILARITY_THRESHOLD))
+
+                if (sim >= OVERRIDE_SIMILARITY_THRESHOLD) {
+                    // 是同一个人 → 覆盖原档案（保留原 ID 和名字）
+                    Log.i(TAG, "Same person, updating existing profile: ${overrideProfile.name}")
+                    overrideProfile.feature = finalFeature
+                    overrideProfile.sampleCount = topFrames.size
+                    profiles[overrideProfile.id] = overrideProfile
+                    // 清除临时档案
+                    currentRegisterProfile = overrideProfile
+                } else {
+                    // 不是同一个人 → 自动加编号，创建新档案
+                    val uniqueName = generateUniqueName(currentRegisterName)
+                    profile.name = uniqueName
+                    profiles[profile.id] = profile
+                    Log.i(TAG, "Different person with same name, auto-renamed to: $uniqueName")
+                }
+            } else {
+                // 没有同名用户 → 直接保存
+                profiles[profile.id] = profile
+            }
+
+            // 5. 持久化
             saveProfiles()
 
             timeoutJob?.cancel()
@@ -407,6 +505,7 @@ class FaceRegisterManager private constructor(private val context: Context) {
         registerState = RegisterState.IDLE
         currentRegisterName = ""
         currentRegisterProfile = null
+        pendingOverrideProfile = null
         candidateFrames.clear()
         lastSampleTime = 0L
         timeoutJob?.cancel()
@@ -422,6 +521,20 @@ class FaceRegisterManager private constructor(private val context: Context) {
 
     fun getProfileByName(name: String): FaceProfile? =
         profiles.values.find { it.name.equals(name, ignoreCase = true) }
+
+    /**
+     * 生成唯一的名字（同名时自动加编号）
+     * 例如：小明 → 小明2 → 小明3 → ...
+     */
+    private fun generateUniqueName(baseName: String): String {
+        var count = 2
+        var name = "$baseName$count"
+        while (getProfileByName(name) != null) {
+            count++
+            name = "$baseName$count"
+        }
+        return name
+    }
 
     fun updateProfile(profile: FaceProfile) {
         profiles[profile.id] = profile

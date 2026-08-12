@@ -11,6 +11,7 @@ import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
+import android.os.BatteryManager
 import android.util.Log
 import android.view.KeyEvent
 import android.view.WindowManager
@@ -42,6 +43,9 @@ import androidx.lifecycle.lifecycleScope
 import com.roboparty.rpoexpression.animation.ExpressionCanvas
 import com.roboparty.rpoexpression.audio.AudioManager
 import com.roboparty.rpoexpression.audio.AsrManager
+import com.roboparty.rpoexpression.audio.ConversationCoordinator
+import com.roboparty.rpoexpression.audio.InterruptReason
+import com.roboparty.rpoexpression.audio.LocalIntentResolver
 import com.roboparty.rpoexpression.communication.CommunicationManager
 import com.roboparty.rpoexpression.llm.LlmManager
 import com.roboparty.rpoexpression.expression.DemoSequenceManager
@@ -80,17 +84,6 @@ import com.roboparty.rpoexpression.audio.KwsManager
  * 实现全屏沉浸式表情显示，完成ASR→LLM→TTS全链路对话
  */
 private const val TAG = "MainActivity"
-//===== 唤醒兜底时间动态计算 ==========
-// 中文TTS常见语速：每秒约3.5个字（CosyVoice 龙安欢/龙安洋音色实测）
-private const val TTS_CHARS_PER_SECOND = 3.5f
-// 云端合成延迟余量（网络RTT + 服务端合成首包延迟）
-private const val TTS_SYNTHESIS_DELAY_MS = 1000L
-// 兜底时间倍率（留50%余量应对异常情况）
-private const val WAKE_UP_FALLBACK_MARGIN = 1.5f
-// 兜底最小时间（再短也不能少于这个，避免极端短句子时兜底太快）
-private const val WAKE_UP_FALLBACK_MIN_MS = 2000L
-// 兜底最大时间（再长也不能超过这个，避免兜底完全失效）
-private const val WAKE_UP_FALLBACK_MAX_MS = 8000L
 class MainActivity : ComponentActivity() {
 
 
@@ -103,6 +96,7 @@ class MainActivity : ComponentActivity() {
     private lateinit var audioManager: AudioManager
     private lateinit var llmManager: LlmManager
     private lateinit var visionManager: VisionManager
+    private lateinit var conversationCoordinator: ConversationCoordinator
     private val REQUEST_RECORD_AUDIO_PERMISSION = 1001
     private val REQUEST_CAMERA_PERMISSION = 1002
     private val REQUEST_ALL_PERMISSIONS = 1003
@@ -111,72 +105,16 @@ class MainActivity : ComponentActivity() {
     private var pendingAsrOnlyTest = false
 
     // ========== 语音交互状态机 ==========
-    /**
-     * 语音交互状态（6状态）：
-     * DORMANT    - 休眠监听：KWS本地唤醒词检测，零网络，低功耗
-     * AWAKENING  - 唤醒确认：播放唤醒音效，切换KWS→ASR
-     * LISTENING  - 对话聆听：ASR全量识别中
-     * PROCESSING - LLM推理中
-     * SPEAKING   - TTS播报中
-     * COOLDOWN   - 冷却防抖：3秒后回到DORMANT
-     */
-    private enum class VoiceState {
-        DORMANT, AWAKENING, LISTENING, PROCESSING, SPEAKING, COOLDOWN
-    }
-    @Volatile
-    private var currentVoiceState = VoiceState.DORMANT
-
-    // 连续对话相关
-    private var isInContinuousConversation = false // 是否处于连续对话模式（唤醒后无需重复唤醒）
-    private val exitWords = listOf(
-        "结束对话", "结束", "拜拜", "拜", "再见", "再会", "退下"  // 结束词
-    )
-
-    // ========== 连续对话空闲超时：一段时间没说话自动退出连续对话 ==========
-    private val CONTINUOUS_CONVERSATION_TIMEOUT_MS = 30000L // 30秒
-    private var continuousConversationTimeoutJob: kotlinx.coroutines.Job? = null
-
-
-    /**
-     * 根据文本长度预估唤醒兜底时间
-     * 公式：(字数 / 每秒字数) × 1000ms × 余量倍率 + 合成延迟
-     * 上下限：[2s, 8s]
-     */
-    private fun estimateWakeUpFallbackMs(text: String): Long {
-        val charCount = text.length.coerceAtLeast(1)
-        val playbackMs = (charCount / TTS_CHARS_PER_SECOND * 1000).toLong()
-        val estimated = (playbackMs * WAKE_UP_FALLBACK_MARGIN).toLong() + TTS_SYNTHESIS_DELAY_MS
-        return estimated.coerceIn(WAKE_UP_FALLBACK_MIN_MS, WAKE_UP_FALLBACK_MAX_MS)
-    }
-
-    // ========== TTS播放结束回调监听器 ==========
-    private var ttsFinishListener: (() -> Unit)? = null
+    // ========== 会话统一管理（P0：委托 AudioManager）==========
+    // 会话ID生成、currentSessionId、conversationJob 统一由 AudioManager 管理
+    // - 新会话：audioManager.startNewSession()
+    // - 中断会话：audioManager.interruptConversation(reason)
+    // - 校验回调：sessionId == audioManager.getCurrentSessionId()
+    // - 独立TTS临时ID：audioManager.generateTempSessionId()
 
     // ========== 人脸注册状态：注册期间阻止TTS finish/barge-in干扰 ==========
     @Volatile
     private var isFaceRegistering = false
-
-    /**
-     * 结束词宽松匹配
-     * 规则：
-     * 1. 只判断清洗后的文本
-     * 2. 输入包含结束词才命中
-     */
-    private fun isExitWord(input: String): Boolean {
-        val trimmed = input.trim()
-        if (trimmed.length < 2) return false
-        return exitWords.any { word ->
-            trimmed.contains(word, ignoreCase = true)
-        }
-    }
-
-    /**
-     * 是否是关机关键词
-     */
-    private fun isPowerOffWord(input: String): Boolean {
-        val trimmed = input.trim()
-        return trimmed == "关机" || trimmed.contains("关机")
-    }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -192,6 +130,16 @@ class MainActivity : ComponentActivity() {
         audioManager = app.audioManager
         llmManager = app.llmManager
         visionManager = app.visionManager
+
+        // 初始化对话协调器（P2：语音对话逻辑集中管理）
+        conversationCoordinator = ConversationCoordinator(
+            context = this,
+            audioManager = audioManager,
+            llmManager = llmManager,
+            expressionManager = expressionManager,
+            voicePreferenceStore = app.voicePreferenceStore,
+            scope = lifecycleScope
+        )
 
         // 保持屏幕常亮
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
@@ -254,7 +202,20 @@ class MainActivity : ComponentActivity() {
         // 启动各个管理器
         startManagers()
 
-        initTtsFinishCallback()
+        // 初始化对话协调器回调（替代原 initTtsFinishCallback）
+        conversationCoordinator.init(object : ConversationCoordinator.Callback {
+            override fun getLastRecognizedName(): String? = app.lastRecognizedName
+            override fun isFaceRegistering(): Boolean = this@MainActivity.isFaceRegistering
+            override fun onStartFaceRegistration(userName: String) {
+                startFaceRegistration(userName)
+            }
+            override fun onNeedCheckPermissionAndStartAsr() {
+                checkRecordPermissionAndStartAsr()
+            }
+            override fun onNeedStartFaceDetect() {
+                startFaceDetect()
+            }
+        })
         initPowerStateCallback()
 
         // 启动自动申请权限，开启摄像头和麦克风
@@ -300,342 +261,25 @@ class MainActivity : ComponentActivity() {
      * - CPU占用：8-12% → 1-3%（↓80%）
      * - 网络流量：50-100KB/s → 0（↓100%）
      */
+    /**
+     * 启动KWS关键词唤醒监听（委托给 ConversationCoordinator）
+     */
     private fun startWakeUpListening() {
-        if (currentVoiceState == VoiceState.DORMANT && audioManager.isKwsListening()) {
-            return // 已经在KWS监听
-        }
-
-        // 退出连续对话模式
-        if (isInContinuousConversation) {
-            exitContinuousConversation()
-        }
-
-        // 确保ASR已停止
-        try {
-            audioManager.stopListening()
-        } catch (e: Exception) {
-            Log.w(TAG, "Stop ASR before KWS failed: ${e.message}")
-        }
-
-        currentVoiceState = VoiceState.DORMANT
-        Log.i(TAG, "Starting KWS wake word listening (DORMANT state)")
-
-        try {
-            audioManager.startKwsListening(object : KwsManager.KwsCallback {
-                override fun onKeywordDetected(keyword: String, confidence: Float, group: KwsManager.WakeWordGroup) {
-                    runOnUiThread {
-                        Log.i(TAG, "Wake word detected: '$keyword', group=$group, confidence=$confidence")
-
-                        // ========== 切换期间输入屏蔽 ==========
-                        // 如果正在人格切换中，直接丢弃唤醒词，避免冲突
-                        if (PersonaSwitchManager.isSwitching) {
-                            Log.i(TAG, "Wake word dropped: persona switch in progress")
-                            return@runOnUiThread
-                        }
-
-                        // 根据唤醒词组从 PersonaRegistry 查找对应人格
-                        val config = PersonaRegistry.getByWakeWordGroup(group)
-                        val persona = config?.persona ?: LlmManager.Persona.LUOBO
-                        triggerWakeUp(persona)
-                    }
-                }
-
-                override fun onError(error: String) {
-                    runOnUiThread {
-                        Log.e(TAG, "KWS error: $error, restarting in 1s...")
-                        currentVoiceState = VoiceState.COOLDOWN
-                        lifecycleScope.launch {
-                            delay(1000)
-                            startWakeUpListening()
-                        }
-                    }
-                }
-            })
-        } catch (e: Exception) {
-            Log.e(TAG, "Start KWS failed", e)
-            // 启动失败，延迟重试
-            lifecycleScope.launch {
-                delay(1000)
-                startWakeUpListening()
-            }
-        }
+        conversationCoordinator.startWakeUpListening()
     }
 
     /**
-     * 触发唤醒（AWAKENING状态）
-     *
-     * @param persona 唤醒后切换到的人格，默认萝卜人格（女款）
-     *
-     * 状态切换时序：
-     * 1. 停止KWS监听，释放AudioRecord
-     * 2. 切换人格（LLM + 表情风格 + TTS音色）
-     * 3. 播放对应人格的问候语（预缓存，秒开）
-     * 4. 问候语播完 → 启动ASR → 进入LISTENING状态
+     * 触发唤醒（委托给 ConversationCoordinator）
      */
     private fun triggerWakeUp(persona: LlmManager.Persona = LlmManager.Persona.LUOBO) {
-        // 防止重复触发
-        if (currentVoiceState != VoiceState.DORMANT) {
-            Log.w(TAG, "triggerWakeUp ignored, current state=$currentVoiceState")
-            return
-        }
-
-        // ========== 快速唤醒路径 (Fast WakeUp) ==========
-        // 如果已经是目标人格，直接唤醒，不做切换
-        // 好处：
-        // 1. 避免无意义的"切换到自己"，减少状态抖动
-        // 2. 更快进入聆听状态，响应更及时
-        // 3. 不清空 LLM 历史，相当于"继续之前的对话"
-        val isFastWakeUp = llmManager.getPersona() == persona
-        if (isFastWakeUp) {
-            Log.i(TAG, "Fast WakeUp: Already in $persona persona, skipping switch")
-            currentVoiceState = VoiceState.AWAKENING
-            isInContinuousConversation = true
-            // 停止 KWS，释放录音通道给 ASR
-            audioManager.stopKwsListening()
-            // 直接进入唤醒应答流程
-            startWakeUpSequence(persona)
-            return
-        }
-
-        // ========== 常规唤醒路径 (Full WakeUp) ==========
-        // 检测到的人格 != 当前人格，需要完整切换
-        Log.i(TAG, "Full WakeUp: Switching to $persona persona")
-
-        // ========== 事务切换 Step 1：申请锁 ==========
-        if (!PersonaSwitchManager.tryStartSwitch("triggerWakeUp")) {
-            Log.w(TAG, "triggerWakeUp: switch in progress, drop request")
-            return
-        }
-
-        try {
-            currentVoiceState = VoiceState.AWAKENING
-            isInContinuousConversation = true
-            Log.i(TAG, "Wake up triggered! persona=$persona, State: DORMANT → AWAKENING")
-
-            // ========== 事务切换 Step 2：切断旧流 (Kill) ==========
-            // 停止KWS，释放录音通道给ASR
-            audioManager.stopKwsListening()
-            // 停止可能正在播放的TTS（休眠状态下理论上不会有，但保险起见）
-            audioManager.stopSpeaking()
-            // 停止可能正在运行的ASR
-            audioManager.stopListening()
-            // 取消可能正在进行的LLM请求
-            app.llmManager.cancelRequest()
-
-            // ========== 事务切换 Step 3：数据层前置切换 (Data First) ==========
-            // 从 PersonaRegistry 获取统一配置，避免散落的 when 分支
-            val config = PersonaRegistry.getConfig(persona)
-
-            // 原则：先切数据，后切视觉，确保状态一致
-            // 数据层操作耗时极短（微秒级），在视觉切换前就完成
-
-            // 3.1 前置：立即切换 TTS 音色（耗时 < 1ms）
-            // 注意：setTtsVoice 内部有幂等检查，相同 voiceId 直接返回
-            // 先读用户为该人格选过的音色，读不到或非法才用默认
-            val voiceOption = app.voicePreferenceStore.resolveVoiceForPersona(persona)
-            audioManager.setTtsVoice(voiceOption.voiceId)
-            Log.d(TAG, "TTS voice set to: ${voiceOption.voiceId} (${voiceOption.displayName})")
-
-            // 3.2 前置：立即切换 LLM 人格
-            // setPersona 会取消旧的 SessionJob，清空短期记忆
-            // 注意：setPersona 内部有幂等检查，相同人格直接返回
-            app.llmManager.setPersona(persona)
-
-            // ========== 事务切换 Step 4：渲染层切换 (Render) ==========
-            // 切换表情风格（瞬切，无动画）
-            // setStyle 内部会触发 styleChangeCallback，在回调中再次确认 TTS 和 LLM（幂等安全）
-            // 这样做的好处：
-            // 1. 数据层先切，确保切换过程中任何意外触发的 TTS 都是新音色
-            // 2. 回调再确认一次，保证状态最终一致
-            // 3. 两次调用都是幂等的，不会有副作用
-            expressionManager.setStyle(config.expressionStyle)
-
-            Log.i(TAG, "Persona switched: $persona, style=${config.expressionStyle}")
-
-            // ========== 事务切换 Step 5：完成 & 释放锁 ==========
-            // setStyle 是同步操作，立即完成，直接释放锁
-            PersonaSwitchManager.finishSwitch("triggerWakeUp")
-        } catch (e: Exception) {
-            Log.e(TAG, "triggerWakeUp failed", e)
-            // 出错时强制释放锁，防止死锁
-            PersonaSwitchManager.forceRelease("triggerWakeUp error")
-            return
-        }
-
-        // 进入唤醒应答流程
-        startWakeUpSequence(persona)
+        conversationCoordinator.onWakeWordDetected(persona)
     }
 
     /**
-     * 唤醒应答序列（快速唤醒和常规唤醒共用）
-     *
-     * 包括：
-     * - 临时关闭 barge-in
-     * - 播放问候语
-     * - 启动连续对话超时计时
-     * - 兜底协程（TTS 回调丢失时强制启动 ASR）
-     *
-     * @param persona 当前人格
-     */
-    private fun startWakeUpSequence(persona: LlmManager.Persona) {
-        // 唤醒应答"嗯？"是短系统提示音（约300ms），不需要barge-in打断功能
-        // 临时关闭barge-in，避免barge-in ASR残留阻塞后续正常ASR启动
-        val wasBargeInEnabled = audioManager.bargeInEnabled
-        audioManager.bargeInEnabled = false
-
-        // 唤醒应答表情 + 对应人格的问候语
-        // 注意：问候语已在应用启动时（陌生人）或人脸识别时（熟人）预合成
-        // 正常情况下播放几乎是秒开，不需要等待合成
-        val greeting = buildGreeting(persona)
-        expressionManager.requestExpression(ExpressionType.RESPONSE, duration = 800, force = true)
-        audioManager.startSpeaking(greeting)
-
-        // 启动连续对话超时计时
-        resetContinuousConversationTimeout()
-
-        // 兜底：动态计算时间后如果还没进入LISTENING状态（TTS回调丢失等异常），强制启动ASR
-        // 正常流程：TTS问候语播完 → ttsFinishListener → 自动启动ASR
-        // 兜底时间根据问候语长度动态计算：预估播放时长 × 1.5余量 + 合成延迟
-        // 句子短 → 兜底短 → 回调丢失时更快恢复
-        // 句子长 → 兜底长 → 避免TTS还没播完就提前开ASR导致自激
-        val fallbackMs = estimateWakeUpFallbackMs(greeting)
-        Log.i(TAG, "Wake-up fallback: greeting=${greeting.length}chars, estimated=${fallbackMs}ms")
-        lifecycleScope.launch {
-            delay(fallbackMs)
-            // 恢复barge-in设置
-            audioManager.bargeInEnabled = wasBargeInEnabled
-            if (currentVoiceState == VoiceState.AWAKENING) {
-                Log.w(TAG, "Fallback: TTS finish callback missed, force starting ASR after ${fallbackMs}ms")
-                currentVoiceState = VoiceState.LISTENING
-                checkRecordPermissionAndStartAsr()
-            }
-        }
-    }
-
-    /**
-     * 对话中切换人格（统一入口）
-     *
-     * 功能：在对话过程中，用户说"换成阿冷"/"换成萝卜"等指令时调用
-     * 自动完成：停止当前播放 → 切换LLM人格 → 切换表情风格 → 切换TTS音色 → 保存持久化 → 播放登场台词 → 自动继续听
-     *
-     * @param target 目标人格
+     * 对话中切换人格（委托给 ConversationCoordinator）
      */
     private fun switchPersona(target: LlmManager.Persona) {
-        // ========== 事务切换 Step 1：申请锁 ==========
-        if (!PersonaSwitchManager.tryStartSwitch("switchPersona")) {
-            Log.w(TAG, "switchPersona: switch in progress, drop request")
-            return
-        }
-
-        try {
-            // 从 PersonaRegistry 获取统一配置
-            val config = PersonaRegistry.getConfig(target)
-
-            // a. 已经是当前人格 → 不切换，回一句话
-            if (llmManager.getPersona() == target) {
-                PersonaSwitchManager.finishSwitch("switchPersona")
-                audioManager.startSpeaking(config.alreadyHereQuote)
-                return
-            }
-
-            Log.i(TAG, "Switching persona in conversation: ${llmManager.getPersona()} → $target")
-
-            // ========== 事务切换 Step 2：切断旧流 (Kill) ==========
-            // 停止当前TTS和ASR，避免切换过程中还在播放/识别
-            audioManager.stopSpeaking()
-            audioManager.stopListening()
-            // 取消可能正在进行的LLM请求
-            llmManager.cancelRequest()
-
-            // ========== 事务切换 Step 3：数据层前置切换 (Data First) ==========
-            // 原则：先切数据，后演动画，播完即开口
-            // 数据层操作耗时极短（微秒级），在动画开始前就完成，避免动画期间误播报旧音色
-
-            // 3.1 前置：立即切换 TTS 音色（耗时 < 1ms）
-            // 这样即使动画期间意外触发 TTS，声音也已经是新的
-            // 注意：setTtsVoice 内部有幂等检查，相同 voiceId 直接返回
-            // 先读用户为该人格选过的音色，读不到或非法才用默认
-            val voiceOption = app.voicePreferenceStore.resolveVoiceForPersona(target)
-            audioManager.setTtsVoice(voiceOption.voiceId)
-            Log.d(TAG, "TTS voice set to: ${voiceOption.voiceId} (${voiceOption.displayName})")
-
-            // 3.2 前置：立即切换 LLM 人格
-            // setPersona 会取消旧的 SessionJob，清空短期记忆
-            // 注意：setPersona 内部有幂等检查，相同人格直接返回
-            llmManager.setPersona(target)
-
-            // ========== 事务切换 Step 4：渲染层后置切换 (Render Next) ==========
-            // 启动表情动画（异步，约 700ms）
-            // 动画中间会触发 styleChangeCallback，在回调中再次确认 TTS 和 LLM（幂等安全）
-            // 这样做的好处：
-            // 1. 数据层先切，确保动画期间任何意外触发的 TTS 都是新音色
-            // 2. 动画中间回调再确认一次，保证状态最终一致
-            // 3. 两次调用都是幂等的，不会有副作用
-            expressionManager.switchStyle(config.expressionStyle, animated = true)
-
-            // ========== 事务切换 Step 5：等待动画完成 (Wait) ==========
-            // 动画总时长约 700ms，延迟 800ms 后释放锁
-            lifecycleScope.launch {
-                try {
-                    delay(800)
-                    // ========== 事务切换 Step 6：释放锁 (Release) ==========
-                    PersonaSwitchManager.finishSwitch("switchPersona")
-                    Log.d(TAG, "Persona switch animation complete, lock released")
-                } catch (e: Exception) {
-                    Log.e(TAG, "Switch animation delay failed", e)
-                    PersonaSwitchManager.forceRelease("switchPersona animation error")
-                }
-            }
-
-            // g. 播放登场台词
-            val intro = config.introQuote
-
-            // 更新状态为SPEAKING
-            currentVoiceState = VoiceState.SPEAKING
-
-            // h. 登场台词播完后，自动启动ASR继续听
-            audioManager.startSpeaking(intro, object : com.roboparty.rpoexpression.audio.TtsManager.TtsStateCallback {
-                override fun onDone() {
-                    runOnUiThread {
-                        Log.d(TAG, "Persona switch intro finished, resuming ASR")
-                        // 确保进入连续对话模式
-                        if (!isInContinuousConversation) {
-                            isInContinuousConversation = true
-                        }
-                        resetContinuousConversationTimeout()
-                        // 自动启动ASR继续听
-                        startAsrRecognition()
-                    }
-                }
-
-                override fun onError(errorCode: Int) {
-                    runOnUiThread {
-                        Log.w(TAG, "Persona switch intro error: $errorCode")
-                        // 出错也继续进入听的状态，避免卡死
-                        if (!isInContinuousConversation) {
-                            isInContinuousConversation = true
-                        }
-                        startAsrRecognition()
-                    }
-                }
-            })
-        } catch (e: Exception) {
-            Log.e(TAG, "switchPersona failed", e)
-            // 出错时强制释放锁，防止死锁
-            PersonaSwitchManager.forceRelease("switchPersona error")
-        }
-    }
-
-    /**
-     * 根据人格生成问候语
-     * 统一从 PersonaRegistry 获取配置，不再硬编码
-     *
-     * @param persona 目标人格
-     * @return 对应风格的问候语
-     */
-    private fun buildGreeting(persona: LlmManager.Persona): String {
-        val name = app.lastRecognizedName
-        return PersonaRegistry.getConfig(persona).buildGreeting(name)
+        conversationCoordinator.switchPersona(target)
     }
 
     /**
@@ -708,9 +352,7 @@ class MainActivity : ComponentActivity() {
                         audioManager.stopListening()
                         audioManager.stopKwsListening()
                         audioManager.stopSpeaking()
-                        currentVoiceState = VoiceState.COOLDOWN
-                        isInContinuousConversation = false
-                        continuousConversationTimeoutJob?.cancel()
+                        audioManager.interruptConversation(InterruptReason.HARDWARE_COMMAND)  // 取消所有进行中的会话
                     } catch (e: Exception) {
                         Log.e(TAG, "Stop audio failed", e)
                     }
@@ -749,92 +391,6 @@ class MainActivity : ComponentActivity() {
             }
         }
     }
-    private fun initTtsFinishCallback() {
-        ttsFinishListener = action@{
-            // 人脸注册期间的TTS提示音播放结束不应该触发连续对话/唤醒流程
-            if (isFaceRegistering) {
-                Log.d(TAG, "TTS finish during face registration, suppressed")
-                return@action
-            }
-
-            ModuleStateManager.onTtsFinishSpeaking()
-
-            lifecycleScope.launch {
-                delay(500)
-
-                if (isInContinuousConversation) {
-                    // 连续对话模式：自动继续聆听，无需唤醒词
-                    startAsrRecognition()
-                } else {
-                    // 非连续对话：回到唤醒监听状态
-                    startWakeUpListening()
-                }
-            }
-        }
-        // 注册到 AudioManager，TTS 结束时会自动触发
-        audioManager.setOnSpeakFinishListener(object : AudioManager.OnSpeakFinishListener {
-            override fun onSpeakFinsh() {
-                runOnUiThread {
-                    ttsFinishListener?.invoke()
-                }
-            }
-        })
-
-        // ===== 注册打断（Barge-in）回调 =====
-        audioManager.setOnBargeInListener(object : AudioManager.OnBargeInListener {
-            override fun onBargeIn(text: String) {
-                runOnUiThread {
-                    Log.d(TAG, "Barge-in received, text=[$text]")
-                    // 人脸注册期间忽略打断，避免干扰采集流程
-                    if (isFaceRegistering) {
-                        Log.d(TAG, "Barge-in suppressed during face registration")
-                        return@runOnUiThread
-                    }
-                    // 1. 取消正在进行的LLM请求
-                    llmManager.cancelRequest()
-                    // 2. 进入连续对话模式（如果还没进入）
-                    if (!isInContinuousConversation) {
-                        isInContinuousConversation = true
-                    }
-                    resetContinuousConversationTimeout()
-
-                    // 3. 如果已有识别文本，直接处理；否则启动新的ASR识别让用户继续说
-                    if (text.isNotBlank()) {
-                        processAsrResult(text, asrOnly = false)
-                    } else {
-                        // speech_started触发的打断：用户刚开口，启动完整ASR识别接收后续内容
-                        startAsrRecognition()
-                    }
-                }
-            }
-        })
-    }
-
-    /**
-     * 重置连续对话空闲超时
-     */
-    private fun resetContinuousConversationTimeout() {
-        continuousConversationTimeoutJob?.cancel()
-
-        continuousConversationTimeoutJob = lifecycleScope.launch {
-            delay(CONTINUOUS_CONVERSATION_TIMEOUT_MS)
-
-            if (isInContinuousConversation && !audioManager.isSpeaking() && !audioManager.isListening()) {
-                exitContinuousConversation()
-                expressionManager.requestExpression(ExpressionType.IDLE, force = true)
-                startWakeUpListening()
-            }
-        }
-    }
-
-    /**
-     * 退出连续对话模式
-     */
-    private fun exitContinuousConversation() {
-        isInContinuousConversation = false
-        continuousConversationTimeoutJob?.cancel()
-        continuousConversationTimeoutJob = null
-    }
 
     override fun onResume() {
         super.onResume()
@@ -847,34 +403,15 @@ class MainActivity : ComponentActivity() {
             startFaceDetect()
         }
 
-        if (!hasAudio || audioManager.isSpeaking() || audioManager.isListening() || audioManager.isKwsListening()) {
-            return
-        }
-
-        if (isInContinuousConversation) {
-            // 保持连续对话，继续聆听
-            startAsrRecognition()
-        } else {
-            // 回到KWS唤醒监听
-            startWakeUpListening()
+        if (hasAudio) {
+            conversationCoordinator.onResume()
         }
     }
 
     override fun onPause() {
         super.onPause()
-        // 退后台停止所有前台任务，彻底释放资源
-        currentVoiceState = VoiceState.COOLDOWN
-        isInContinuousConversation = false // 退出连续对话模式
-        continuousConversationTimeoutJob?.cancel()
-        continuousConversationTimeoutJob = null
-
-        try {
-            audioManager.stopListening()
-            audioManager.stopKwsListening()
-            audioManager.stopSpeaking()
-        } catch (e: Exception) {
-            // 忽略停止异常
-        }
+        // 语音部分委托给 Coordinator
+        conversationCoordinator.onPause()
         try {
             visionManager.stopFaceDetect()
         } catch (e: Exception) {
@@ -938,10 +475,7 @@ class MainActivity : ComponentActivity() {
                 // B键：停止所有操作，回到待机
                 KeyEvent.KEYCODE_BUTTON_B -> {
                     demoSequenceManager.stopDemo()
-                    exitContinuousConversation() // 退出连续对话模式
-                    audioManager.stopSpeaking()
-                    audioManager.stopListening()
-                    llmManager.cancelRequest()
+                    conversationCoordinator.interrupt(InterruptReason.HARDWARE_COMMAND)
                     visionManager.stopFaceDetect()
                     expressionManager.requestExpression(ExpressionType.IDLE, force = true)
                     return true
@@ -1055,8 +589,7 @@ class MainActivity : ComponentActivity() {
         if (ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
             ActivityCompat.requestPermissions(this, arrayOf(Manifest.permission.RECORD_AUDIO), REQUEST_RECORD_AUDIO_PERMISSION)
         } else {
-            isInContinuousConversation = true // 手动触发也进入连续对话模式
-            resetContinuousConversationTimeout() // 重置空闲超时
+            conversationCoordinator.enterContinuousConversation() // 手动触发也进入连续对话模式
             startAsrRecognition(pendingAsrOnlyTest)
         }
     }
@@ -1074,290 +607,10 @@ class MainActivity : ComponentActivity() {
     }
 
     /**
-     * 开始ASR识别
+     * 开始ASR识别（委托给 ConversationCoordinator）
      */
     private fun startAsrRecognition(asrOnly: Boolean = false) {
-        // 恢复barge-in功能（唤醒时临时关闭了）
-        audioManager.bargeInEnabled = true
-
-        // 关键修复：确保KWS完全停止，避免KWS回调与对话回调冲突
-        if (audioManager.isKwsListening()) {
-            Log.d(TAG, "startAsrRecognition: KWS still running, stopping first...")
-            audioManager.stopKwsListening()
-        }
-        // 如果正在听（可能是barge-in残留的ASR会话），先停止再启动新的
-        if (audioManager.isListening()) {
-            Log.d(TAG, "startAsrRecognition: ASR already listening (barge-in residue?), stopping first...")
-            audioManager.stopListening()
-        }
-        // 如果正在说话（TTS刚结束状态可能还没更新），先停止TTS再继续
-        if (audioManager.isSpeaking()) {
-            Log.d(TAG, "startAsrRecognition: TTS still speaking, stopping first...")
-            audioManager.stopSpeaking()
-        }
-
-        // 更新状态为LISTENING
-        currentVoiceState = VoiceState.LISTENING
-        Log.i(TAG, "State: → LISTENING, starting ASR")
-
-        // ========== 先重置连续对话空闲超时，避免每次说话后很快退出 ==========
-        if (isInContinuousConversation) {
-            resetContinuousConversationTimeout()
-        }
-
-        // 注意：识别中表情（瞳孔放大）由AsrManager在真正开始录音时触发
-        // 这里不提前调用，避免WebSocket连接期间用户误以为可以说话
-
-        // 等待100ms确保旧的AudioRecord和WebSocket完全释放，避免资源竞争
-        lifecycleScope.launch {
-            delay(100)
-            // 延迟后再次检查状态，避免期间状态已变化（比如被关机/打断）
-            if (currentVoiceState != VoiceState.LISTENING) {
-                Log.d(TAG, "startAsrRecognition: state changed during delay, aborting")
-                return@launch
-            }
-            audioManager.startListening(object : AsrManager.AsrResultCallback {
-                override fun onResult(text: String) {
-                    runOnUiThread {
-                        // ASR结束表情由AsrManager内部统一触发，这里不重复调用
-                        processAsrResult(text, asrOnly)
-                    }
-                }
-
-                override fun onError(errorMsg: String) {
-                    runOnUiThread {
-                        // ASR错误表情由AsrManager内部统一触发，这里不重复调用
-                        if (isInContinuousConversation) {
-                            // 连续对话模式：出错后自动继续聆听
-                            expressionManager.requestExpression(ExpressionType.CONFUSED, duration = 1000, force = true)
-                            lifecycleScope.launch {
-                                delay(1000)
-                                startAsrRecognition()
-                            }
-                        } else {
-                            expressionManager.requestExpression(ExpressionType.CONFUSED)
-                            audioManager.startSpeaking("抱歉，我没有听清，请再说一遍")
-                        }
-                    }
-                }
-            })
-        }
-    }
-
-    /**
-     * 统一处理ASR识别结果（正常识别 / 打断场景共用）
-     */
-    private fun processAsrResult(text: String, asrOnly: Boolean = false) {
-        // ========== 切换期间输入屏蔽 ==========
-        // 如果正在人格切换中，直接丢弃 ASR 结果，避免用旧人格回复
-        if (PersonaSwitchManager.isSwitching) {
-            Log.i(TAG, "ASR result dropped: persona switch in progress")
-            return
-        }
-
-        if (asrOnly) {
-            audioManager.startSpeaking("识别结果：$text")
-            return
-        }
-
-        if (text.isNotEmpty()) {
-            // 重置连续对话空闲超时
-            if (isInContinuousConversation) {
-                resetContinuousConversationTimeout()
-            }
-
-            // 统一清洗文本
-            val raw = text.lowercase()
-                .replace(Regex("[^a-z\\u4e00-\\u9fa5]"), "")
-
-            // 结束词检测
-            if (isInContinuousConversation && isExitWord(raw)) {
-                exitContinuousConversation()
-                llmManager.exitConversation() // 同时清空LLM对话历史
-
-                expressionManager.requestExpression(ExpressionType.HAPPY, duration = 1200, force = true)
-                audioManager.startSpeaking("好的，随时可以叫我，拜拜")
-                return
-            }
-
-
-            // 关机关键词检测
-            if (isPowerOffWord(raw)) {
-                expressionManager.powerOff()
-                exitContinuousConversation()
-                llmManager.exitConversation() // 关机也清空对话
-                audioManager.stopSpeaking()
-                return
-            }
-
-            // ========== 人格切换指令检测（已禁用，改为仅支持手动切换） ==========
-            // 原功能：语音指令切换人格（"换成阿冷"、"切换女款"等）
-            // 现策略：仅支持手动切换（两指捏合 + 底部中间按钮）
-            // 保留代码以便后续需要时恢复
-            // val switchTarget = PersonaSwitcher.matchSwitchCommand(text, llmManager.getPersona())
-            // if (switchTarget != null) {
-            //     Log.i(TAG, "Persona switch command detected: $text → $switchTarget")
-            //     switchPersona(switchTarget)
-            //     return
-            // }
-
-            sendTextToLlm(text)
-        } else {
-            // 未识别到内容
-            if (isInContinuousConversation) {
-                // 连续对话模式：没听清就继续听，不退出
-                expressionManager.requestExpression(ExpressionType.CONFUSED, duration = 800, force = true)
-                lifecycleScope.launch {
-                    delay(800)
-                    startAsrRecognition()
-                }
-            } else {
-                expressionManager.requestExpression(ExpressionType.IDLE, force = true)
-            }
-        }
-    }
-
-    /**
-     * 发送文本给LLM（流式流水线：LLM SSE → 逐句 TTS）
-     *
-     * 优化后：LLM 边生成边回调 → 收到第一句话立刻开始播 → 后续边播边收
-     * 新增：多轮对话记忆管理
-     * - 自动维护对话历史（由LlmManager内部处理）
-     * - 新增指令："退出对话"/"清除记忆" → 清空短期记忆
-     * - 简单长期记忆："我叫XX" → 记住用户名
-     *
-     * 注意："再见"/"拜拜"等结束词已在ASR结果阶段拦截处理，不会走到这里
-     */
-    private fun sendTextToLlm(text: String) {
-        if (text.isBlank()) {
-            return
-        }
-
-        // 更新状态为PROCESSING（LLM推理中）
-        currentVoiceState = VoiceState.PROCESSING
-
-        val trimmedText = text.trim()
-
-        // ========== 指令检测：清空记忆（"再见/拜拜"已在前面拦截） ==========
-        if (trimmedText.contains("退出对话") || trimmedText.contains("清除记忆") ||
-            trimmedText.contains("忘了我") || trimmedText.contains("重置对话")) {
-            llmManager.exitConversation()
-            exitContinuousConversation()
-            audioManager.startSpeaking("好的，我已经清空对话记忆啦，我们重新开始吧~")
-            expressionManager.requestExpression(ExpressionType.HAPPY)
-            return
-        }
-
-        // ========== 简单长期记忆提取（关键词匹配）+ 人脸注册触发 ==========
-        val namePattern1 = Regex("我叫([\\u4e00-\\u9fa5a-zA-Z]{2,4})")
-        val namePattern2 = Regex("我是([\\u4e00-\\u9fa5a-zA-Z]{2,4})")
-        val nameMatch = namePattern1.find(trimmedText) ?: namePattern2.find(trimmedText)
-        if (nameMatch != null) {
-            val userName = nameMatch.groupValues[1]
-            val invalidNames = setOf("一个", "你的", "机器", "机器人", "AI", "ai", "你朋友", "学生", "好人")
-            if (userName !in invalidNames) {
-                llmManager.addLongTermMemory("用户的名字是$userName")
-                Log.i(TAG, "Name command detected: $userName, starting face registration")
-
-                // 触发人脸注册流程，注册流程自己处理TTS和表情，不走LLM
-                startFaceRegistration(userName)
-                return  // 关键：直接返回，不继续走LLM，避免表情和TTS被覆盖
-            }
-        }
-
-        // ========== 开始请求LLM时重置超时，避免思考和回复期间误退出 ==========
-        if (isInContinuousConversation) {
-            resetContinuousConversationTimeout()
-        }
-
-        // 切换到思考表情
-        ModuleStateManager.onLlmStartThinking()
-
-        // 初始化流式播报会话（等第一个完整句子到达就开始播）
-        audioManager.startStreaming()
-
-        // 情绪流式解析器：解析 LLM 输出中的 [情绪] 标签，实时驱动表情 + 唱歌音色切换
-        var isSingingMode = false
-        val emotionStreamParser = EmotionParser.StreamParser(
-            onEmotionParsed = { emotion ->
-                val expr = EmotionParser.emotionToExpression(emotion)
-                if (expr != null) {
-                    Log.i(TAG, "Emotion-driven expression: $emotion -> $expr")
-                    expressionManager.requestExpression(
-                        type = expr,
-                        intensity = 100,
-                        duration = null,
-                        force = true,
-                        source = ExpressionSource.LLM_EMOTION
-                    )
-                }
-                // 唱歌模式：切换歌声音色
-                if (emotion == "singing") {
-                    isSingingMode = true
-                    audioManager.applySingingVoice()
-                    Log.i(TAG, "Singing mode activated")
-                }
-            },
-            onTextReady = { text ->
-                audioManager.feedStreamChunk(text)
-            }
-        )
-
-        llmManager.sendQueryStream(text, object : LlmManager.StreamCallback {
-            override fun onDelta(delta: String) {
-                // LLM 增量文本：切到主线程解析情绪标签并喂给 TTS
-                runOnUiThread {
-                    emotionStreamParser.feed(delta)
-                }
-            }
-
-            override fun onComplete(fullText: String) {
-                runOnUiThread {
-                    ModuleStateManager.onLlmFinish()
-
-                    if (isInContinuousConversation) {
-                        resetContinuousConversationTimeout()
-                    }
-
-                    // 刷出解析器中剩余的文本
-                    emotionStreamParser.flush()
-                    emotionStreamParser.reset()
-
-                    // 把 buffer 中剩余的碎片全部播出去
-                    audioManager.finishStreaming()
-
-                    // 唱歌模式结束，恢复默认音色
-                    if (isSingingMode) {
-                        isSingingMode = false
-                        audioManager.restoreDefaultVoice(expressionManager.getCurrentStyle())
-                        Log.i(TAG, "Singing mode ended, voice restored")
-                    }
-                }
-            }
-
-            override fun onError(errorMsg: String) {
-                runOnUiThread {
-                    ModuleStateManager.onLlmFinish()
-
-                    if (isInContinuousConversation) {
-                        resetContinuousConversationTimeout()
-                    }
-
-                    emotionStreamParser.reset()
-
-                    // 唱歌模式异常退出也要恢复音色
-                    if (isSingingMode) {
-                        isSingingMode = false
-                        audioManager.restoreDefaultVoice(expressionManager.getCurrentStyle())
-                    }
-
-                    // 停掉可能已经入队的半截内容
-                    audioManager.stopSpeaking()
-                    expressionManager.requestExpression(ExpressionType.SAD)
-                    audioManager.startSpeaking("抱歉，我现在无法回答你的问题，请稍后再试")
-                }
-            }
-        })
+        conversationCoordinator.startAsrRecognition(asrOnly)
     }
 
     /**
@@ -1386,7 +639,8 @@ class MainActivity : ComponentActivity() {
         audioManager.stopListening()
 
         // 语音提示
-        audioManager.startSpeaking("好的$userName，请看我这边，我来记住你~")
+        val regSessionId = audioManager.generateTempSessionId()
+        audioManager.startSpeaking("好的$userName，请看我这边，我来记住你~", regSessionId)
         // 切换到识别中表情（在TTS提示音播放时就显示识别中）
         expressionManager.requestExpression(ExpressionType.RECOGNIZING)
 
@@ -1418,10 +672,11 @@ class MainActivity : ComponentActivity() {
                     // 注册成功：开心表情
                     expressionManager.setDistancePupilScale(1f)
                     expressionManager.requestExpression(ExpressionType.HAPPY, 1500)
-                    audioManager.startSpeaking("太好了，我记住你啦，$userName！以后我就能认出你了~")
+                    val successSessionId = audioManager.generateTempSessionId()
+                    audioManager.startSpeaking("太好了，我记住你啦，$userName！以后我就能认出你了~", successSessionId)
                     Log.i(TAG, "Face registration success: ${profile.name}")
                     DebugVisionState.updateRegister(false)
-                    resetContinuousConversationTimeout()
+                    conversationCoordinator.refreshContinuousConversationTimeout()
                 }
             }
 
@@ -1431,9 +686,10 @@ class MainActivity : ComponentActivity() {
                     DebugVisionState.updateRegister(false)
                     expressionManager.setDistancePupilScale(1f)
                     expressionManager.requestExpression(ExpressionType.CONFUSED, 1500)
-                    audioManager.startSpeaking("不好意思，我没看清你的脸，请正对镜头再说一次名字吧~")
+                    val failSessionId = audioManager.generateTempSessionId()
+                    audioManager.startSpeaking("不好意思，我没看清你的脸，请正对镜头再说一次名字吧~", failSessionId)
                     Log.w(TAG, "Face registration failed: $reason")
-                    resetContinuousConversationTimeout()
+                    conversationCoordinator.refreshContinuousConversationTimeout()
                 }
             }
 
@@ -1443,8 +699,9 @@ class MainActivity : ComponentActivity() {
                     DebugVisionState.updateRegister(false)
                     expressionManager.setDistancePupilScale(1f)
                     expressionManager.requestExpression(ExpressionType.CONFUSED, 1500)
-                    audioManager.startSpeaking("注册超时啦，请正对镜头再试一次吧~")
-                    resetContinuousConversationTimeout()
+                    val timeoutSessionId = audioManager.generateTempSessionId()
+                    audioManager.startSpeaking("注册超时啦，请正对镜头再试一次吧~", timeoutSessionId)
+                    conversationCoordinator.refreshContinuousConversationTimeout()
                 }
             }
         })
@@ -1459,14 +716,16 @@ class MainActivity : ComponentActivity() {
                 if (grantResults.isNotEmpty() && grantResults[0] == PackageManager.PERMISSION_GRANTED) {
                     startAsrRecognition(pendingAsrOnlyTest)
                 } else {
-                    audioManager.startSpeaking("请授予录音权限，否则无法进行语音识别")
+                    val permSessionId = audioManager.generateTempSessionId()
+                    audioManager.startSpeaking("请授予录音权限，否则无法进行语音识别", permSessionId)
                 }
             }
             REQUEST_CAMERA_PERMISSION -> {
                 if (grantResults.isNotEmpty() && grantResults[0] == PackageManager.PERMISSION_GRANTED) {
                     startFaceDetect()
                 } else {
-                    audioManager.startSpeaking("请授予相机权限，否则无法进行人脸识别")
+                    val permSessionId = audioManager.generateTempSessionId()
+                    audioManager.startSpeaking("请授予相机权限，否则无法进行人脸识别", permSessionId)
                 }
             }
             REQUEST_ALL_PERMISSIONS -> {
@@ -1512,13 +771,6 @@ class MainActivity : ComponentActivity() {
                 super.onUserSmile(smileProb)
             }
 
-            override fun onUserBlink() {
-                super.onUserBlink()
-            }
-            override fun onUserSurprised() {
-                super.onUserSurprised()
-            }
-
             override fun onFaceLost() {
                 super.onFaceLost()
                 // 人脸离开，重置瞳孔到中心
@@ -1531,7 +783,8 @@ class MainActivity : ComponentActivity() {
                 // 多人场景进入时的语音播报（如"哇，好多人呀！"）
                 // 不打断正在进行的对话，只有空闲时才说
                 if (!audioManager.isSpeaking() && !audioManager.isListening()) {
-                    audioManager.startSpeaking(text)
+                    val faceSessionId = audioManager.generateTempSessionId()
+                    audioManager.startSpeaking(text, faceSessionId)
                 }
             }
         })
@@ -1545,24 +798,15 @@ class MainActivity : ComponentActivity() {
         lifecycleScope.launch {
             // 停止Demo
             demoSequenceManager.stopDemo()
-            // 停止音频和LLM
-            audioManager.stopListening()
-            audioManager.stopKwsListening()
-            audioManager.stopSpeaking()
-            llmManager.cancelRequest()
-            llmManager.exitConversation() // 软重置时清空对话记忆
             // 停止视觉
             visionManager.stopFaceDetect()
             // 重置表情状态
             expressionManager.softReset()
-            // 退出连续对话
-            isInContinuousConversation = false
-            currentVoiceState = VoiceState.COOLDOWN
-            continuousConversationTimeoutJob?.cancel()
-            delay(200)
-            // 重启视觉和唤醒
+            // 语音部分委托给 Coordinator（内部会停止音频/LLM，延迟后重启唤醒）
+            conversationCoordinator.performSoftReset()
+            delay(300) // 等待 Coordinator 完成语音重置
+            // 重启视觉
             try { startFaceDetect() } catch (e: Exception) { Log.e(TAG, "Restart face detect failed", e) }
-            try { startWakeUpListening() } catch (e: Exception) { Log.e(TAG, "Restart wake up failed", e) }
             Log.i(TAG, "Soft reset complete")
         }
     }
@@ -1571,10 +815,7 @@ class MainActivity : ComponentActivity() {
         super.onDestroy()
         // 释放所有资源
         demoSequenceManager.stopDemo()
-        audioManager.stopSpeaking()
-        audioManager.stopListening()
-        audioManager.stopKwsListening()
-        llmManager.cancelRequest()
+        conversationCoordinator.onDestroy()
         visionManager.stopFaceDetect()
         expressionManager.stop()
         communicationManager.stop()
@@ -1817,7 +1058,8 @@ class MainActivity : ComponentActivity() {
                     Button(
                         modifier = Modifier.weight(1f),
                         onClick = {
-                            audioManager.startSpeaking("你好，我是RPO智能对话机器人，现在正在测试纯眼部表情系统。")
+                            val debugSessionId = audioManager.generateTempSessionId()
+                            audioManager.startSpeaking("你好，我是RPO智能对话机器人，现在正在测试纯眼部表情系统。", debugSessionId)
                         }
                     ) { Text("TTS测试", fontSize = 10.sp) }
                     Button(

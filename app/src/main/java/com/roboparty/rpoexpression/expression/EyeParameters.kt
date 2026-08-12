@@ -174,9 +174,11 @@ data class EyeParameters(
 
 /**
  * 表情风格枚举
- * 男女两款风格，适配不同角色设定
+ * 支持多种风格：传统代码绘制风格 + SVG 数码风格
  */
 enum class ExpressionStyle(val description: String) {
     MALE("男款·丹凤眼风格"),
-    FEMALE("女款·杏眼风格")
+    FEMALE("女款·杏眼风格"),
+    SHAPE_MALE("形状男款·方形Figma设计"),
+    SHAPE_FEMALE("形状女款·圆形Figma设计")
 }

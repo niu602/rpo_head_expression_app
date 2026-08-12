@@ -16,7 +16,6 @@ import com.roboparty.rpoexpression.animation.energy.EnergyFieldMask
 import com.roboparty.rpoexpression.animation.energy.EnergyParticlesRenderer
 import com.roboparty.rpoexpression.expression.EnergyFieldParameters
 import com.roboparty.rpoexpression.expression.ExpressionManager
-import kotlin.math.abs
 import kotlin.math.sin
 
 /**
@@ -64,21 +63,6 @@ class RorschachEnergyRenderer : EnergyFieldRenderer {
     private var lastCenterX = 0f
     private var lastCenterY = 0f
 
-    // ========== IMU 惯性状态（弹簧-阻尼模型） ==========
-    // 目标值（来自 IMU），当前值（带惯性），每帧逼近目标
-    private var targetOffsetX = 0f
-    private var targetOffsetY = 0f
-    private var inertiaOffsetX = 0f
-    private var inertiaOffsetY = 0f
-    private var targetTiltOffset = 0f   // IMU 驱动的额外倾斜
-    private var inertiaTiltOffset = 0f
-    private var targetRotation = 0f      // IMU Roll 驱动的整体旋转
-    private var inertiaRotation = 0f
-    // 摇晃冲击：峰值后指数衰减
-    private var shakeImpact = 0f
-    // 点头弹跳：峰值后阻尼振荡
-    private var nodBounce = 0f
-
     /**
      * 主渲染方法
      */
@@ -88,8 +72,6 @@ class RorschachEnergyRenderer : EnergyFieldRenderer {
         centerY: Float,
         size: Size,
         time: Float,
-        imuPitch: Float,
-        imuRoll: Float
     ) {
         // 缓存中心坐标
         if (size != lastSize) {
@@ -101,13 +83,7 @@ class RorschachEnergyRenderer : EnergyFieldRenderer {
         // 更新颜色缓存
         updateColorCache(params)
 
-        // 更新 IMU 惯性
-        updateImuInertia(imuPitch, imuRoll, time)
-
-        // IMU 惯性偏移（像素级，叠加到各层中心位置）
         val baseDim = minOf(size.width, size.height)
-        val inertiaPxX = inertiaOffsetX * baseDim * 0.15f
-        val inertiaPxY = inertiaOffsetY * baseDim * 0.15f
 
         // ===== 视角补偿：侧面时 Blob 透视压缩 + 饱和度提升 + 焦点偏移 =====
         // 注意：注视方向偏移已由 getEnergyFieldParameters() 中的 corePositionX/Y 处理
@@ -131,20 +107,20 @@ class RorschachEnergyRenderer : EnergyFieldRenderer {
                 // ===== 2. L3 粒子环带（最底层，被 L2 遮挡部分自然形成深度感） =====
                 if (params.particleCount > 0) {
                     with(particlesRenderer) {
-                        renderParticles(params, centerX + inertiaPxX * 0.5f, centerY + inertiaPxY * 0.5f, size, time)
+                        renderParticles(params, centerX, centerY, size, time)
                     }
                 }
 
                 // ===== 3. L2 流体光场 =====
                 drawBlobField(
-                    params, centerX + inertiaPxX, centerY + inertiaPxY, size, time,
+                    params, centerX, centerY, size, time,
                     perspectiveScaleX, perspectiveScaleY, satBoost
                 )
 
                 // ===== 4. L1 能量焦点 =====
                 drawCoreFocus(
-                    params, centerX + inertiaPxX * 0.7f + perspectiveShiftX,
-                    centerY + inertiaPxY * 0.7f + perspectiveShiftY, size, time
+                    params, centerX + perspectiveShiftX,
+                    centerY + perspectiveShiftY, size, time
                 )
 
                 // ===== 5. 效果叠加层 =====
@@ -212,10 +188,8 @@ class RorschachEnergyRenderer : EnergyFieldRenderer {
         }
 
         // 计算 Blob 路径
-        // IMU 惯性叠加到 Blob 倾斜
-        val effectiveTilt = (params.blobTilt + inertiaTiltOffset).coerceIn(-1f, 1f)
-        // 摇晃时增加扰动幅度（液团被甩动的不规则感）
-        val effectiveDistortion = (params.blobDistortion + shakeImpact * 0.15f).coerceIn(0f, 1f)
+        val effectiveTilt = params.blobTilt
+        val effectiveDistortion = params.blobDistortion
 
         BlobCalculator.calculateBlobPath(
             path = blobPath,
@@ -443,73 +417,6 @@ class RorschachEnergyRenderer : EnergyFieldRenderer {
                 size = Size(barW * params.progressValue, barH)
             )
         }
-    }
-
-    // ==================== IMU 惯性 ====================
-
-    /**
-     * 每帧更新 IMU 惯性状态
-     *
-     * - Pitch → 焦点 Y 偏移 + Blob 倾斜偏移
-     * - Roll → Blob 整体旋转
-     * - SHAKE → 惯性甩动（通过大幅 roll 变化间接触发）
-     * - NOD → 焦点快速上下弹跳（通过大幅 pitch 变化间接触发）
-     *
-     * 物理模型：一阶低通滤波 + 阻尼衰减
-     * stiffness=0.15, damping=0.85
-     */
-    private fun updateImuInertia(imuPitch: Float, imuRoll: Float, time: Float) {
-        // ===== 1. Pitch → Y 偏移 + 倾斜 =====
-        // pitch 正值=抬头，负值=低头（弧度）
-        targetOffsetY = imuPitch.coerceIn(-1f, 1f)
-        targetTiltOffset = imuPitch.coerceIn(-1f, 1f) * 0.3f
-
-        // ===== 2. Roll → X 偏移 + 整体旋转 =====
-        // roll 正值=右倾，负值=左倾
-        targetOffsetX = imuRoll.coerceIn(-1f, 1f) * 0.5f
-        targetRotation = imuRoll.coerceIn(-1f, 1f) * 15f // 最大旋转15度
-
-        // ===== 3. 检测剧烈摇晃（roll 绝对值 > 0.5 → 触发摇晃甩动） =====
-        val rollAbs = abs(imuRoll)
-        if (rollAbs > 0.5f && shakeImpact < rollAbs) {
-            shakeImpact = rollAbs
-        }
-
-        // ===== 4. 检测点头（pitch 绝对值突变 → 触发弹跳） =====
-        val pitchAbs = abs(imuPitch)
-        if (pitchAbs > 0.6f && nodBounce < pitchAbs * 0.5f) {
-            nodBounce = pitchAbs * 0.5f
-        }
-
-        // ===== 4. 摇晃冲击 → 随机方向甩动 =====
-        if (shakeImpact > 0.01f) {
-            // 摇晃产生与 roll 方向相反的横向甩动
-            targetOffsetX += -imuRoll * shakeImpact * 0.8f
-            shakeImpact *= 0.90f
-        } else {
-            shakeImpact = 0f
-        }
-
-        // ===== 5. 点头 → 焦点弹跳 =====
-        if (nodBounce > 0.01f) {
-            // 阻尼振荡：sin 随时间衰减
-            targetOffsetY += sin(time * 8f) * nodBounce * 0.5f
-            nodBounce *= 0.88f
-        } else {
-            nodBounce = 0f
-        }
-
-        // ===== 6. 弹簧-阻尼滤波（一阶低通 + 阻尼衰减） =====
-        val stiffness = 0.15f
-        val damping = 0.85f
-        inertiaOffsetX += (targetOffsetX - inertiaOffsetX) * stiffness
-        inertiaOffsetX *= damping
-        inertiaOffsetY += (targetOffsetY - inertiaOffsetY) * stiffness
-        inertiaOffsetY *= damping
-        inertiaTiltOffset += (targetTiltOffset - inertiaTiltOffset) * stiffness
-        inertiaTiltOffset *= damping
-        inertiaRotation += (targetRotation - inertiaRotation) * stiffness
-        inertiaRotation *= damping
     }
 
     // ==================== 颜色缓存 ====================

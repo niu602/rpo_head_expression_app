@@ -43,15 +43,27 @@ object PersonaRegistry {
     /** 获取所有人格配置 */
     fun getAllConfigs(): Collection<PersonaConfig> = REGISTRY.values
 
-    /** 获取默认人格配置（女款萝卜） */
-    fun getDefaultConfig(): PersonaConfig = getConfig(LlmManager.Persona.LUOBO)
+    /** 获取默认人格配置（男款阿冷，与默认风格 SHAPE_MALE 对应） */
+    fun getDefaultConfig(): PersonaConfig = getConfig(LlmManager.Persona.ALIN)
 
     /**
      * 根据表情风格反向查找人格配置
      * 用于 styleChangeCallback 中从 ExpressionStyle 反查 Persona
+     *
+     * 映射规则：
+     * - MALE / SHAPE_MALE → 阿冷（男款人格，男性音色）
+     * - FEMALE / SHAPE_FEMALE → 萝卜（女款人格，女性音色）
+     *
+     * 同一性别不同渲染风格共享同一个人格和音色，
+     * 确保"男款只能用男声、女款只能用女声"的约束统一生效
      */
     fun getByStyle(style: ExpressionStyle): PersonaConfig? {
         return REGISTRY.values.find { it.expressionStyle == style }
+            ?: when (style) {
+                ExpressionStyle.SHAPE_MALE -> getConfig(LlmManager.Persona.ALIN)
+                ExpressionStyle.SHAPE_FEMALE -> getConfig(LlmManager.Persona.LUOBO)
+                else -> null
+            }
     }
 
     /**

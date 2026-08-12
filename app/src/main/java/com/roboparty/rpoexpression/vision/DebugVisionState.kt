@@ -134,5 +134,71 @@ object DebugVisionState {
         _register.value = RegisterInfo(isRegistering, name, collected, total)
     }
 
+    // ========== 瞳孔偏移校准调试 ==========
+
+    data class PupilCalibrationInfo(
+        val rawOffsetX: Float = 0f,
+        val rawOffsetY: Float = 0f,
+        val correctedOffsetX: Float = 0f,
+        val correctedOffsetY: Float = 0f,
+        val cameraOffsetCorrectionX: Float = 0f,
+        val cameraOffsetCorrectionY: Float = 0.05f,
+        val pupilFollowFactor: Float = 0.8f,
+        val timestamp: Long = 0L
+    )
+
+    private val _pupilCalibration = MutableStateFlow(PupilCalibrationInfo())
+    val pupilCalibration: StateFlow<PupilCalibrationInfo> = _pupilCalibration
+
+    /**
+     * 更新瞳孔偏移校准信息（由VisionManager调用）
+     */
+    fun updatePupilCalibration(
+        rawOffsetX: Float,
+        rawOffsetY: Float,
+        correctedOffsetX: Float,
+        correctedOffsetY: Float
+    ) {
+        val config = com.roboparty.rpoexpression.config.ConfigManager.getInstance().config.value.faceDetection
+        _pupilCalibration.value = PupilCalibrationInfo(
+            rawOffsetX = rawOffsetX,
+            rawOffsetY = rawOffsetY,
+            correctedOffsetX = correctedOffsetX,
+            correctedOffsetY = correctedOffsetY,
+            cameraOffsetCorrectionX = config.cameraOffsetCorrectionX,
+            cameraOffsetCorrectionY = config.cameraOffsetCorrectionY,
+            pupilFollowFactor = config.pupilFollowFactor,
+            timestamp = System.currentTimeMillis()
+        )
+    }
+
+    /**
+     * 调整X轴校正值（用于现场校准）
+     * @param delta 调整量（正值=向右校正，负值=向左校正）
+     */
+    fun adjustCameraOffsetX(delta: Float) {
+        val configManager = com.roboparty.rpoexpression.config.ConfigManager.getInstance()
+        val current = configManager.config.value.faceDetection.cameraOffsetCorrectionX
+        val newValue = (current + delta).coerceIn(-0.5f, 0.5f)
+        configManager.updateFromJson(
+            """{"faceDetection": {"cameraOffsetCorrectionX": $newValue}}""",
+            persist = true
+        )
+    }
+
+    /**
+     * 调整Y轴校正值（用于现场校准）
+     * @param delta 调整量（正值=向下校正，负值=向上校正）
+     */
+    fun adjustCameraOffsetY(delta: Float) {
+        val configManager = com.roboparty.rpoexpression.config.ConfigManager.getInstance()
+        val current = configManager.config.value.faceDetection.cameraOffsetCorrectionY
+        val newValue = (current + delta).coerceIn(-0.5f, 0.5f)
+        configManager.updateFromJson(
+            """{"faceDetection": {"cameraOffsetCorrectionY": $newValue}}""",
+            persist = true
+        )
+    }
+
     private val mainHandler = android.os.Handler(android.os.Looper.getMainLooper())
 }

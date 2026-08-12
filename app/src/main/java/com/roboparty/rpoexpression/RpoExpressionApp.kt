@@ -12,8 +12,8 @@ import android.content.IntentFilter
 import android.os.Build
 import android.os.Handler
 import android.os.Looper
-import kotlinx.coroutines.launch
 import com.roboparty.rpoexpression.audio.AudioManager
+import com.roboparty.rpoexpression.audio.LocalIntentResolver
 import com.roboparty.rpoexpression.communication.CommunicationManager
 import com.roboparty.rpoexpression.communication.HeadControlManager
 import com.roboparty.rpoexpression.expression.DemoSequenceManager
@@ -27,7 +27,6 @@ import com.roboparty.rpoexpression.recognition.FaceRegisterManager
 import com.roboparty.rpoexpression.recognition.FaceRecognitionResult
 import com.roboparty.rpoexpression.sensor.AmbientLightManager
 import com.roboparty.rpoexpression.sensor.BrightnessManager
-import com.roboparty.rpoexpression.sensor.ImuManager
 import com.roboparty.rpoexpression.sensor.VolumeManager
 import com.roboparty.rpoexpression.system.SystemStatusMonitor
 import com.roboparty.rpoexpression.util.Constants
@@ -39,6 +38,7 @@ import android.util.Log
 import com.roboparty.rpoexpression.vision.DebugVisionState
 import com.roboparty.rpoexpression.vision.VisionManager
 import android.content.ContentValues.TAG
+import android.graphics.Bitmap
 /**
  * Application入口
  * 初始化各个管理器单例
@@ -55,8 +55,6 @@ class RpoExpressionApp : Application() {
     lateinit var ambientLightManager: AmbientLightManager
         private set
     lateinit var demoSequenceManager: DemoSequenceManager
-        private set
-    lateinit var imuManager: ImuManager
         private set
     lateinit var audioManager: AudioManager
         private set
@@ -112,50 +110,6 @@ class RpoExpressionApp : Application() {
             Log.e("RpoExpressionApp", "AmbientLightManager init failed", e)
         }
         demoSequenceManager = DemoSequenceManager(expressionManager)
-        try {
-            imuManager = ImuManager.getInstance(this)
-            imuManager.start()
-            // 注册IMU头部动作监听
-            imuManager.setPoseListener { pose ->
-                when (pose.currentAction) {
-                    ImuManager.HeadAction.BOW_DOWN -> {
-                        // 低头：半闭眼1.5秒
-                        expressionManager.setTempEyelidOffset(-0.4f)
-                        expressionManager.scope.launch {
-                            kotlinx.coroutines.delay(1500)
-                            expressionManager.setTempEyelidOffset(0f)
-                        }
-                    }
-                    ImuManager.HeadAction.LOOK_UP -> {
-                        // 抬头：睁大眼1.5秒
-                        expressionManager.setTempEyelidOffset(0.3f)
-                        expressionManager.scope.launch {
-                            kotlinx.coroutines.delay(1500)
-                            expressionManager.setTempEyelidOffset(0f)
-                        }
-                    }
-                    ImuManager.HeadAction.SHAKE -> {
-                        // 摇头：瞳孔左右晃动3次
-                        expressionManager.scope.launch {
-                            repeat(3) {
-                                expressionManager.setTempPupilShakeX(0.3f)
-                                kotlinx.coroutines.delay(100)
-                                expressionManager.setTempPupilShakeX(-0.3f)
-                                kotlinx.coroutines.delay(100)
-                            }
-                            expressionManager.setTempPupilShakeX(0f)
-                        }
-                    }
-                    ImuManager.HeadAction.SHAKE_HARD -> {
-                        // 剧烈晃动：触发惊讶表情
-                        expressionManager.requestExpression(com.roboparty.rpoexpression.expression.ExpressionType.SURPRISED, 1000)
-                    }
-                    else -> {}
-                }
-            }
-        } catch (e: Exception) {
-            Log.e("RpoExpressionApp", "ImuManager init failed, skip IMU perception", e)
-        }
 
         // 初始化第二阶段新增模块
         try {
@@ -191,6 +145,18 @@ class RpoExpressionApp : Application() {
                     // 确保启动恢复的音色不会被预缓存任务覆盖
                     audioManager.setTtsVoice(originalVoice)
                     Log.d("RpoExpressionApp", "Preload complete, restored voice = $originalVoice")
+
+                    // P1：预加载本地意图快速响应文本（当前音色下）
+                    // 这些文本在 LocalIntentResolver 匹配成功后直接播放，无需走 LLM
+                    // 预合成后响应延迟 < 100ms
+                    try {
+                        LocalIntentResolver.getPreloadTexts().forEach { text ->
+                            audioManager.preloadTts(text)
+                        }
+                        Log.d("RpoExpressionApp", "Local intent preload complete: ${LocalIntentResolver.getPreloadTexts().size} texts")
+                    } catch (e: Exception) {
+                        Log.w("RpoExpressionApp", "Local intent preload failed", e)
+                    }
                 } catch (e: Exception) {
                     Log.w("RpoExpressionApp", "Preload TTS failed", e)
                 }
@@ -227,7 +193,7 @@ class RpoExpressionApp : Application() {
                     Log.w("RpoExpressionApp", "No persona config found for style: $style")
                 }
             }
-            // 初始化时应用一次默认风格（女款）对应的音色
+            // 初始化时应用一次默认风格（形状男款·阿冷）对应的音色
             val defaultConfig = PersonaRegistry.getDefaultConfig()
             audioManager.applyVoiceStyle(expressionManager.getCurrentStyle())
             audioManager.setTtsVoice(defaultConfig.cloudVoiceId)
@@ -289,11 +255,27 @@ class RpoExpressionApp : Application() {
 
             // 连接VisionManager回调：人脸帧 → 识别/注册
             visionManager.setRecognitionFrameCallback { faceBitmap, face, fullBitmap, srcWidth, srcHeight, rotation ->
-                // 注册中：收集样本
+                // ========== Bitmap 所有权约定 ==========
+                // VisionManager 通过回调移交 Bitmap 所有权给本层
+                // 本层负责确保每个消费者（识别/注册）拥有独立的 Bitmap，
+                // 避免双重回收（Double Free）导致 Native 层 SIGSEGV 崩溃。
                 if (faceRegisterManager.isRegistering()) {
-                    faceRegisterManager.addSample(fullBitmap, face, srcWidth, srcHeight, rotation)
+                    // 注册管线：创建独立副本，注册管线拥有副本的所有权
+                    val registerBitmap = try {
+                        fullBitmap.copy(Bitmap.Config.ARGB_8888, false)
+                    } catch (e: Exception) {
+                        Log.e("RpoExpressionApp", "Copy bitmap for registration failed", e)
+                        null
+                    }
+                    if (registerBitmap != null) {
+                        faceRegisterManager.addSample(registerBitmap, face, srcWidth, srcHeight, rotation)
+                    }
+                    // 原始 Bitmap 由本层负责回收
+                    try {
+                        if (!fullBitmap.isRecycled) fullBitmap.recycle()
+                    } catch (_: Exception) {}
                 } else {
-                    // 空闲：尝试识别
+                    // 识别管线：直接移交所有权，识别管线负责回收
                     faceIdentifier.identifyAsync(fullBitmap, face, srcWidth, srcHeight, rotation)
                 }
             }
@@ -495,7 +477,6 @@ class RpoExpressionApp : Application() {
         brightnessManager.stop()
         volumeManager.stop()
         ambientLightManager.stop()
-        imuManager.stop()
         communicationManager.stop()
         headControlManager.release()
         faceIdentifier.release()

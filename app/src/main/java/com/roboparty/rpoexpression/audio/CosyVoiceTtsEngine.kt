@@ -20,10 +20,10 @@ import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
 import java.util.concurrent.ConcurrentHashMap
-import java.util.concurrent.ConcurrentLinkedQueue
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
 import java.util.concurrent.LinkedBlockingDeque
+import java.util.concurrent.LinkedBlockingQueue
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 
@@ -62,9 +62,33 @@ class CosyVoiceTtsEngine(@Suppress("UNUSED_PARAMETER") context: Context) : TtsEn
         // LRU 缓存配置
         private const val MAX_CACHE_SIZE = 60
         private const val EVICT_COUNT = 5
+
+        // 播放队列容量（P1：有界队列，防止打断后旧内容残留）
+        // 容量=2：当前正在播1句 + 队列最多积压1句，共2句
+        private const val PLAY_QUEUE_CAPACITY = 2
+
+        // ========== 句间倾听窗（P3：句间打断机制）==========
+        // 每句播完后停顿的最小/最大时长（随机取值，模拟自然呼吸感）
+        private const val INTER_SENTENCE_PAUSE_MIN_MS = 800L
+        private const val INTER_SENTENCE_PAUSE_MAX_MS = 1200L
+        // 回声尾巴：播放结束后短暂屏蔽麦克风，防止扬声器余音被误判为用户说话
+        private const val ECHO_TAIL_MS = 200L
     }
 
     // ==================== 数据类 ====================
+
+    /**
+     * 播放队列中的句子，绑定会话ID
+     *
+     * 设计目的：
+     * - 每个 TTS 请求（speak/speakChunk）携带 sessionId
+     * - 播放时校验 sessionId == currentSessionId，不匹配则跳过（会话已被取消/切换）
+     * - 根治旧架构中"旧会话的队列句子在新会话中继续播放"的竞态问题
+     */
+    private data class QueuedSentence(
+        val text: String,
+        val sessionId: Long
+    )
 
     private data class TtsRequest(
         val model: String,
@@ -117,10 +141,31 @@ class CosyVoiceTtsEngine(@Suppress("UNUSED_PARAMETER") context: Context) : TtsEn
     // 回调
     private var stateCallback: TtsManager.TtsStateCallback? = null
 
-    // 播放队列（线程安全）
-    private val playQueue = ConcurrentLinkedQueue<String>()
+    // 播放队列（有界，容量=2），每个句子绑定会话ID
+    // 溢出策略：DROP_OLDEST（队列满时丢弃最旧的，保留最新的）
+    // 设计目的：防止 LLM 流式输出过快导致队列积压过多句子，
+    //           打断后旧内容残留播放的问题
+    private val playQueue = LinkedBlockingQueue<QueuedSentence>(PLAY_QUEUE_CAPACITY)
     private val isPlaying = AtomicBoolean(false)
     private val hasStarted = AtomicBoolean(false)  // 标记是否已经开始过播放（用于 onStart 回调）
+
+    /**
+     * 当前活跃会话ID
+     * - speak(sessionId) / speakChunk(isFirst=true, sessionId) 时设置
+     * - stop() 时重置为 0
+     * - playNextSentence 时校验队列中句子的 sessionId == currentSessionId，不匹配则跳过
+     */
+    @Volatile private var currentSessionId: Long = 0L
+
+    /**
+     * 当前正在播放句子的会话ID（用于回调透传）
+     */
+    @Volatile private var playingSessionId: Long = 0L
+
+    // ========== 句间倾听窗（P3）==========
+    private var interSentenceListener: TtsEngine.OnInterSentenceListener? = null
+    @Volatile private var interSentenceInterrupted = false
+    private var interSentenceRunnable: Runnable? = null
 
     // ==================== LRU 缓存结构 ====================
 
@@ -281,19 +326,21 @@ class CosyVoiceTtsEngine(@Suppress("UNUSED_PARAMETER") context: Context) : TtsEn
 
     // ==================== 整句播报（清空队列重新开始） ====================
 
-    override fun speak(text: String, callback: TtsManager.TtsStateCallback?) {
+    override fun speak(text: String, sessionId: Long, callback: TtsManager.TtsStateCallback?) {
         if (!isInitialized) {
             Log.e(TAG, "Engine not initialized")
-            callback?.onError(-1)
+            callback?.onError(-1, sessionId)
             return
         }
         stateCallback = callback
+        currentSessionId = sessionId
+        Log.d(TAG, "speak: sessionId=$sessionId, text length=${text.length}")
 
         executor.execute {
             // 整句播报：清空队列，重新开始
             stopInternal()
             hasStarted.set(false)
-            enqueueSentences(text)
+            enqueueSentences(text, sessionId)
             startPlaybackIfNeeded()
         }
     }
@@ -304,16 +351,22 @@ class CosyVoiceTtsEngine(@Suppress("UNUSED_PARAMETER") context: Context) : TtsEn
         stateCallback = callback
     }
 
-    override fun speakChunk(text: String, @Suppress("UNUSED_PARAMETER") isFirst: Boolean) {
+    override fun speakChunk(text: String, isFirst: Boolean, sessionId: Long) {
         if (text.isBlank()) {
             Log.w(TAG, "speakChunk: text is blank, skipping")
             return
         }
-        Log.i(TAG, "speakChunk: text=[$text] (appending to queue)")
+        Log.i(TAG, "speakChunk: sessionId=$sessionId, isFirst=$isFirst, text=[$text]")
 
         executor.execute {
+            if (isFirst) {
+                // 首句：清空旧队列，设置新会话ID（与 SystemTtsEngine QUEUE_FLUSH 行为一致）
+                currentSessionId = sessionId
+                stopInternal()
+                hasStarted.set(false)
+            }
             // 流式模式：追加到队列，不打断当前播放
-            enqueueSentences(text)
+            enqueueSentences(text, sessionId)
             startPlaybackIfNeeded()
         }
     }
@@ -391,12 +444,27 @@ class CosyVoiceTtsEngine(@Suppress("UNUSED_PARAMETER") context: Context) : TtsEn
 
     /**
      * 把文本分割成句子，加入播放队列
+     *
+     * 溢出策略：DROP_OLDEST —— 队列满时丢弃最旧的句子，保留最新的。
+     * 这样即使 LLM 流式输出很快，队列最多积压 PLAY_QUEUE_CAPACITY 句，
+     * 打断后不会有大量旧内容残留播放。
+     *
+     * @param text 要分割的文本
+     * @param sessionId 会话ID，绑定到每个队列句子
      */
-    private fun enqueueSentences(text: String) {
+    private fun enqueueSentences(text: String, sessionId: Long) {
         val sentences = splitSentences(text)
-        Log.d(TAG, "Enqueue ${sentences.size} sentences, queue size was ${playQueue.size}")
+        Log.d(TAG, "Enqueue ${sentences.size} sentences, sessionId=$sessionId, queue size was ${playQueue.size}")
         sentences.forEach { sentence ->
-            playQueue.offer(sentence)
+            val item = QueuedSentence(sentence, sessionId)
+            // DROP_OLDEST：队列满时丢弃最旧的，直到能放入新句子
+            while (!playQueue.offer(item)) {
+                val dropped = playQueue.poll()
+                if (dropped != null) {
+                    Log.w(TAG, "Queue full (capacity=$PLAY_QUEUE_CAPACITY), dropped oldest: " +
+                            "sessionId=${dropped.sessionId}, text=${dropped.text.take(20)}...")
+                }
+            }
             // 预加载：队列里的句子都提前合成
             preloadSentence(sentence)
         }
@@ -423,25 +491,39 @@ class CosyVoiceTtsEngine(@Suppress("UNUSED_PARAMETER") context: Context) : TtsEn
 
     /**
      * 播放队列中的下一句
+     *
+     * 会话校验：跳过所有 sessionId != currentSessionId 的过期句子，
+     * 直到找到匹配的句子或队列为空。
      */
     private fun playNextSentence() {
-        val sentence = playQueue.poll()
-        if (sentence == null) {
-            Log.d(TAG, "Queue is empty, playback finished")
-            isPlaying.set(false)
-            onAllComplete()
-            return
+        // 跳过所有过期会话的句子
+        var sentence: QueuedSentence?
+        while (true) {
+            sentence = playQueue.poll()
+            if (sentence == null) {
+                Log.d(TAG, "Queue is empty, playback finished")
+                isPlaying.set(false)
+                onAllComplete()
+                return
+            }
+            if (sentence.sessionId == currentSessionId) {
+                break // 找到当前会话的句子
+            }
+            Log.w(TAG, "Skip expired sentence: sessionId=${sentence.sessionId}, current=$currentSessionId, text=${sentence.text.take(20)}...")
+            // 继续 poll 下一个
         }
 
-        Log.d(TAG, "Playing next sentence: ${sentence.take(30)}...")
+        val validSentence = sentence!!
+        playingSessionId = validSentence.sessionId
+        Log.d(TAG, "Playing next sentence: ${validSentence.text.take(30)}..., sessionId=${validSentence.sessionId}")
         engineState = STATE_SYNTHESIZING
 
         executor.execute {
             // 通过 synthesizeSentence 获取 URL（自带缓存命中 + 过期检查 + 重新合成）
-            val audioUrl = synthesizeSentence(sentence)
+            val audioUrl = synthesizeSentence(validSentence.text)
 
             if (audioUrl == null) {
-                Log.e(TAG, "Sentence synthesis failed, skipping: ${sentence.take(30)}")
+                Log.e(TAG, "Sentence synthesis failed, skipping: ${validSentence.text.take(30)}")
                 // 合成失败，跳过这句，继续下一句
                 playNextSentence()
                 return@execute
@@ -629,14 +711,15 @@ class CosyVoiceTtsEngine(@Suppress("UNUSED_PARAMETER") context: Context) : TtsEn
             mediaPlayer?.prepareAsync()
 
             mediaPlayer?.setOnPreparedListener {
-                Log.d(TAG, "MediaPlayer prepared, starting playback")
+                Log.d(TAG, "MediaPlayer prepared, starting playback, sessionId=$playingSessionId")
                 it.start()
 
                 // 第一次开始播放时触发 onStart
                 if (!hasStarted.getAndSet(true)) {
+                    val sid = playingSessionId
                     mainHandler.post {
                         ModuleStateManager.onTtsStartSpeaking()
-                        stateCallback?.onStart()
+                        stateCallback?.onStart(sid)
                     }
                 }
             }
@@ -650,17 +733,57 @@ class CosyVoiceTtsEngine(@Suppress("UNUSED_PARAMETER") context: Context) : TtsEn
 
     /**
      * 单句播放完成
+     *
+     * P3 句间倾听窗：每句播完后不立即播下一句，而是停顿 800~1200ms。
+     * 停顿期间 engineState=IDLE，isSpeaking()=false，上层 VAD 可以检测用户语音。
+     * - 检测到用户语音 → interruptInterSentence() → 清空剩余队列 → onDone
+     * - 无语音 → 延迟结束 → 继续播下一句
      */
     private fun onSentenceComplete() {
         Log.d(TAG, "Sentence complete, queue size=${playQueue.size}")
+        // 句间暂停：标记为非播放状态，让 shouldListen() 返回 true
+        engineState = STATE_IDLE
+
         if (playQueue.isEmpty()) {
             // 队列空了，全部播完
             isPlaying.set(false)
             onAllComplete()
-        } else {
-            // 还有下一句，继续播
-            playNextSentence()
+            return
         }
+
+        // 还有下一句：进入句间倾听窗
+        val pauseMs = (INTER_SENTENCE_PAUSE_MIN_MS..INTER_SENTENCE_PAUSE_MAX_MS).random()
+        interSentenceInterrupted = false
+        val remaining = playQueue.size
+        Log.d(TAG, "Inter-sentence listening window: ${pauseMs}ms, remaining=$remaining")
+        interSentenceListener?.onInterSentenceStart(remaining)
+
+        // 取消之前的延迟任务（防止重入）
+        interSentenceRunnable?.let { mainHandler.removeCallbacks(it) }
+        val runnable = Runnable {
+            interSentenceRunnable = null
+            // 检查是否已经被停止（stop() 已调用）
+            if (!isPlaying.get() || currentSessionId == 0L) {
+                Log.d(TAG, "Inter-sentence: playback already stopped, skip")
+                interSentenceListener?.onInterSentenceEnd(interrupted = false)
+                return@Runnable
+            }
+            if (interSentenceInterrupted) {
+                // 被用户打断：清空剩余队列，结束播放
+                Log.i(TAG, "Inter-sentence: interrupted by user, clearing remaining queue")
+                interSentenceListener?.onInterSentenceEnd(interrupted = true)
+                stopInternal(clearQueue = true)
+                isPlaying.set(false)
+                onAllComplete()
+            } else {
+                // 正常继续：播下一句
+                Log.d(TAG, "Inter-sentence: no user speech, continue to next sentence")
+                interSentenceListener?.onInterSentenceEnd(interrupted = false)
+                playNextSentence()
+            }
+        }
+        interSentenceRunnable = runnable
+        mainHandler.postDelayed(runnable, pauseMs)
     }
 
     /**
@@ -668,12 +791,14 @@ class CosyVoiceTtsEngine(@Suppress("UNUSED_PARAMETER") context: Context) : TtsEn
      * 注意：不清空缓存！缓存由 LRU 机制自动管理
      */
     private fun onAllComplete() {
-        Log.d(TAG, "All sentences complete")
+        val sid = playingSessionId
+        Log.d(TAG, "All sentences complete, sessionId=$sid")
         engineState = STATE_IDLE
         hasStarted.set(false)
+        playingSessionId = 0L
         mainHandler.post {
             ModuleStateManager.onTtsFinishSpeaking()
-            stateCallback?.onDone()
+            stateCallback?.onDone(sid)
         }
     }
 
@@ -691,21 +816,30 @@ class CosyVoiceTtsEngine(@Suppress("UNUSED_PARAMETER") context: Context) : TtsEn
     }
 
     private fun onSynthesisError(msg: String) {
-        Log.e(TAG, "Synthesis error: $msg")
+        val sid = playingSessionId
+        Log.e(TAG, "Synthesis error: $msg, sessionId=$sid")
         engineState = STATE_IDLE
         isPlaying.set(false)
         hasStarted.set(false)
+        playingSessionId = 0L
         playQueue.clear()
         // 注意：不清空缓存！出错不影响已有缓存
         mainHandler.post {
             ModuleStateManager.onTtsError()
-            stateCallback?.onError(-1)
+            stateCallback?.onError(-1, sid)
         }
     }
 
     // ==================== 内部停止 ====================
 
-    private fun stopInternal() {
+    /**
+     * 内部停止播放
+     *
+     * @param clearQueue 是否清空播放队列
+     *                   - true：打断/新播报开始，清空所有待播句子
+     *                   - false：仅停止当前播放，保留队列（预留场景）
+     */
+    private fun stopInternal(clearQueue: Boolean = true) {
         try {
             if (mediaPlayer?.isPlaying == true) {
                 mediaPlayer?.stop()
@@ -714,23 +848,35 @@ class CosyVoiceTtsEngine(@Suppress("UNUSED_PARAMETER") context: Context) : TtsEn
         } catch (e: Exception) {
             Log.w(TAG, "stopInternal exception", e)
         }
+        // 取消句间倾听窗延迟任务
+        interSentenceRunnable?.let { mainHandler.removeCallbacks(it) }
+        interSentenceRunnable = null
+        interSentenceInterrupted = false
         engineState = STATE_IDLE
         isPlaying.set(false)
-        playQueue.clear()
+        if (clearQueue) {
+            playQueue.clear()
+            Log.d(TAG, "stopInternal: queue cleared")
+        } else {
+            Log.d(TAG, "stopInternal: queue preserved (${playQueue.size} sentences)")
+        }
         // 注意：不清空缓存！停止不影响缓存，下次播放还能用
     }
 
     // ==================== TtsEngine 接口实现 ====================
 
-    override fun stop() {
+    override fun stop(clearQueue: Boolean) {
         val wasSpeaking = engineState != STATE_IDLE || isPlaying.get()
+        val stoppedSessionId = currentSessionId
+        currentSessionId = 0L // 立即失效，后续队列句子全部跳过
+        Log.d(TAG, "stop: wasSpeaking=$wasSpeaking, clearQueue=$clearQueue, stoppedSessionId=$stoppedSessionId")
         executor.execute {
-            stopInternal()
+            stopInternal(clearQueue)
             if (wasSpeaking) {
                 mainHandler.post {
-                    Log.d(TAG, "TTS stopped manually")
+                    Log.d(TAG, "TTS stopped manually, sessionId=$stoppedSessionId")
                     ModuleStateManager.onTtsFinishSpeaking()
-                    stateCallback?.onDone()
+                    stateCallback?.onDone(stoppedSessionId)
                 }
             }
         }
@@ -743,6 +889,19 @@ class CosyVoiceTtsEngine(@Suppress("UNUSED_PARAMETER") context: Context) : TtsEn
     }
 
     override fun isAvailable(): Boolean = isInitialized
+
+    // ========== 句间倾听窗（P3）接口实现 ==========
+
+    override fun setOnInterSentenceListener(listener: TtsEngine.OnInterSentenceListener?) {
+        interSentenceListener = listener
+    }
+
+    override fun interruptInterSentence() {
+        if (interSentenceRunnable != null) {
+            Log.i(TAG, "interruptInterSentence: user spoke during listening window")
+            interSentenceInterrupted = true
+        }
+    }
 
     override fun release() {
         executor.execute {

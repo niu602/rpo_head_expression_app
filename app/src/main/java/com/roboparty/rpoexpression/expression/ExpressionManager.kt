@@ -59,8 +59,8 @@ class ExpressionManager private constructor() {
     // 上次表情切换时间，用于防抖
     private var lastSwitchTime = 0L
 
-    // 当前渲染风格（默认女款）
-    private var currentStyle = ExpressionStyle.FEMALE
+    // 当前渲染风格（默认形状男款）
+    private var currentStyle = ExpressionStyle.SHAPE_MALE
     private var isGenderSwitching = false
     private var genderSwitchOverlay = EyeParameters()
 
@@ -157,10 +157,17 @@ class ExpressionManager private constructor() {
     private var pupilTargetX = 0f
     private var pupilTargetY = 0f
     
-    internal var tempPupilShakeX = 0f
-    internal var tempEyelidOffset = 0f
     internal var touchPupilOffsetX = 0f
     internal var touchPupilOffsetY = 0f
+
+    // 视觉跟踪激活标志（由 VisionManager 设置）
+    // 为 true 时待机微动作暂停，瞳孔完全受视觉跟踪控制
+    @Volatile var visionTrackingActive = false
+        private set
+
+    fun setVisionTrackingActive(active: Boolean) {
+        visionTrackingActive = active
+    }
 
     enum class BlinkType {
         NORMAL, FAST, DOUBLE
@@ -433,6 +440,8 @@ class ExpressionManager private constructor() {
         return when (style) {
             ExpressionStyle.MALE -> Color(0xFF4FC3F7)    // 男款：冰蓝色
             ExpressionStyle.FEMALE -> Color(0xFFCE93D8)  // 女款：粉紫色
+            ExpressionStyle.SHAPE_MALE -> Color(0xFFE0E0E0) // 形状男款：浅灰白（黑白风）
+            ExpressionStyle.SHAPE_FEMALE -> Color(0xFFF5F5F5) // 形状女款：亮白色（黑白风）
         }
     }
 
@@ -506,13 +515,6 @@ class ExpressionManager private constructor() {
 
     fun setDistancePupilScale(scale: Float) {
         setPupilScale(scale)
-    }
-    fun setTempPupilShakeX(x: Float) {
-        tempPupilShakeX = x.coerceIn(-1f, 1f)
-    }
-
-    fun setTempEyelidOffset(offset: Float) {
-        tempEyelidOffset = offset.coerceIn(-1f, 1f)
     }
     fun setTouchPupilOffset(x: Float, y: Float) {
         touchPupilOffsetX = x.coerceIn(-1f, 1f)
@@ -831,11 +833,18 @@ class ExpressionManager private constructor() {
     }
     private fun startIdleMicroMotion() {
         // 待机微动作：随机小幅度眼球移动，恢复自动眨眼
+        // 视觉跟踪激活时暂停微动作，避免与 VisionManager 争夺瞳孔控制权
         startAutoBlink()
         scope.launch {
             while (isActive && !isPoweredOff && _expressionState.value.type == ExpressionType.IDLE) {
+                // 视觉跟踪激活时，等待跟踪结束后再恢复微动作
+                if (visionTrackingActive) {
+                    delay(100)
+                    continue
+                }
                 delay(Random.nextLong(3000, 8000))
                 if (_expressionState.value.type != ExpressionType.IDLE) continue
+                if (visionTrackingActive) continue
                 val targetX = Random.nextFloat() * 0.3f - 0.15f
                 val targetY = Random.nextFloat() * 0.2f - 0.1f
                 val duration = 500L
